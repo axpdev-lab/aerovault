@@ -130,4 +130,4 @@ GPL-3.0 -- See [LICENSE](LICENSE) for details.
 
 ## Origin
 
-AeroVault v2 was originally developed as the encryption engine for [AeroFTP](https://github.com/axpnet/aeroftp), a professional FTP/SFTP/cloud client. This standalone crate makes the format available for any Rust project.
+AeroVault v2 was originally developed as the encryption engine for [AeroFTP](https://github.com/axpdev-lab/aeroftp), a professional FTP/SFTP/cloud client. This standalone crate makes the format available for any Rust project.

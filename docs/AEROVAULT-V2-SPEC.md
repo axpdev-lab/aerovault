@@ -3,7 +3,7 @@
 **Version**: 2
 **Status**: Stable
 **Date**: 2026-03-07
-**Authors**: AXP Development
+**Authors**: axpdev-lab
 
 ---
 
@@ -480,10 +480,10 @@ Future versions MAY use the 320-byte reserved area (offsets 192-511) for additio
 
 The reference implementation is the `aerovault` Rust crate:
 
-- Repository: https://github.com/axpnet/aerovault
+- Repository: https://github.com/axpdev-lab/aerovault
 - Crate: `aerovault`
 - CLI: `aerovault-cli`
 
 ---
 
-*AeroVault v2 Format Specification -- AXP Development, 2026*
+*AeroVault v2 Format Specification -- axpdev-lab, 2026*

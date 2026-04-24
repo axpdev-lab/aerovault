@@ -67,7 +67,7 @@
 //! └──────────────────────────────────┘
 //! ```
 //!
-//! See [`AEROVAULT-V2-SPEC.md`](https://github.com/axpnet/aerovault/blob/main/docs/AEROVAULT-V2-SPEC.md)
+//! See [`AEROVAULT-V2-SPEC.md`](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V2-SPEC.md)
 //! for the complete format specification.
 
 pub(crate) mod constants;
