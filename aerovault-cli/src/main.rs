@@ -89,6 +89,42 @@ enum Commands {
         name: String,
     },
 
+    /// Rename an entry in place.
+    Rename {
+        /// Path to the vault file.
+        vault: PathBuf,
+
+        /// Current entry name.
+        from: String,
+
+        /// New basename (single path segment).
+        to: String,
+    },
+
+    /// Move an entry to another vault path.
+    Move {
+        /// Path to the vault file.
+        vault: PathBuf,
+
+        /// Source entry path.
+        from: String,
+
+        /// Destination entry path.
+        to: String,
+    },
+
+    /// Copy an entry to another vault path.
+    Copy {
+        /// Path to the vault file.
+        vault: PathBuf,
+
+        /// Source entry path.
+        from: String,
+
+        /// Destination entry path.
+        to: String,
+    },
+
     /// Show vault security information.
     Info {
         /// Path to the vault file.
@@ -249,6 +285,39 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             v.delete_entry(&name)?;
             println!("Deleted: {name}");
+        }
+
+        Commands::Rename { vault, from, to } => {
+            let mut password = read_password("Password: ")?;
+            let pb = spinner("Unlocking vault...");
+            let v = Vault::open(&vault, password.clone())?;
+            password.zeroize();
+            pb.finish_and_clear();
+
+            v.rename_entry(&from, &to)?;
+            println!("Renamed: {from} -> {to}");
+        }
+
+        Commands::Move { vault, from, to } => {
+            let mut password = read_password("Password: ")?;
+            let pb = spinner("Unlocking vault...");
+            let v = Vault::open(&vault, password.clone())?;
+            password.zeroize();
+            pb.finish_and_clear();
+
+            v.move_entry(&from, &to)?;
+            println!("Moved: {from} -> {to}");
+        }
+
+        Commands::Copy { vault, from, to } => {
+            let mut password = read_password("Password: ")?;
+            let pb = spinner("Unlocking vault...");
+            let v = Vault::open(&vault, password.clone())?;
+            password.zeroize();
+            pb.finish_and_clear();
+
+            v.copy_entry(&from, &to)?;
+            println!("Copied: {from} -> {to}");
         }
 
         Commands::Info { path } => {

@@ -68,6 +68,15 @@ aerovault mkdir my-vault.aerovault docs/reports
 # Delete an entry
 aerovault rm my-vault.aerovault document.pdf
 
+# Rename an entry in place
+aerovault rename my-vault.aerovault docs/report.txt report-final.txt
+
+# Move or rename across directories
+aerovault move my-vault.aerovault docs/report-final.txt archive/reports/report-final.txt
+
+# Copy file or directory to another path
+aerovault copy my-vault.aerovault archive/reports/report-final.txt backup/report-final.txt
+
 # Show security info
 aerovault info my-vault.aerovault
 
@@ -99,6 +108,15 @@ for entry in vault.list()? {
 
 // Extract
 vault.extract("secret.pdf", "/tmp/")?;
+
+// Rename in place (same parent directory)
+vault.rename_entry("keys.txt", "keys-2026.txt")?;
+
+// Move (works for files and directories)
+vault.move_entry("secret.pdf", "archive/secret.pdf")?;
+
+// Copy (works for files and directories)
+vault.copy_entry("archive/secret.pdf", "backup/secret.pdf")?;
 ```
 
 ## Format Specification

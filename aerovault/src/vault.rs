@@ -779,6 +779,282 @@ impl Vault {
         Ok(removed)
     }
 
+    /// Move or rename an entry inside the vault.
+    ///
+    /// Supports both file and directory moves. When moving a directory, all
+    /// descendant entries are moved as a single atomic manifest update.
+    pub fn move_entry(&self, from: &str, to: &str) -> crate::Result<()> {
+        let from = from.trim().trim_matches('/');
+        let to = to.trim().trim_matches('/');
+
+        if from.is_empty() || to.is_empty() {
+            return Err(crate::Error::InvalidPath(
+                "source and destination cannot be empty".into(),
+            ));
+        }
+
+        validate_entry_name(from)?;
+        validate_entry_name(to)?;
+
+        if from == to {
+            return Ok(());
+        }
+
+        if to.starts_with(&format!("{from}/")) {
+            return Err(crate::Error::InvalidPath(
+                "cannot move an entry into its own subtree".into(),
+            ));
+        }
+
+        if from.len() > 4096 || to.len() > 4096 {
+            return Err(crate::Error::InvalidPath("path too long".into()));
+        }
+
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut header_buf = [0u8; HEADER_SIZE];
+        reader.read_exact(&mut header_buf)?;
+
+        let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
+        let manifest_str = std::str::from_utf8(&manifest_encrypted)
+            .map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json = crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
+
+        let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
+            .map_err(|e| crate::Error::Manifest(e.to_string()))?;
+
+        let mut data_section = Vec::new();
+        reader.read_to_end(&mut data_section)?;
+
+        let mut names: Vec<String> = Vec::with_capacity(manifest.entries.len());
+        for entry in &manifest.entries {
+            names.push(crypto::decrypt_filename(
+                self.master_key.expose_secret(),
+                &entry.encrypted_name,
+            )?);
+        }
+
+        let src_index = names
+            .iter()
+            .position(|n| n == from)
+            .ok_or_else(|| crate::Error::EntryNotFound(from.to_string()))?;
+        let src_is_dir = manifest.entries[src_index].is_dir;
+
+        let mut renames: Vec<(usize, String)> = Vec::new();
+        for (idx, name) in names.iter().enumerate() {
+            if src_is_dir {
+                if name == from {
+                    renames.push((idx, to.to_string()));
+                } else if name.starts_with(&format!("{from}/")) {
+                    renames.push((idx, format!("{to}{}", &name[from.len()..])));
+                }
+            } else if name == from {
+                renames.push((idx, to.to_string()));
+            }
+        }
+
+        if renames.is_empty() {
+            return Err(crate::Error::EntryNotFound(from.to_string()));
+        }
+
+        // Build final entry map and validate uniqueness + parent directories.
+        let mut final_map: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        for (idx, old_name) in names.iter().enumerate() {
+            let resolved_name = renames
+                .iter()
+                .find(|(rename_idx, _)| *rename_idx == idx)
+                .map(|(_, new_name)| new_name.as_str())
+                .unwrap_or(old_name.as_str());
+
+            if final_map
+                .insert(resolved_name.to_string(), manifest.entries[idx].is_dir)
+                .is_some()
+            {
+                return Err(crate::Error::Manifest(format!(
+                    "target entry already exists: {resolved_name}"
+                )));
+            }
+        }
+
+        for name in final_map.keys() {
+            if let Some((parent, _)) = name.rsplit_once('/') {
+                if parent.is_empty() {
+                    continue;
+                }
+                let parent_is_dir = final_map.get(parent).copied().unwrap_or(false);
+                if !parent_is_dir {
+                    return Err(crate::Error::EntryNotFound(format!(
+                        "parent directory '{parent}'"
+                    )));
+                }
+            }
+        }
+
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        for (idx, new_name) in &renames {
+            manifest.entries[*idx].encrypted_name =
+                crypto::encrypt_filename(self.master_key.expose_secret(), new_name)?;
+            manifest.entries[*idx].modified = now.clone();
+        }
+
+        manifest.modified = now;
+        self.write_vault_atomic(&header_buf, &manifest, &data_section, &[])?;
+        Ok(())
+    }
+
+    /// Rename an entry while keeping it in the same parent directory.
+    pub fn rename_entry(&self, current_name: &str, new_name: &str) -> crate::Result<()> {
+        let current_name = current_name.trim().trim_matches('/');
+        let new_name = new_name.trim().trim_matches('/');
+
+        if new_name.is_empty() {
+            return Err(crate::Error::InvalidPath("new name cannot be empty".into()));
+        }
+        if new_name.contains('/') || new_name.contains('\\') || new_name.contains('\0') {
+            return Err(crate::Error::InvalidPath(
+                "new name must be a single path segment".into(),
+            ));
+        }
+        if new_name == "." || new_name == ".." {
+            return Err(crate::Error::InvalidPath("invalid new name".into()));
+        }
+
+        let target = if let Some((parent, _)) = current_name.rsplit_once('/') {
+            format!("{parent}/{new_name}")
+        } else {
+            new_name.to_string()
+        };
+
+        self.move_entry(current_name, &target)
+    }
+
+    /// Copy an entry (file or directory) inside the vault.
+    ///
+    /// The copied entries reuse the existing encrypted data chunk references;
+    /// only manifest metadata is duplicated and re-encrypted names are written.
+    pub fn copy_entry(&self, from: &str, to: &str) -> crate::Result<()> {
+        let from = from.trim().trim_matches('/');
+        let to = to.trim().trim_matches('/');
+
+        if from.is_empty() || to.is_empty() {
+            return Err(crate::Error::InvalidPath(
+                "source and destination cannot be empty".into(),
+            ));
+        }
+
+        validate_entry_name(from)?;
+        validate_entry_name(to)?;
+
+        if from == to {
+            return Err(crate::Error::Manifest(
+                "target entry already exists".into(),
+            ));
+        }
+
+        if to.starts_with(&format!("{from}/")) {
+            return Err(crate::Error::InvalidPath(
+                "cannot copy an entry into its own subtree".into(),
+            ));
+        }
+
+        if from.len() > 4096 || to.len() > 4096 {
+            return Err(crate::Error::InvalidPath("path too long".into()));
+        }
+
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut header_buf = [0u8; HEADER_SIZE];
+        reader.read_exact(&mut header_buf)?;
+
+        let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
+        let manifest_str = std::str::from_utf8(&manifest_encrypted)
+            .map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json = crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
+
+        let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
+            .map_err(|e| crate::Error::Manifest(e.to_string()))?;
+
+        let mut data_section = Vec::new();
+        reader.read_to_end(&mut data_section)?;
+
+        let mut names: Vec<String> = Vec::with_capacity(manifest.entries.len());
+        for entry in &manifest.entries {
+            names.push(crypto::decrypt_filename(
+                self.master_key.expose_secret(),
+                &entry.encrypted_name,
+            )?);
+        }
+
+        let src_index = names
+            .iter()
+            .position(|n| n == from)
+            .ok_or_else(|| crate::Error::EntryNotFound(from.to_string()))?;
+        let src_is_dir = manifest.entries[src_index].is_dir;
+
+        let mut copies: Vec<(usize, String)> = Vec::new();
+        for (idx, name) in names.iter().enumerate() {
+            if src_is_dir {
+                if name == from {
+                    copies.push((idx, to.to_string()));
+                } else if name.starts_with(&format!("{from}/")) {
+                    copies.push((idx, format!("{to}{}", &name[from.len()..])));
+                }
+            } else if name == from {
+                copies.push((idx, to.to_string()));
+            }
+        }
+
+        if copies.is_empty() {
+            return Err(crate::Error::EntryNotFound(from.to_string()));
+        }
+
+        let mut final_map: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        for (idx, name) in names.iter().enumerate() {
+            final_map.insert(name.to_string(), manifest.entries[idx].is_dir);
+        }
+        for (src_idx, copied_name) in &copies {
+            if final_map
+                .insert(copied_name.clone(), manifest.entries[*src_idx].is_dir)
+                .is_some()
+            {
+                return Err(crate::Error::Manifest(format!(
+                    "target entry already exists: {copied_name}"
+                )));
+            }
+        }
+
+        for name in final_map.keys() {
+            if let Some((parent, _)) = name.rsplit_once('/') {
+                if parent.is_empty() {
+                    continue;
+                }
+                let parent_is_dir = final_map.get(parent).copied().unwrap_or(false);
+                if !parent_is_dir {
+                    return Err(crate::Error::EntryNotFound(format!(
+                        "parent directory '{parent}'"
+                    )));
+                }
+            }
+        }
+
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let mut new_entries: Vec<ManifestEntry> = Vec::with_capacity(copies.len());
+        for (src_idx, copied_name) in copies {
+            let mut cloned = manifest.entries[src_idx].clone();
+            cloned.encrypted_name =
+                crypto::encrypt_filename(self.master_key.expose_secret(), &copied_name)?;
+            cloned.modified = now.clone();
+            new_entries.push(cloned);
+        }
+
+        manifest.entries.extend(new_entries);
+        manifest.modified = now;
+        self.write_vault_atomic(&header_buf, &manifest, &data_section, &[])?;
+        Ok(())
+    }
+
     /// Compact the vault by removing orphaned data from deleted entries.
     ///
     /// Reads all surviving entries, decrypts and re-encrypts their chunks with
@@ -1407,5 +1683,146 @@ mod tests {
         assert!(validate_entry_name("/etc/passwd").is_err());
         assert!(validate_entry_name("foo\0bar").is_err());
         assert!(validate_entry_name("normal/file.txt").is_ok());
+    }
+
+    #[test]
+    fn test_rename_entry() {
+        let path = temp_vault_path();
+        let opts = CreateOptions::new(&path, "test-password-123");
+        let vault = Vault::create(opts).unwrap();
+
+        let test_file = std::env::temp_dir().join("aerovault-rename-input.txt");
+        std::fs::write(&test_file, b"rename me").unwrap();
+        vault.add_files(&[&test_file]).unwrap();
+
+        vault
+            .rename_entry("aerovault-rename-input.txt", "renamed.txt")
+            .unwrap();
+
+        let entries = vault.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "renamed.txt");
+
+        let out_dir = std::env::temp_dir().join("aerovault-rename-output");
+        std::fs::create_dir_all(&out_dir).ok();
+        let extracted = vault.extract("renamed.txt", &out_dir).unwrap();
+        assert!(extracted.ends_with("renamed.txt"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&test_file).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn test_move_directory_recursive() {
+        let path = temp_vault_path();
+        let opts = CreateOptions::new(&path, "test-password-123");
+        let vault = Vault::create(opts).unwrap();
+
+        vault.create_directory("docs/old").unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("aerovault-move-input.txt");
+        std::fs::write(&test_file, b"move me").unwrap();
+        vault.add_files_to_dir(&[&test_file], "docs/old").unwrap();
+
+        vault.create_directory("archive").unwrap();
+        vault.move_entry("docs/old", "archive/old").unwrap();
+
+        let names: Vec<String> = vault.list().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "archive/old"));
+        assert!(names.iter().any(|n| n == "archive/old/aerovault-move-input.txt"));
+        assert!(!names.iter().any(|n| n == "docs/old"));
+
+        let out_dir = temp_dir.join("aerovault-move-output");
+        std::fs::create_dir_all(&out_dir).ok();
+        let extracted = vault
+            .extract("archive/old/aerovault-move-input.txt", &out_dir)
+            .unwrap();
+        let content = std::fs::read_to_string(extracted).unwrap();
+        assert_eq!(content, "move me");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&test_file).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn test_move_entry_rejects_self_subtree() {
+        let path = temp_vault_path();
+        let opts = CreateOptions::new(&path, "test-password-123");
+        let vault = Vault::create(opts).unwrap();
+
+        vault.create_directory("docs/old").unwrap();
+        assert!(vault.move_entry("docs", "docs/archive").is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_copy_entry_file() {
+        let path = temp_vault_path();
+        let opts = CreateOptions::new(&path, "test-password-123");
+        let vault = Vault::create(opts).unwrap();
+
+        let test_file = std::env::temp_dir().join("aerovault-copy-input.txt");
+        std::fs::write(&test_file, b"copy me").unwrap();
+        vault.add_files(&[&test_file]).unwrap();
+
+        vault
+            .copy_entry("aerovault-copy-input.txt", "aerovault-copy-output.txt")
+            .unwrap();
+
+        let names: Vec<String> = vault.list().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "aerovault-copy-input.txt"));
+        assert!(names.iter().any(|n| n == "aerovault-copy-output.txt"));
+
+        let out_dir = std::env::temp_dir().join("aerovault-copy-output-dir");
+        std::fs::create_dir_all(&out_dir).ok();
+        let extracted = vault.extract("aerovault-copy-output.txt", &out_dir).unwrap();
+        let content = std::fs::read_to_string(extracted).unwrap();
+        assert_eq!(content, "copy me");
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&test_file).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
+    }
+
+    #[test]
+    fn test_copy_entry_directory_recursive() {
+        let path = temp_vault_path();
+        let opts = CreateOptions::new(&path, "test-password-123");
+        let vault = Vault::create(opts).unwrap();
+
+        vault.create_directory("docs/original").unwrap();
+
+        let test_file = std::env::temp_dir().join("aerovault-copy-tree-input.txt");
+        std::fs::write(&test_file, b"tree copy").unwrap();
+        vault.add_files_to_dir(&[&test_file], "docs/original").unwrap();
+
+        vault.create_directory("archive").unwrap();
+        vault.copy_entry("docs/original", "archive/original-copy").unwrap();
+
+        let names: Vec<String> = vault.list().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().any(|n| n == "docs/original"));
+        assert!(names.iter().any(|n| n == "archive/original-copy"));
+        assert!(names
+            .iter()
+            .any(|n| n == "archive/original-copy/aerovault-copy-tree-input.txt"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&test_file).ok();
+    }
+
+    #[test]
+    fn test_copy_entry_rejects_self_subtree() {
+        let path = temp_vault_path();
+        let opts = CreateOptions::new(&path, "test-password-123");
+        let vault = Vault::create(opts).unwrap();
+
+        vault.create_directory("docs/original").unwrap();
+        assert!(vault.copy_entry("docs", "docs/archive").is_err());
+
+        std::fs::remove_file(&path).ok();
     }
 }
