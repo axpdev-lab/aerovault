@@ -29,6 +29,7 @@ pub struct CreateOptions {
     password: SecretString,
     mode: EncryptionMode,
     chunk_size: u32,
+    version: u8,
 }
 
 impl CreateOptions {
@@ -39,7 +40,20 @@ impl CreateOptions {
             password: SecretString::from(password.into()),
             mode: EncryptionMode::Standard,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            version: VERSION,
         }
+    }
+
+    /// Select the on-disk container version to write.
+    ///
+    /// Defaults to the current [`VERSION`] (v3, file-id-bound chunk AAD).
+    /// Pass [`LEGACY_VERSION`] (v2, chunk-index-only AAD) to write a legacy
+    /// container, e.g. for migration tooling or backward-compat round-trip
+    /// tests. Any other value is rejected at [`Vault::create`]. Readers accept
+    /// both versions regardless of which one was written.
+    pub fn with_version(mut self, version: u8) -> Self {
+        self.version = version;
+        self
     }
 
     /// Set the encryption mode.
@@ -100,6 +114,10 @@ impl Vault {
             return Err(FormatError::InvalidChunkSize(opts.chunk_size).into());
         }
 
+        if opts.version != VERSION && opts.version != LEGACY_VERSION {
+            return Err(FormatError::UnsupportedVersion(opts.version).into());
+        }
+
         // Generate random salt
         let mut salt = [0u8; SALT_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -127,7 +145,7 @@ impl Vault {
 
         let mut header = VaultHeader {
             magic: *MAGIC,
-            version: VERSION,
+            version: opts.version,
             flags,
             salt,
             wrapped_master_key: wrapped_master,
@@ -163,12 +181,7 @@ impl Vault {
         writer.get_ref().sync_all()?;
         drop(writer);
 
-        // If target already exists, use safe rename; otherwise just rename
-        if opts.path.exists() {
-            atomic_rename(&tmp_path, &opts.path)?;
-        } else {
-            std::fs::rename(&tmp_path, &opts.path)?;
-        }
+        atomic_rename(&tmp_path, &opts.path)?;
 
         let master_key = SecretVec::new(master_key_raw.to_vec());
         let mac_key = SecretVec::new(mac_key_raw.to_vec());
@@ -233,7 +246,7 @@ impl Vault {
         if reader.read_exact(&mut buf).is_err() {
             return false;
         }
-        &buf[..10] == MAGIC && buf[10] == VERSION
+        &buf[..10] == MAGIC && (buf[10] == VERSION || buf[10] == LEGACY_VERSION)
     }
 
     /// Read vault header information without a password.
@@ -297,10 +310,8 @@ impl Vault {
         let mut entries = Vec::with_capacity(manifest.entries.len());
 
         for entry in &manifest.entries {
-            let name = crypto::decrypt_filename(
-                self.master_key.expose_secret(),
-                &entry.encrypted_name,
-            )?;
+            let name =
+                crypto::decrypt_filename(self.master_key.expose_secret(), &entry.encrypted_name)?;
             entries.push(EntryInfo {
                 name,
                 size: entry.size,
@@ -337,6 +348,7 @@ impl Vault {
 
         let cascade_mode = self.header.flags.cascade_mode;
         let chunk_size = self.header.chunk_size as usize;
+        let bind_chunks = self.header.version >= VERSION;
 
         // Read current vault state
         let file = File::open(&self.path)?;
@@ -346,12 +358,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(
-            self.master_key.expose_secret(),
-            manifest_str,
-        )?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| crate::Error::Manifest(e.to_string()))?;
@@ -414,6 +424,22 @@ impl Vault {
 
             let mut source_reader = BufReader::new(source);
             let mut chunk_count = 0u32;
+            let chunk_total = if metadata.len() == 0 {
+                0
+            } else {
+                metadata
+                    .len()
+                    .div_ceil(chunk_size as u64)
+                    .try_into()
+                    .map_err(|_| crate::Error::Manifest("chunk count overflow".into()))?
+            };
+            let file_id = if bind_chunks {
+                let mut id = [0u8; 16];
+                rand::rngs::OsRng.fill_bytes(&mut id);
+                Some(id)
+            } else {
+                None
+            };
             let entry_offset = data_offset;
 
             loop {
@@ -425,14 +451,22 @@ impl Vault {
                 chunk.truncate(bytes_read);
 
                 let encrypted_chunk = if cascade_mode {
-                    crypto::encrypt_chunk_cascade(
+                    crypto::encrypt_chunk_cascade_bound(
                         self.master_key.expose_secret(),
                         &chacha_key,
                         &chunk,
                         chunk_count,
+                        file_id.as_ref(),
+                        chunk_total,
                     )?
                 } else {
-                    crypto::encrypt_chunk(self.master_key.expose_secret(), &chunk, chunk_count)?
+                    crypto::encrypt_chunk_bound(
+                        self.master_key.expose_secret(),
+                        &chunk,
+                        chunk_count,
+                        file_id.as_ref(),
+                        chunk_total,
+                    )?
                 };
 
                 let chunk_len = encrypted_chunk.len() as u32;
@@ -440,11 +474,24 @@ impl Vault {
                 new_data.extend_from_slice(&encrypted_chunk);
 
                 data_offset += 4 + encrypted_chunk.len() as u64;
-                chunk_count = chunk_count.checked_add(1).ok_or_else(|| {
-                    crate::Error::Manifest("chunk count overflow".into())
-                })?;
+                chunk_count = chunk_count
+                    .checked_add(1)
+                    .ok_or_else(|| crate::Error::Manifest("chunk count overflow".into()))?;
 
                 chunk.zeroize();
+            }
+
+            // The v3+ chunk AAD binds `chunk_total`, derived from the pre-stream
+            // `metadata.len()`. Extraction rebuilds the AAD from the manifest's
+            // stored `chunk_count` (the actual number of chunks streamed). If the
+            // source changed size between the stat and the read, the two diverge
+            // and every chunk would fail AAD verification on extract: a silently
+            // unrecoverable entry. Fail the add instead of persisting it. (Legacy
+            // v2 binds only the chunk index, so the mismatch is harmless there.)
+            if bind_chunks && chunk_count != chunk_total {
+                return Err(crate::Error::Manifest(format!(
+                    "source changed size during add (bound {chunk_total} chunks, streamed {chunk_count}); aborting to avoid an unrecoverable entry"
+                )));
             }
 
             let modified = metadata
@@ -461,6 +508,7 @@ impl Vault {
                 size: metadata.len(),
                 offset: entry_offset,
                 chunk_count,
+                file_id,
                 is_dir: false,
                 modified,
             });
@@ -483,7 +531,9 @@ impl Vault {
     pub fn create_directory(&self, dir_name: &str) -> crate::Result<u32> {
         let dir_name = dir_name.trim().trim_matches('/');
         if dir_name.is_empty() {
-            return Err(crate::Error::InvalidPath("directory name cannot be empty".into()));
+            return Err(crate::Error::InvalidPath(
+                "directory name cannot be empty".into(),
+            ));
         }
         if dir_name.contains("..") {
             return Err(crate::Error::InvalidPath(
@@ -501,12 +551,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(
-            self.master_key.expose_secret(),
-            manifest_str,
-        )?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| crate::Error::Manifest(e.to_string()))?;
@@ -520,7 +568,11 @@ impl Vault {
         for i in 1..=parts.len() {
             let partial = parts[..i].join("/");
             let encrypted = crypto::encrypt_filename(self.master_key.expose_secret(), &partial)?;
-            if !manifest.entries.iter().any(|e| e.encrypted_name == encrypted) {
+            if !manifest
+                .entries
+                .iter()
+                .any(|e| e.encrypted_name == encrypted)
+            {
                 dirs_to_create.push((partial, encrypted));
             }
         }
@@ -537,6 +589,7 @@ impl Vault {
                 size: 0,
                 offset: 0,
                 chunk_count: 0,
+                file_id: None,
                 is_dir: true,
                 modified: now.clone(),
             });
@@ -553,7 +606,11 @@ impl Vault {
     ///
     /// Returns the full path of the extracted file. Validates that the output
     /// path stays within `output_dir` to prevent path traversal attacks.
-    pub fn extract(&self, entry_name: &str, output_dir: impl AsRef<Path>) -> crate::Result<PathBuf> {
+    pub fn extract(
+        &self,
+        entry_name: &str,
+        output_dir: impl AsRef<Path>,
+    ) -> crate::Result<PathBuf> {
         let output_dir = output_dir.as_ref();
 
         // Validate entry name against path traversal
@@ -612,7 +669,9 @@ impl Vault {
         let filename = Path::new(entry_name)
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| crate::Error::InvalidPath(format!("invalid entry name: {entry_name}")))?;
+            .ok_or_else(|| {
+                crate::Error::InvalidPath(format!("invalid entry name: {entry_name}"))
+            })?;
         let dest_path = output_dir.join(filename);
         validate_output_path(&dest_path, output_dir)?;
 
@@ -633,17 +692,21 @@ impl Vault {
             reader.read_exact(&mut encrypted_chunk)?;
 
             let mut plaintext = if cascade_mode {
-                crypto::decrypt_chunk_cascade(
+                crypto::decrypt_chunk_cascade_bound(
                     self.master_key.expose_secret(),
                     &chacha_key,
                     &encrypted_chunk,
                     chunk_idx,
+                    entry.file_id.as_ref(),
+                    entry.chunk_count,
                 )?
             } else {
-                crypto::decrypt_chunk(
+                crypto::decrypt_chunk_bound(
                     self.master_key.expose_secret(),
                     &encrypted_chunk,
                     chunk_idx,
+                    entry.file_id.as_ref(),
+                    entry.chunk_count,
                 )?
             };
 
@@ -683,12 +746,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(
-            self.master_key.expose_secret(),
-            manifest_str,
-        )?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| crate::Error::Manifest(e.to_string()))?;
@@ -730,12 +791,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(
-            self.master_key.expose_secret(),
-            manifest_str,
-        )?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| crate::Error::Manifest(e.to_string()))?;
@@ -746,10 +805,8 @@ impl Vault {
         let original_count = manifest.entries.len();
 
         manifest.entries.retain(|entry| {
-            let decrypted = crypto::decrypt_filename(
-                self.master_key.expose_secret(),
-                &entry.encrypted_name,
-            );
+            let decrypted =
+                crypto::decrypt_filename(self.master_key.expose_secret(), &entry.encrypted_name);
             match decrypted {
                 Ok(name) => {
                     // Direct name match
@@ -817,9 +874,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| crate::Error::Manifest(e.to_string()))?;
@@ -859,7 +917,8 @@ impl Vault {
         }
 
         // Build final entry map and validate uniqueness + parent directories.
-        let mut final_map: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let mut final_map: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         for (idx, old_name) in names.iter().enumerate() {
             let resolved_name = renames
                 .iter()
@@ -947,9 +1006,7 @@ impl Vault {
         validate_entry_name(to)?;
 
         if from == to {
-            return Err(crate::Error::Manifest(
-                "target entry already exists".into(),
-            ));
+            return Err(crate::Error::Manifest("target entry already exists".into()));
         }
 
         if to.starts_with(&format!("{from}/")) {
@@ -969,9 +1026,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| crate::Error::Manifest(e.to_string()))?;
@@ -1010,7 +1068,8 @@ impl Vault {
             return Err(crate::Error::EntryNotFound(from.to_string()));
         }
 
-        let mut final_map: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let mut final_map: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         for (idx, name) in names.iter().enumerate() {
             final_map.insert(name.to_string(), manifest.entries[idx].is_dir);
         }
@@ -1074,12 +1133,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(
-            self.master_key.expose_secret(),
-            manifest_str,
-        )?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         let mut manifest: VaultManifest = serde_json::from_str(&manifest_json)
             .map_err(|e| crate::Error::Manifest(e.to_string()))?;
@@ -1120,34 +1177,42 @@ impl Vault {
                 orig_reader.read_exact(&mut encrypted_chunk)?;
 
                 let mut plaintext = if cascade_mode {
-                    crypto::decrypt_chunk_cascade(
+                    crypto::decrypt_chunk_cascade_bound(
                         self.master_key.expose_secret(),
                         &chacha_key,
                         &encrypted_chunk,
                         chunk_idx,
+                        entry.file_id.as_ref(),
+                        entry.chunk_count,
                     )?
                 } else {
-                    crypto::decrypt_chunk(
+                    crypto::decrypt_chunk_bound(
                         self.master_key.expose_secret(),
                         &encrypted_chunk,
                         chunk_idx,
+                        entry.file_id.as_ref(),
+                        entry.chunk_count,
                     )?
                 };
 
                 encrypted_chunk.zeroize();
 
                 let new_encrypted = if cascade_mode {
-                    crypto::encrypt_chunk_cascade(
+                    crypto::encrypt_chunk_cascade_bound(
                         self.master_key.expose_secret(),
                         &chacha_key,
                         &plaintext,
                         chunk_idx,
+                        entry.file_id.as_ref(),
+                        entry.chunk_count,
                     )?
                 } else {
-                    crypto::encrypt_chunk(
+                    crypto::encrypt_chunk_bound(
                         self.master_key.expose_secret(),
                         &plaintext,
                         chunk_idx,
+                        entry.file_id.as_ref(),
+                        entry.chunk_count,
                     )?
                 };
 
@@ -1167,8 +1232,8 @@ impl Vault {
         manifest.modified = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
         // Write compacted vault
-        let manifest_json = serde_json::to_string(&manifest)
-            .map_err(|e| crate::Error::Manifest(e.to_string()))?;
+        let manifest_json =
+            serde_json::to_string(&manifest).map_err(|e| crate::Error::Manifest(e.to_string()))?;
         let encrypted_manifest =
             crypto::encrypt_filename(self.master_key.expose_secret(), &manifest_json)?;
         let manifest_bytes = encrypted_manifest.as_bytes();
@@ -1201,10 +1266,7 @@ impl Vault {
     ///
     /// Re-wraps the master and MAC keys with a new KEK. The encrypted content
     /// remains unchanged — only the 512-byte header is modified.
-    pub fn change_password(
-        &mut self,
-        new_password: impl Into<String>,
-    ) -> crate::Result<()> {
+    pub fn change_password(&mut self, new_password: impl Into<String>) -> crate::Result<()> {
         let new_pwd = SecretString::from(new_password.into());
         if new_pwd.expose_secret().len() < MIN_PASSWORD_LENGTH {
             return Err(crate::Error::PasswordPolicy(format!(
@@ -1228,8 +1290,7 @@ impl Vault {
 
         // Derive new KEKs
         let new_base_kek = crypto::derive_key(&new_pwd, &new_salt)?;
-        let (new_kek_master, new_kek_mac) =
-            crypto::derive_kek_pair(new_base_kek.expose_secret());
+        let (new_kek_master, new_kek_mac) = crypto::derive_kek_pair(new_base_kek.expose_secret());
 
         // Re-wrap keys
         let new_wrapped_master =
@@ -1275,12 +1336,10 @@ impl Vault {
         reader.read_exact(&mut header_buf)?;
 
         let (_manifest_len, manifest_encrypted) = crypto::read_manifest_bounded(&mut reader)?;
-        let manifest_str = std::str::from_utf8(&manifest_encrypted)
-            .map_err(|_| CryptoError::ManifestEncoding)?;
-        let manifest_json = crypto::decrypt_filename(
-            self.master_key.expose_secret(),
-            manifest_str,
-        )?;
+        let manifest_str =
+            std::str::from_utf8(&manifest_encrypted).map_err(|_| CryptoError::ManifestEncoding)?;
+        let manifest_json =
+            crypto::decrypt_filename(self.master_key.expose_secret(), manifest_str)?;
 
         serde_json::from_str(&manifest_json).map_err(|e| crate::Error::Manifest(e.to_string()))
     }
@@ -1293,8 +1352,8 @@ impl Vault {
         existing_data: &[u8],
         new_data: &[u8],
     ) -> crate::Result<()> {
-        let manifest_json = serde_json::to_string(manifest)
-            .map_err(|e| crate::Error::Manifest(e.to_string()))?;
+        let manifest_json =
+            serde_json::to_string(manifest).map_err(|e| crate::Error::Manifest(e.to_string()))?;
         let encrypted_manifest =
             crypto::encrypt_filename(self.master_key.expose_secret(), &manifest_json)?;
         let manifest_bytes = encrypted_manifest.as_bytes();
@@ -1406,12 +1465,16 @@ fn validate_entry_name(name: &str) -> crate::Result<()> {
 /// Validate that a resolved output path stays within the output directory.
 fn validate_output_path(path: &Path, output_dir: &Path) -> crate::Result<()> {
     // Canonicalize the output directory (it must exist)
-    let canonical_dir = output_dir.canonicalize().unwrap_or_else(|_| output_dir.to_path_buf());
+    let canonical_dir = output_dir
+        .canonicalize()
+        .unwrap_or_else(|_| output_dir.to_path_buf());
 
     // For the file path, canonicalize the parent (which should exist after create_dir_all)
     // and append the filename
     let canonical_path = if let Some(parent) = path.parent() {
-        let canon_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+        let canon_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
         if let Some(filename) = path.file_name() {
             canon_parent.join(filename)
         } else {
@@ -1430,15 +1493,29 @@ fn validate_output_path(path: &Path, output_dir: &Path) -> crate::Result<()> {
     Ok(())
 }
 
-/// Atomic rename: original → .bak, tmp → original, delete .bak.
-fn atomic_rename(tmp_path: &str, final_path: &Path) -> crate::Result<()> {
-    let bak_path = format!("{}.bak", final_path.display());
-    std::fs::rename(final_path, &bak_path)?;
-    if let Err(e) = std::fs::rename(tmp_path, final_path) {
-        let _ = std::fs::rename(&bak_path, final_path); // Rollback
-        return Err(e.into());
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) -> crate::Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = File::open(parent)?;
+        dir.sync_all()?;
     }
-    let _ = std::fs::remove_file(&bak_path);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &Path) -> crate::Result<()> {
+    Ok(())
+}
+
+/// Atomic rename: tmp -> final as the single visible commit point.
+fn atomic_rename(tmp_path: &str, final_path: &Path) -> crate::Result<()> {
+    #[cfg(windows)]
+    if final_path.exists() {
+        std::fs::remove_file(final_path)?;
+    }
+
+    std::fs::rename(tmp_path, final_path)?;
+    fsync_parent_dir(final_path)?;
     Ok(())
 }
 
@@ -1452,13 +1529,13 @@ fn atomic_write(path: &Path, data: &[u8], suffix: &str) -> crate::Result<()> {
     writer.get_ref().sync_all()?;
     drop(writer);
 
-    let bak_path = format!("{}.bak", path.display());
-    std::fs::rename(path, &bak_path)?;
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::rename(&bak_path, path); // Rollback
-        return Err(e.into());
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
     }
-    let _ = std::fs::remove_file(&bak_path);
+
+    std::fs::rename(&tmp_path, path)?;
+    fsync_parent_dir(path)?;
     Ok(())
 }
 
@@ -1469,7 +1546,10 @@ mod tests {
 
     fn temp_vault_path() -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("aerovault-test-{}.aerovault", rand::random::<u64>()));
+        path.push(format!(
+            "aerovault-test-{}.aerovault",
+            rand::random::<u64>()
+        ));
         path
     }
 
@@ -1512,12 +1592,10 @@ mod tests {
     #[test]
     fn test_chunk_size_validation() {
         let path = temp_vault_path();
-        let opts = CreateOptions::new(&path, "test-password-123")
-            .with_chunk_size(1); // too small
+        let opts = CreateOptions::new(&path, "test-password-123").with_chunk_size(1); // too small
         assert!(Vault::create(opts).is_err());
 
-        let opts = CreateOptions::new(&path, "test-password-123")
-            .with_chunk_size(32 * 1024 * 1024); // too large
+        let opts = CreateOptions::new(&path, "test-password-123").with_chunk_size(32 * 1024 * 1024); // too large
         assert!(Vault::create(opts).is_err());
 
         std::fs::remove_file(&path).ok();
@@ -1559,10 +1637,66 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_v2_roundtrip_and_version_dispatch() {
+        // A v2 (LEGACY_VERSION) container must round-trip byte-identically with
+        // the chunk-index-only AAD, and a default v3 container must round-trip
+        // with the file-id-bound AAD. Both must reopen and extract correctly.
+        // Locks the backward-compat read path against future refactors.
+        let v2_path = temp_vault_path();
+        let v3_path = temp_vault_path();
+
+        // Multi-chunk payload (> one default chunk) to exercise chunk indexing.
+        let input = std::env::temp_dir().join(format!(
+            "aerovault-legacy-input-{}.bin",
+            v2_path.file_stem().unwrap().to_string_lossy()
+        ));
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&input, &payload).unwrap();
+        let entry = input.file_name().unwrap().to_string_lossy().to_string();
+
+        // --- v2 legacy container ---
+        let v2 = Vault::create(
+            CreateOptions::new(&v2_path, "legacy-password-123").with_version(LEGACY_VERSION),
+        )
+        .unwrap();
+        v2.add_files(&[&input]).unwrap();
+        assert_eq!(Vault::peek(&v2_path).unwrap().version, LEGACY_VERSION);
+
+        let v2r = Vault::open(&v2_path, "legacy-password-123").unwrap();
+        let out2 = std::env::temp_dir().join(format!("av-legacy-out-{}", std::process::id()));
+        std::fs::create_dir_all(&out2).ok();
+        let ex2 = v2r.extract(&entry, &out2).unwrap();
+        assert_eq!(std::fs::read(&ex2).unwrap(), payload, "v2 legacy round-trip");
+
+        // --- v3 default container ---
+        let v3 = Vault::create(CreateOptions::new(&v3_path, "modern-password-123")).unwrap();
+        v3.add_files(&[&input]).unwrap();
+        assert_eq!(Vault::peek(&v3_path).unwrap().version, VERSION);
+
+        let v3r = Vault::open(&v3_path, "modern-password-123").unwrap();
+        let out3 = std::env::temp_dir().join(format!("av-v3-out-{}", std::process::id()));
+        std::fs::create_dir_all(&out3).ok();
+        let ex3 = v3r.extract(&entry, &out3).unwrap();
+        assert_eq!(std::fs::read(&ex3).unwrap(), payload, "v3 round-trip");
+
+        // An unsupported version is rejected at create time.
+        assert!(
+            Vault::create(CreateOptions::new(temp_vault_path(), "x-password-123").with_version(9))
+                .is_err()
+        );
+
+        std::fs::remove_file(&v2_path).ok();
+        std::fs::remove_file(&v3_path).ok();
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_dir_all(&out2).ok();
+        std::fs::remove_dir_all(&out3).ok();
+    }
+
+    #[test]
     fn test_cascade_mode() {
         let path = temp_vault_path();
-        let opts = CreateOptions::new(&path, "test-password-123")
-            .with_mode(EncryptionMode::Cascade);
+        let opts =
+            CreateOptions::new(&path, "test-password-123").with_mode(EncryptionMode::Cascade);
         let vault = Vault::create(opts).unwrap();
 
         assert_eq!(vault.mode(), EncryptionMode::Cascade);
@@ -1577,7 +1711,9 @@ mod tests {
         let vault2 = Vault::open(&path, "test-password-123").unwrap();
         let out_dir = std::env::temp_dir().join("aerovault-cascade-output");
         std::fs::create_dir_all(&out_dir).ok();
-        let extracted = vault2.extract("aerovault-cascade-input.txt", &out_dir).unwrap();
+        let extracted = vault2
+            .extract("aerovault-cascade-input.txt", &out_dir)
+            .unwrap();
         let content = std::fs::read_to_string(&extracted).unwrap();
         assert_eq!(content, "Cascade mode test");
 
@@ -1731,7 +1867,9 @@ mod tests {
 
         let names: Vec<String> = vault.list().unwrap().into_iter().map(|e| e.name).collect();
         assert!(names.iter().any(|n| n == "archive/old"));
-        assert!(names.iter().any(|n| n == "archive/old/aerovault-move-input.txt"));
+        assert!(names
+            .iter()
+            .any(|n| n == "archive/old/aerovault-move-input.txt"));
         assert!(!names.iter().any(|n| n == "docs/old"));
 
         let out_dir = temp_dir.join("aerovault-move-output");
@@ -1779,7 +1917,9 @@ mod tests {
 
         let out_dir = std::env::temp_dir().join("aerovault-copy-output-dir");
         std::fs::create_dir_all(&out_dir).ok();
-        let extracted = vault.extract("aerovault-copy-output.txt", &out_dir).unwrap();
+        let extracted = vault
+            .extract("aerovault-copy-output.txt", &out_dir)
+            .unwrap();
         let content = std::fs::read_to_string(extracted).unwrap();
         assert_eq!(content, "copy me");
 
@@ -1798,10 +1938,14 @@ mod tests {
 
         let test_file = std::env::temp_dir().join("aerovault-copy-tree-input.txt");
         std::fs::write(&test_file, b"tree copy").unwrap();
-        vault.add_files_to_dir(&[&test_file], "docs/original").unwrap();
+        vault
+            .add_files_to_dir(&[&test_file], "docs/original")
+            .unwrap();
 
         vault.create_directory("archive").unwrap();
-        vault.copy_entry("docs/original", "archive/original-copy").unwrap();
+        vault
+            .copy_entry("docs/original", "archive/original-copy")
+            .unwrap();
 
         let names: Vec<String> = vault.list().unwrap().into_iter().map(|e| e.name).collect();
         assert!(names.iter().any(|n| n == "docs/original"));

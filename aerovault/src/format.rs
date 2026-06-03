@@ -50,7 +50,7 @@ impl HeaderFlags {
 /// | Offset | Size | Field |
 /// |--------|------|-------|
 /// | 0 | 10 | Magic (`AEROVAULT2`) |
-/// | 10 | 1 | Version (2) |
+/// | 10 | 1 | Version (2 legacy, 3 current) |
 /// | 11 | 1 | Flags (bit 0 = cascade) |
 /// | 12 | 32 | Argon2id salt |
 /// | 44 | 40 | AES-KW wrapped master key |
@@ -62,7 +62,7 @@ impl HeaderFlags {
 pub struct VaultHeader {
     /// Magic bytes: `AEROVAULT2`.
     pub magic: [u8; 10],
-    /// Format version (currently 2).
+    /// Format version.
     pub version: u8,
     /// Header flags.
     pub flags: HeaderFlags,
@@ -118,7 +118,7 @@ impl VaultHeader {
         }
 
         let version = data[10];
-        if version != VERSION {
+        if version != VERSION && version != LEGACY_VERSION {
             return Err(FormatError::UnsupportedVersion(version).into());
         }
 
@@ -210,6 +210,10 @@ pub struct ManifestEntry {
 
     /// Number of encrypted chunks.
     pub chunk_count: u32,
+
+    /// Random per-file id used by v3 chunk AAD binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<[u8; 16]>,
 
     /// `true` for directory entries (manifest-only, no data section).
     #[serde(default)]

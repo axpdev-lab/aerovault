@@ -38,11 +38,29 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::constants::*;
 use crate::error::CryptoError;
 
+const CHUNK_AAD_V3_PREFIX: &[u8] = b"AeroVault v2 chunk aad v3";
+
+fn chunk_aad(chunk_index: u32, file_id: Option<&[u8; 16]>, chunk_count: u32) -> Vec<u8> {
+    if let Some(file_id) = file_id {
+        let mut aad = Vec::with_capacity(CHUNK_AAD_V3_PREFIX.len() + 16 + 4 + 4);
+        aad.extend_from_slice(CHUNK_AAD_V3_PREFIX);
+        aad.extend_from_slice(file_id);
+        aad.extend_from_slice(&chunk_count.to_le_bytes());
+        aad.extend_from_slice(&chunk_index.to_le_bytes());
+        aad
+    } else {
+        chunk_index.to_le_bytes().to_vec()
+    }
+}
+
 /// Derive a 32-byte base KEK from a password and salt using Argon2id.
 ///
 /// Parameters: 128 MiB memory, 4 iterations, 4 parallelism threads.
 /// This exceeds OWASP 2024 recommendations.
-pub(crate) fn derive_key(password: &SecretString, salt: &[u8; SALT_SIZE]) -> crate::Result<SecretVec<u8>> {
+pub(crate) fn derive_key(
+    password: &SecretString,
+    salt: &[u8; SALT_SIZE],
+) -> crate::Result<SecretVec<u8>> {
     use argon2::Argon2;
 
     let params = argon2::Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
@@ -62,7 +80,9 @@ pub(crate) fn derive_key(password: &SecretString, salt: &[u8; SALT_SIZE]) -> cra
 /// Returns `(kek_master, kek_mac)` — two independent 32-byte keys for
 /// wrapping the master key and the MAC key respectively.
 /// Both keys are auto-zeroized when dropped.
-pub(crate) fn derive_kek_pair(base_kek: &[u8]) -> (Zeroizing<[u8; KEY_SIZE]>, Zeroizing<[u8; KEY_SIZE]>) {
+pub(crate) fn derive_kek_pair(
+    base_kek: &[u8],
+) -> (Zeroizing<[u8; KEY_SIZE]>, Zeroizing<[u8; KEY_SIZE]>) {
     let hkdf = Hkdf::<Sha256>::new(None, base_kek);
 
     let mut kek_master = Zeroizing::new([0u8; KEY_SIZE]);
@@ -159,7 +179,10 @@ pub(crate) fn encrypt_filename(master_key: &[u8], plaintext: &str) -> crate::Res
 }
 
 /// Decrypt a filename (or manifest JSON) from BASE64URL_NOPAD-encoded AES-256-SIV ciphertext.
-pub(crate) fn decrypt_filename(master_key: &[u8], encoded_ciphertext: &str) -> crate::Result<String> {
+pub(crate) fn decrypt_filename(
+    master_key: &[u8],
+    encoded_ciphertext: &str,
+) -> crate::Result<String> {
     use aes_siv::Aes256SivAead;
     use aes_siv::KeyInit as SivKeyInit;
 
@@ -188,10 +211,21 @@ pub(crate) fn decrypt_filename(master_key: &[u8], encoded_ciphertext: &str) -> c
 /// each chunk to its position, preventing reordering attacks.
 ///
 /// A random 12-byte nonce is prepended to the ciphertext.
+#[allow(dead_code)]
 pub(crate) fn encrypt_chunk(
     master_key: &[u8],
     plaintext: &[u8],
     chunk_index: u32,
+) -> crate::Result<Vec<u8>> {
+    encrypt_chunk_bound(master_key, plaintext, chunk_index, None, 0)
+}
+
+pub(crate) fn encrypt_chunk_bound(
+    master_key: &[u8],
+    plaintext: &[u8],
+    chunk_index: u32,
+    file_id: Option<&[u8; 16]>,
+    chunk_count: u32,
 ) -> crate::Result<Vec<u8>> {
     let cipher = Aes256GcmSiv::new_from_slice(master_key)
         .map_err(|e| CryptoError::SivOperation(e.to_string()))?;
@@ -200,7 +234,7 @@ pub(crate) fn encrypt_chunk(
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let aad = chunk_index.to_le_bytes();
+    let aad = chunk_aad(chunk_index, file_id, chunk_count);
 
     let ciphertext = cipher
         .encrypt(
@@ -210,9 +244,7 @@ pub(crate) fn encrypt_chunk(
                 aad: &aad,
             },
         )
-        .map_err(|_| CryptoError::ChunkEncrypt {
-            chunk_index,
-        })?;
+        .map_err(|_| CryptoError::ChunkEncrypt { chunk_index })?;
 
     // nonce || ciphertext || tag (tag is appended by the AEAD)
     let mut output = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -224,10 +256,21 @@ pub(crate) fn encrypt_chunk(
 /// Decrypt a chunk encrypted with AES-256-GCM-SIV.
 ///
 /// Input format: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
+#[allow(dead_code)]
 pub(crate) fn decrypt_chunk(
     master_key: &[u8],
     encrypted: &[u8],
     chunk_index: u32,
+) -> crate::Result<Vec<u8>> {
+    decrypt_chunk_bound(master_key, encrypted, chunk_index, None, 0)
+}
+
+pub(crate) fn decrypt_chunk_bound(
+    master_key: &[u8],
+    encrypted: &[u8],
+    chunk_index: u32,
+    file_id: Option<&[u8; 16]>,
+    chunk_count: u32,
 ) -> crate::Result<Vec<u8>> {
     if encrypted.len() < NONCE_SIZE + TAG_SIZE {
         return Err(CryptoError::ChunkDecrypt { chunk_index }.into());
@@ -238,7 +281,7 @@ pub(crate) fn decrypt_chunk(
 
     let nonce = Nonce::from_slice(&encrypted[..NONCE_SIZE]);
     let ciphertext = &encrypted[NONCE_SIZE..];
-    let aad = chunk_index.to_le_bytes();
+    let aad = chunk_aad(chunk_index, file_id, chunk_count);
 
     cipher
         .decrypt(
@@ -255,14 +298,26 @@ pub(crate) fn decrypt_chunk(
 ///
 /// This provides defense-in-depth: data remains confidential even if one of the
 /// two algorithms is compromised.
+#[allow(dead_code)]
 pub(crate) fn encrypt_chunk_cascade(
     master_key: &[u8],
     chacha_key: &[u8; KEY_SIZE],
     plaintext: &[u8],
     chunk_index: u32,
 ) -> crate::Result<Vec<u8>> {
+    encrypt_chunk_cascade_bound(master_key, chacha_key, plaintext, chunk_index, None, 0)
+}
+
+pub(crate) fn encrypt_chunk_cascade_bound(
+    master_key: &[u8],
+    chacha_key: &[u8; KEY_SIZE],
+    plaintext: &[u8],
+    chunk_index: u32,
+    file_id: Option<&[u8; 16]>,
+    chunk_count: u32,
+) -> crate::Result<Vec<u8>> {
     // First layer: AES-256-GCM-SIV
-    let inner = encrypt_chunk(master_key, plaintext, chunk_index)?;
+    let inner = encrypt_chunk_bound(master_key, plaintext, chunk_index, file_id, chunk_count)?;
 
     // Second layer: ChaCha20-Poly1305
     let chacha = ChaCha20Poly1305::new_from_slice(chacha_key)
@@ -272,7 +327,7 @@ pub(crate) fn encrypt_chunk_cascade(
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
 
-    let aad = chunk_index.to_le_bytes();
+    let aad = chunk_aad(chunk_index, file_id, chunk_count);
     let outer = chacha
         .encrypt(
             nonce,
@@ -290,11 +345,23 @@ pub(crate) fn encrypt_chunk_cascade(
 }
 
 /// Decrypt a cascade-encrypted chunk: ChaCha20-Poly1305 then AES-256-GCM-SIV.
+#[allow(dead_code)]
 pub(crate) fn decrypt_chunk_cascade(
     master_key: &[u8],
     chacha_key: &[u8; KEY_SIZE],
     encrypted: &[u8],
     chunk_index: u32,
+) -> crate::Result<Vec<u8>> {
+    decrypt_chunk_cascade_bound(master_key, chacha_key, encrypted, chunk_index, None, 0)
+}
+
+pub(crate) fn decrypt_chunk_cascade_bound(
+    master_key: &[u8],
+    chacha_key: &[u8; KEY_SIZE],
+    encrypted: &[u8],
+    chunk_index: u32,
+    file_id: Option<&[u8; 16]>,
+    chunk_count: u32,
 ) -> crate::Result<Vec<u8>> {
     if encrypted.len() < NONCE_SIZE + TAG_SIZE {
         return Err(CryptoError::CascadeDecrypt { chunk_index }.into());
@@ -306,7 +373,7 @@ pub(crate) fn decrypt_chunk_cascade(
 
     let nonce = chacha20poly1305::Nonce::from_slice(&encrypted[..NONCE_SIZE]);
     let ciphertext = &encrypted[NONCE_SIZE..];
-    let aad = chunk_index.to_le_bytes();
+    let aad = chunk_aad(chunk_index, file_id, chunk_count);
 
     let inner = chacha
         .decrypt(
@@ -319,7 +386,7 @@ pub(crate) fn decrypt_chunk_cascade(
         .map_err(|_| CryptoError::CascadeDecrypt { chunk_index })?;
 
     // Peel inner layer: AES-256-GCM-SIV
-    decrypt_chunk(master_key, &inner, chunk_index)
+    decrypt_chunk_bound(master_key, &inner, chunk_index, file_id, chunk_count)
 }
 
 /// Validate that a manifest length is within bounds.
@@ -416,6 +483,22 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_wrong_file_id_fails() {
+        let key = [5u8; KEY_SIZE];
+        let plaintext = b"data";
+        let file_a = [1u8; 16];
+        let file_b = [2u8; 16];
+        let encrypted = encrypt_chunk_bound(&key, plaintext, 0, Some(&file_a), 1).unwrap();
+
+        assert_eq!(
+            decrypt_chunk_bound(&key, &encrypted, 0, Some(&file_a), 1).unwrap(),
+            plaintext
+        );
+        assert!(decrypt_chunk_bound(&key, &encrypted, 0, Some(&file_b), 1).is_err());
+        assert!(decrypt_chunk_bound(&key, &encrypted, 0, Some(&file_a), 2).is_err());
+    }
+
+    #[test]
     fn test_cascade_roundtrip() {
         let master = [8u8; KEY_SIZE];
         let chacha = derive_chacha_key(&master);
@@ -432,6 +515,25 @@ mod tests {
         let plaintext = b"data";
         let encrypted = encrypt_chunk_cascade(&master, &chacha, plaintext, 0).unwrap();
         assert!(decrypt_chunk_cascade(&master, &chacha, &encrypted, 1).is_err());
+    }
+
+    #[test]
+    fn test_cascade_wrong_file_id_fails() {
+        let master = [8u8; KEY_SIZE];
+        let chacha = derive_chacha_key(&master);
+        let plaintext = b"data";
+        let file_a = [1u8; 16];
+        let file_b = [2u8; 16];
+        let encrypted =
+            encrypt_chunk_cascade_bound(&master, &chacha, plaintext, 0, Some(&file_a), 1).unwrap();
+
+        assert_eq!(
+            decrypt_chunk_cascade_bound(&master, &chacha, &encrypted, 0, Some(&file_a), 1).unwrap(),
+            plaintext
+        );
+        assert!(
+            decrypt_chunk_cascade_bound(&master, &chacha, &encrypted, 0, Some(&file_b), 1).is_err()
+        );
     }
 
     #[test]

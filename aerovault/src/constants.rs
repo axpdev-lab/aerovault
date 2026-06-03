@@ -6,8 +6,11 @@
 /// Magic bytes identifying an AeroVault v2 file.
 pub const MAGIC: &[u8; 10] = b"AEROVAULT2";
 
-/// Current format version.
-pub const VERSION: u8 = 2;
+/// Legacy v2 format version. Chunk AAD binds only the per-file chunk index.
+pub const LEGACY_VERSION: u8 = 2;
+
+/// Current format version. Chunk AAD binds file id, chunk count, and chunk index.
+pub const VERSION: u8 = 3;
 
 /// Total header size in bytes.
 pub const HEADER_SIZE: usize = 512;
