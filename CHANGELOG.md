@@ -2,6 +2,31 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.4.1] - 2026-06-03
+
+### Security (dual-independent audit remediation)
+
+Hardens the v2/v3 extract and atomic-write paths. No format change; all 0.4.0
+containers remain readable and byte-identical on re-create.
+
+#### Fixed
+- **Symlink write-through on extract (High, AV-001 / CODEX-AV-001).** Extraction
+  now opens the output with `O_NOFOLLOW` + `create_new`, verifies the opened
+  fd's device/inode against the path, and re-checks canonical containment, so a
+  pre-planted destination symlink can no longer redirect decrypted plaintext
+  outside the extraction root.
+- **Unauthenticated `chunk_len` pre-read allocation (Medium, AV-006 /
+  CODEX-AV-002).** Each per-chunk length is validated against the header
+  `chunk_size` + AEAD overhead and the bytes remaining in the file before
+  allocating, rejecting an over-declared length instead of attempting a giant
+  allocation.
+- **Relative-path atomic write (AV-011).** `fsync_parent_dir` treats an empty
+  parent as `"."`, so creating/compacting/changing the password of a vault given
+  a bare relative filename no longer reports failure on success.
+- **Reserved header region now authenticated (AV-012).** The 320-byte reserved
+  region is carried through the header struct so the HMAC-SHA512 covers the full
+  512-byte header, and non-zero reserved bytes are rejected on read.
+
 ## [0.4.0] - 2026-06-03
 
 ### Container format v3 (file-id-bound chunk AAD)
