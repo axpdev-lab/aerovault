@@ -2,6 +2,17 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.4.2] - 2026-06-03
+
+### Documentation / metadata only (no code or format change)
+
+- Refresh the package description (drop the em-dash, note the CLI).
+- README: replace the stale "chunk index AAD" security note with the current
+  file-id-bound chunk AAD plus the new extract hardening, and add an
+  Acknowledgements section crediting **Ehud Kirsh (E. Kirsh)** for the
+  wrapper-stack pipeline model design contribution (AeroFTP issue #162).
+- `aerovault-cli` republished at the same version to keep the two crates aligned.
+
 ## [0.4.1] - 2026-06-03
 
 ### Security (dual-independent audit remediation)
