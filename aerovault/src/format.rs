@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::constants::*;
 use crate::error::{CryptoError, FormatError};
 
+const HEADER_RESERVED_START: usize = 128;
+const HEADER_RESERVED_END: usize = HEADER_SIZE - MAC_SIZE;
+const HEADER_RESERVED_SIZE: usize = HEADER_RESERVED_END - HEADER_RESERVED_START;
+
 /// Encryption mode for vault content chunks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EncryptionMode {
@@ -74,7 +78,9 @@ pub struct VaultHeader {
     pub wrapped_mac_key: [u8; WRAPPED_KEY_SIZE],
     /// Plaintext chunk size in bytes.
     pub chunk_size: u32,
-    /// HMAC-SHA512 of header bytes 0..128.
+    /// Reserved bytes copied from disk so MAC verification covers the raw header.
+    pub(crate) reserved: [u8; HEADER_RESERVED_SIZE],
+    /// HMAC-SHA512 of the full 512-byte header with this MAC field zeroed.
     pub header_mac: [u8; MAC_SIZE],
 }
 
@@ -92,7 +98,7 @@ impl VaultHeader {
         buf[44..84].copy_from_slice(&self.wrapped_master_key);
         buf[84..124].copy_from_slice(&self.wrapped_mac_key);
         buf[124..128].copy_from_slice(&self.chunk_size.to_le_bytes());
-        // bytes 128..448 remain zero (reserved)
+        buf[HEADER_RESERVED_START..HEADER_RESERVED_END].copy_from_slice(&self.reserved);
         buf[HEADER_SIZE - MAC_SIZE..].copy_from_slice(&self.header_mac);
 
         buf
@@ -135,6 +141,12 @@ impl VaultHeader {
 
         let chunk_size = u32::from_le_bytes([data[124], data[125], data[126], data[127]]);
 
+        let mut reserved = [0u8; HEADER_RESERVED_SIZE];
+        reserved.copy_from_slice(&data[HEADER_RESERVED_START..HEADER_RESERVED_END]);
+        if reserved.iter().any(|&byte| byte != 0) {
+            return Err(FormatError::ReservedBytesNonZero.into());
+        }
+
         let mut header_mac = [0u8; MAC_SIZE];
         header_mac.copy_from_slice(&data[HEADER_SIZE - MAC_SIZE..]);
 
@@ -146,6 +158,7 @@ impl VaultHeader {
             wrapped_master_key,
             wrapped_mac_key,
             chunk_size,
+            reserved,
             header_mac,
         })
     }

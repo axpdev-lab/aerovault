@@ -38,6 +38,8 @@ pub enum FormatError {
     ManifestTruncated,
     /// Invalid chunk size in header.
     InvalidChunkSize(u32),
+    /// Reserved header bytes must be zero.
+    ReservedBytesNonZero,
 }
 
 /// Errors from cryptographic operations.
@@ -83,7 +85,9 @@ impl fmt::Display for FormatError {
             FormatError::TooSmall { actual, expected } => {
                 write!(f, "file too small ({actual} bytes, need {expected})")
             }
-            FormatError::InvalidMagic => write!(f, "invalid magic bytes (not an AeroVault v2 file)"),
+            FormatError::InvalidMagic => {
+                write!(f, "invalid magic bytes (not an AeroVault v2 file)")
+            }
             FormatError::UnsupportedVersion(v) => write!(f, "unsupported version {v}"),
             FormatError::ManifestTooLarge(size) => {
                 write!(f, "manifest too large ({size} bytes, max 64 MiB)")
@@ -91,6 +95,9 @@ impl fmt::Display for FormatError {
             FormatError::ManifestTruncated => write!(f, "manifest data truncated"),
             FormatError::InvalidChunkSize(size) => {
                 write!(f, "invalid chunk size {size} (must be 4 KiB - 16 MiB)")
+            }
+            FormatError::ReservedBytesNonZero => {
+                write!(f, "reserved header bytes must be zero")
             }
         }
     }
@@ -101,7 +108,9 @@ impl fmt::Display for CryptoError {
         match self {
             CryptoError::KeyDerivation(msg) => write!(f, "key derivation failed: {msg}"),
             CryptoError::KeyUnwrap => write!(f, "key unwrap failed (wrong password?)"),
-            CryptoError::HeaderMacMismatch => write!(f, "header MAC mismatch (tampered or wrong password)"),
+            CryptoError::HeaderMacMismatch => {
+                write!(f, "header MAC mismatch (tampered or wrong password)")
+            }
             CryptoError::ChunkEncrypt { chunk_index } => {
                 write!(f, "chunk {chunk_index} encryption failed")
             }

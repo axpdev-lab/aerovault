@@ -4,7 +4,7 @@
 //! AeroVault v2 containers. All mutations use atomic writes (temp + fsync + rename)
 //! to prevent data corruption on crash or power loss.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 
 use crate::constants::*;
 use crate::crypto;
-use crate::error::{CryptoError, FormatError};
+use crate::error::{CryptoError, Error, FormatError};
 use crate::format::*;
 
 /// Minimum allowed chunk size (4 KiB).
@@ -151,6 +151,7 @@ impl Vault {
             wrapped_master_key: wrapped_master,
             wrapped_mac_key: wrapped_mac,
             chunk_size: opts.chunk_size,
+            reserved: [0u8; 320],
             header_mac: [0u8; MAC_SIZE],
         };
         header.header_mac = header.compute_mac(&mac_key_raw);
@@ -654,7 +655,8 @@ impl Vault {
 
         // Skip manifest
         let (manifest_len, _manifest_data) = crypto::read_manifest_bounded(&mut reader)?;
-        let _ = manifest_len;
+        let data_start = HEADER_SIZE as u64 + 4 + manifest_len as u64;
+        let vault_len = std::fs::metadata(&self.path)?.len();
 
         // Skip to entry offset
         let mut skipped = 0u64;
@@ -679,14 +681,24 @@ impl Vault {
             std::fs::create_dir_all(parent)?;
         }
 
-        let out_file = File::create(&dest_path)?;
+        let out_file = open_new_output_file(&dest_path, output_dir)?;
         let mut writer = BufWriter::new(out_file);
 
         // Read and decrypt chunks
+        let mut entry_bytes_consumed = 0u64;
         for chunk_idx in 0..entry.chunk_count {
             let mut len_buf = [0u8; 4];
             reader.read_exact(&mut len_buf)?;
             let chunk_len = u32::from_le_bytes(len_buf) as usize;
+            let bytes_remaining =
+                vault_len.saturating_sub(data_start + entry.offset + entry_bytes_consumed + 4);
+            validate_encrypted_chunk_len(
+                chunk_len,
+                bytes_remaining,
+                self.header.chunk_size,
+                cascade_mode,
+            )?;
+            entry_bytes_consumed += 4 + chunk_len as u64;
 
             let mut encrypted_chunk = vec![0u8; chunk_len];
             reader.read_exact(&mut encrypted_chunk)?;
@@ -1168,10 +1180,20 @@ impl Vault {
             let entry_new_offset = new_data_offset;
             orig_reader.seek(std::io::SeekFrom::Start(data_start + entry.offset))?;
 
+            let mut entry_bytes_consumed = 0u64;
             for chunk_idx in 0..entry.chunk_count {
                 let mut len_buf = [0u8; 4];
                 orig_reader.read_exact(&mut len_buf)?;
                 let encrypted_chunk_len = u32::from_le_bytes(len_buf) as usize;
+                let bytes_remaining = original_size
+                    .saturating_sub(data_start + entry.offset + entry_bytes_consumed + 4);
+                validate_encrypted_chunk_len(
+                    encrypted_chunk_len,
+                    bytes_remaining,
+                    self.header.chunk_size,
+                    cascade_mode,
+                )?;
+                entry_bytes_consumed += 4 + encrypted_chunk_len as u64;
 
                 let mut encrypted_chunk = vec![0u8; encrypted_chunk_len];
                 orig_reader.read_exact(&mut encrypted_chunk)?;
@@ -1308,6 +1330,7 @@ impl Vault {
             wrapped_master_key: new_wrapped_master,
             wrapped_mac_key: new_wrapped_mac,
             chunk_size: self.header.chunk_size,
+            reserved: [0u8; 320],
             header_mac: [0u8; MAC_SIZE],
         };
         new_header.header_mac = new_header.compute_mac(self.mac_key.expose_secret());
@@ -1493,9 +1516,96 @@ fn validate_output_path(path: &Path, output_dir: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+fn validate_encrypted_chunk_len(
+    chunk_len: usize,
+    bytes_remaining: u64,
+    header_chunk_size: u32,
+    cascade_mode: bool,
+) -> crate::Result<()> {
+    let aead_overhead = NONCE_SIZE + TAG_SIZE;
+    let max_len =
+        header_chunk_size as usize + aead_overhead + if cascade_mode { aead_overhead } else { 0 };
+
+    if chunk_len > max_len {
+        return Err(Error::Format(FormatError::InvalidChunkSize(
+            chunk_len as u32,
+        )));
+    }
+    if chunk_len as u64 > bytes_remaining {
+        return Err(Error::Format(FormatError::ManifestTruncated));
+    }
+    Ok(())
+}
+
+fn open_new_output_file(path: &Path, output_dir: &Path) -> crate::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    validate_output_path(path, output_dir)?;
+
+    let canonical_dir = output_dir.canonicalize()?;
+    let canonical_parent = path
+        .parent()
+        .ok_or_else(|| Error::InvalidPath(format!("missing parent for {}", path.display())))?
+        .canonicalize()?;
+    if !canonical_parent.starts_with(&canonical_dir) {
+        return Err(Error::InvalidPath(format!(
+            "output path escapes target directory: {}",
+            path.display()
+        )));
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        let fd_meta = file.metadata()?;
+        let path_meta = std::fs::symlink_metadata(path)?;
+        if !path_meta.file_type().is_file()
+            || fd_meta.dev() != path_meta.dev()
+            || fd_meta.ino() != path_meta.ino()
+        {
+            return Err(Error::InvalidPath(format!(
+                "output path is not the newly-created regular file: {}",
+                path.display()
+            )));
+        }
+        let canonical_path = path.canonicalize()?;
+        if !canonical_path.starts_with(&canonical_dir) {
+            return Err(Error::InvalidPath(format!(
+                "output path escapes target directory: {}",
+                path.display()
+            )));
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let file = options.open(path)?;
+        let canonical_path = path.canonicalize()?;
+        if !canonical_path.starts_with(&canonical_dir) {
+            return Err(Error::InvalidPath(format!(
+                "output path escapes target directory: {}",
+                path.display()
+            )));
+        }
+        Ok(file)
+    }
+}
+
 #[cfg(unix)]
 fn fsync_parent_dir(path: &Path) -> crate::Result<()> {
     if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
         let dir = File::open(parent)?;
         dir.sync_all()?;
     }
@@ -1666,7 +1776,11 @@ mod tests {
         let out2 = std::env::temp_dir().join(format!("av-legacy-out-{}", std::process::id()));
         std::fs::create_dir_all(&out2).ok();
         let ex2 = v2r.extract(&entry, &out2).unwrap();
-        assert_eq!(std::fs::read(&ex2).unwrap(), payload, "v2 legacy round-trip");
+        assert_eq!(
+            std::fs::read(&ex2).unwrap(),
+            payload,
+            "v2 legacy round-trip"
+        );
 
         // --- v3 default container ---
         let v3 = Vault::create(CreateOptions::new(&v3_path, "modern-password-123")).unwrap();
@@ -1680,10 +1794,10 @@ mod tests {
         assert_eq!(std::fs::read(&ex3).unwrap(), payload, "v3 round-trip");
 
         // An unsupported version is rejected at create time.
-        assert!(
-            Vault::create(CreateOptions::new(temp_vault_path(), "x-password-123").with_version(9))
-                .is_err()
-        );
+        assert!(Vault::create(
+            CreateOptions::new(temp_vault_path(), "x-password-123").with_version(9)
+        )
+        .is_err());
 
         std::fs::remove_file(&v2_path).ok();
         std::fs::remove_file(&v3_path).ok();

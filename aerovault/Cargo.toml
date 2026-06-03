@@ -24,3 +24,4 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hkdf = { workspace = true }
 zeroize = { workspace = true }
+libc = { workspace = true }
