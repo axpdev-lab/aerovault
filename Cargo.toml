@@ -10,7 +10,7 @@ authors = ["axpdev-lab <dev@axpdev.it>"]
 repository = "https://github.com/axpdev-lab/aerovault"
 homepage = "https://github.com/axpdev-lab/aerovault"
 documentation = "https://docs.rs/aerovault"
-description = "Military-grade encrypted vault format — AES-256-GCM-SIV, Argon2id, AES-KW, HMAC-SHA512"
+description = "Military-grade encrypted vault format and CLI: AES-256-GCM-SIV, Argon2id, AES-KW, HMAC-SHA512"
 keywords = ["encryption", "vault", "aes-gcm-siv", "argon2", "cryptography"]
 categories = ["cryptography", "command-line-utilities"]
 

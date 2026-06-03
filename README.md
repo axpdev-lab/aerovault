@@ -138,7 +138,9 @@ See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the complete bina
 
 - All key material is zeroized after use
 - Constant-time MAC comparison prevents timing attacks
-- Chunk index AAD prevents reordering attacks
+- File-id-bound chunk AAD (current format) prevents chunk splicing and reordering
+- Extraction opens outputs with `O_NOFOLLOW` + `create_new` to refuse symlink redirection
+- Per-chunk lengths are bounds-checked before allocation
 - Atomic writes prevent corruption on crash
 - 128 MiB Argon2id makes GPU brute-force impractical
 
@@ -149,3 +151,13 @@ GPL-3.0 -- See [LICENSE](LICENSE) for details.
 ## Origin
 
 AeroVault v2 was originally developed as the encryption engine for [AeroFTP](https://github.com/axpdev-lab/aeroftp), a professional FTP/SFTP/cloud client. This standalone crate makes the format available for any Rust project.
+
+## Acknowledgements
+
+From the v3 format work onward, the AeroVault wrapper-stack pipeline model (the
+packing / chunking / chunk-id / compression / crypt / cipher-hash taxonomy) is a
+design contribution by **Ehud Kirsh (E. Kirsh)**, AeroFTP issue
+[#162](https://github.com/axpdev-lab/aeroftp/issues/162), 2026. Ehud has also
+provided sustained community testing of AeroVault across releases. The
+wrapper-stack format itself is implemented in the AeroFTP application; this crate
+provides the stable v2 / current-format library it builds on.
