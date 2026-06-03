@@ -10,7 +10,9 @@
 
 Military-grade encrypted vault format for single-file encrypted containers.
 
-AeroVault v2 combines **AES-256-GCM-SIV** (nonce misuse-resistant), **Argon2id** (128 MiB), **AES-256-KW** key wrapping, and optional **ChaCha20-Poly1305** cascade encryption into a portable `.aerovault` file format.
+AeroVault combines **AES-256-GCM-SIV** (nonce misuse-resistant), **Argon2id** (128 MiB), **AES-256-KW** key wrapping, and optional **ChaCha20-Poly1305** cascade encryption into a portable `.aerovault` file format.
+
+The current container format is **v3**, which binds a per-file 16-byte `file_id` into the chunk AAD to prevent chunk splicing and reordering. Existing **v2** containers stay fully supported (read, write, and in-place re-encrypt); the crypto stack below is shared by both.
 
 ## Cryptographic Stack
 
@@ -121,11 +123,11 @@ vault.copy_entry("archive/secret.pdf", "backup/secret.pdf")?;
 
 ## Format Specification
 
-See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the complete binary format specification.
+See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the base binary layout. The current **v3** container keeps that layout and adds a per-file 16-byte `file_id` to the chunk AAD (inner AEAD and the optional ChaCha20-Poly1305 cascade). The `file_id` is stored in the AES-SIV-authenticated manifest and the on-disk version is covered by the HMAC-SHA512 header MAC, so neither can be stripped to force the legacy path. See the [CHANGELOG](CHANGELOG.md) (0.4.0) for the v3 delta.
 
 ## vs Cryptomator
 
-| | AeroVault v2 | Cryptomator v8 |
+| | AeroVault | Cryptomator v8 |
 |---|---|---|
 | KDF | Argon2id (128 MiB) | scrypt (64 MiB) |
 | Content cipher | AES-256-GCM-SIV | AES-256-GCM |
@@ -150,7 +152,7 @@ GPL-3.0 -- See [LICENSE](LICENSE) for details.
 
 ## Origin
 
-AeroVault v2 was originally developed as the encryption engine for [AeroFTP](https://github.com/axpdev-lab/aeroftp), a professional FTP/SFTP/cloud client. This standalone crate makes the format available for any Rust project.
+AeroVault was originally developed as the encryption engine for [AeroFTP](https://github.com/axpdev-lab/aeroftp), a professional FTP/SFTP/cloud client. This standalone crate makes the format available for any Rust project.
 
 ## Acknowledgements
 
