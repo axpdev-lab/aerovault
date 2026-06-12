@@ -296,8 +296,18 @@ pub(crate) fn aerocorrect_windows(total_len: u64, window: u64) -> Vec<(u64, u64)
 #[allow(dead_code)]
 pub(crate) fn estimate_windowed_sidecar_len(total_len: u64, pct: u32, window: u64) -> u64 {
     let mut total = (HEADER_LEN + CHECKSUM_LEN) as u64;
-    for (_, len) in aerocorrect_windows(total_len, window) {
-        total += SEGMENT_HEADER_LEN as u64 + avec_len_for(len, pct);
+    let segment_len = |len| (SEGMENT_HEADER_LEN as u64).saturating_add(avec_len_for(len, pct));
+    if total_len == 0 {
+        return total.saturating_add(segment_len(0));
+    }
+    let w = window.max(1);
+    let full_windows = total_len / w;
+    let tail = total_len % w;
+    if full_windows > 0 {
+        total = total.saturating_add(full_windows.saturating_mul(segment_len(w)));
+    }
+    if tail > 0 {
+        total = total.saturating_add(segment_len(tail));
     }
     total
 }
@@ -673,6 +683,11 @@ mod tests {
                 assert_eq!(est, real, "windowed estimate != real len={len} pct={pct}");
             }
         }
+    }
+
+    #[test]
+    fn estimate_windowed_handles_huge_lengths_without_materializing_windows() {
+        assert_eq!(estimate_windowed_sidecar_len(u64::MAX, 50, 1), u64::MAX);
     }
 
     #[test]
