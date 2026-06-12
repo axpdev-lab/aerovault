@@ -1,0 +1,12 @@
+AeroCorrect cross-implementation fixture.
+Generated for AeroVault crate 0.5.0 tests and protected by AeroFTP v4 `correct gen --ec medium`.
+The payload is intentionally plain ASCII so the fixture remains easy to inspect in git, while still exercising binary-safe sidecar framing and Reed-Solomon repair.
+
+Block 000: 0123456789abcdef 89abcdef01234567 the quick brown fox checks parity windows.
+Block 001: fedcba9876543210 76543210fedcba98 content binding is SHA-256, not path binding.
+Block 002: 0011223344556677 8899aabbccddeeff repairs must be atomic and fail closed.
+Block 003: cafe0001beef0002 dead0003feed0004 one sidecar format works for any file.
+Block 004: 13579bdf2468ace0 0eca8642fdb97531 AeroFTP and the standalone crate share bytes.
+Block 005: 1123581321345589 1442333776109870 deterministic fixtures make audits calmer.
+Block 006: aa55aa55cc33cc33 0f0ff0f099996666 parity payloads live outside the container.
+Block 007: 7e57da7a5eed1234 45ab89ef0123cdef final SHA-256 gates every repair.

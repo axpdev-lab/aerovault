@@ -33,6 +33,10 @@ corresponding AeroFTP release; crate fixes ship on
   extract / atomic-write paths.
 - The crate fixes are published: `aerovault 0.4.1` (security) and `0.4.2`
   (metadata), with `aerovault-cli` realigned to 0.4.2.
+- `aerovault 0.5.0` adds the `.aerocorrect` detached Error Correction sidecar.
+  The sidecar format is shared with AeroFTP v4, binds by content SHA-256, and
+  repairs only through temp-file replacement after final SHA-256 verification.
+  It is additive and does not change the `.aerovault` container layout.
 - The v4 Wrapper-Stack (ECC) development line is cleared to start. A full "GA,
   stable without reservations" claim remains conditional on a live validation
   matrix (real GUI, real 2FA unlock, multi-GiB round-trips, crash injection),

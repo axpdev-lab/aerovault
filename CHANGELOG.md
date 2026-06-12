@@ -2,6 +2,23 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.5.0] - 2026-06-12
+
+### Error Correction (`.aerocorrect`)
+
+- Add the unified detached `.aerocorrect` Reed-Solomon sidecar format for any
+  file, including `.aerovault` containers and arbitrary standalone payloads.
+- Add the public `correct_generate`, `correct_verify`, and `correct_repair` API,
+  plus `AeroCorrectSidecar` parse / serialize helpers.
+- Add `aerovault correct {gen,verify,repair}` to generate, verify, and repair
+  standalone files with atomic all-or-nothing replacement on repair.
+- Stream generation, verify, and repair in 64 MiB windows; repair reads sidecar
+  parity on demand instead of loading the whole sidecar into memory.
+- Pin `reed-solomon-erasure` to `=6.0.0` to keep the wire format and codec
+  behavior aligned with AeroFTP v4.
+- Credit to **Ehud Kirsh** for driving the one-sidecar `.aerocorrect` format
+  direction in AeroFTP discussion #276.
+
 ## [0.4.2] - 2026-06-03
 
 ### Documentation / metadata only (no code or format change)

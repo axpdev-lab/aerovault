@@ -11,6 +11,11 @@
 
 AeroVault v2 is a single-file encrypted container format designed for maximum security with practical usability. A `.aerovault` file encapsulates an arbitrary number of files and directories in a single encrypted archive, using layered cryptography to provide defense-in-depth.
 
+Detached Error Correction is specified separately in
+[`AEROCORRECT-SPEC.md`](AEROCORRECT-SPEC.md). A `.aerocorrect` file protects the
+bytes of an `.aerovault` container or any other file without changing the
+container layout described here.
+
 ### 1.1 Design Goals
 
 - **Single-file portability**: One `.aerovault` file contains everything

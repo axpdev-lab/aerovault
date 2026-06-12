@@ -73,11 +73,17 @@
 pub(crate) mod constants;
 pub(crate) mod crypto;
 pub mod error;
+pub mod error_correction;
 pub mod format;
 pub mod vault;
 
 // Re-export primary API
 pub use error::Error;
+pub use error_correction::{
+    aerocorrect_sidecar_path_for, correct_generate, correct_repair, correct_verify,
+    AeroCorrectSegment, AeroCorrectSidecar, CorrectGenerateReport, CorrectRepairReport,
+    CorrectVerifyReport, AEROCORRECT_EXTENSION, AEROCORRECT_MAGIC, AEROCORRECT_VERSION,
+};
 pub use format::{EncryptionMode, HeaderFlags, ManifestEntry, VaultHeader, VaultManifest};
 pub use vault::{CompactResult, CreateOptions, EntryInfo, PeekInfo, Vault};
 

@@ -16,6 +16,7 @@ aerovault = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
 secrecy = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
 rpassword = "7"

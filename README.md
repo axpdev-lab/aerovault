@@ -14,6 +14,8 @@ AeroVault combines **AES-256-GCM-SIV** (nonce misuse-resistant), **Argon2id** (1
 
 The current container format is **v3**, which binds a per-file 16-byte `file_id` into the chunk AAD to prevent chunk splicing and reordering. Existing **v2** containers stay fully supported (read, write, and in-place re-encrypt); the crypto stack below is shared by both.
 
+Since 0.5.0 the crate also ships the unified `.aerocorrect` Reed-Solomon sidecar format: a detached, content-SHA-bound recovery file for any byte stream. It can protect `.aerovault` containers or ordinary files, and repair is atomic and all-or-nothing.
+
 ## Cryptographic Stack
 
 | Layer | Algorithm | Standard |
@@ -25,6 +27,7 @@ The current container format is **v3**, which binds a per-file 16-byte `file_id`
 | Filename Encryption | AES-256-SIV | RFC 5297 |
 | Header Integrity | HMAC-SHA512 | RFC 2104 |
 | Key Separation | HKDF-SHA256 | RFC 5869 |
+| Error Correction | Reed-Solomon parity sidecar | `.aerocorrect` v1 |
 
 ## Installation
 
@@ -87,6 +90,15 @@ aerovault passwd my-vault.aerovault
 
 # Check if file is an AeroVault
 aerovault check suspicious-file.bin
+
+# Generate a detached recovery sidecar for any file
+aerovault correct gen my-vault.aerovault --ec medium
+
+# Verify without modifying the file
+aerovault correct verify my-vault.aerovault
+
+# Repair in place from my-vault.aerovault.aerocorrect
+aerovault correct repair my-vault.aerovault
 ```
 
 ## Library Usage
@@ -121,9 +133,27 @@ vault.move_entry("secret.pdf", "archive/secret.pdf")?;
 vault.copy_entry("archive/secret.pdf", "backup/secret.pdf")?;
 ```
 
+### Error Correction API
+
+```rust
+use aerovault::{correct_generate, correct_repair, correct_verify};
+
+fn protect_and_repair() -> Result<(), Box<dyn std::error::Error>> {
+    let report = correct_generate("my-vault.aerovault", 15, None)?;
+    println!("wrote {}", report.sidecar);
+
+    let verified = correct_verify("my-vault.aerovault", None)?;
+    if !verified.verified {
+        let repaired = correct_repair("my-vault.aerovault", None)?;
+        println!("status: {}", repaired.status);
+    }
+    Ok(())
+}
+```
+
 ## Format Specification
 
-See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the base binary layout. The current **v3** container keeps that layout and adds a per-file 16-byte `file_id` to the chunk AAD (inner AEAD and the optional ChaCha20-Poly1305 cascade). The `file_id` is stored in the AES-SIV-authenticated manifest and the on-disk version is covered by the HMAC-SHA512 header MAC, so neither can be stripped to force the legacy path. See the [CHANGELOG](CHANGELOG.md) (0.4.0) for the v3 delta.
+See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the base binary layout. The current **v3** container keeps that layout and adds a per-file 16-byte `file_id` to the chunk AAD (inner AEAD and the optional ChaCha20-Poly1305 cascade). The `file_id` is stored in the AES-SIV-authenticated manifest and the on-disk version is covered by the HMAC-SHA512 header MAC, so neither can be stripped to force the legacy path. See [docs/AEROCORRECT-SPEC.md](docs/AEROCORRECT-SPEC.md) for the detached Error Correction sidecar. See the [CHANGELOG](CHANGELOG.md) (0.4.0, 0.5.0) for the v3 and `.aerocorrect` deltas.
 
 ## vs Cryptomator
 
@@ -143,6 +173,7 @@ See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the base binary l
 - File-id-bound chunk AAD (current format) prevents chunk splicing and reordering
 - Extraction opens outputs with `O_NOFOLLOW` + `create_new` to refuse symlink redirection
 - Per-chunk lengths are bounds-checked before allocation
+- `.aerocorrect` repair verifies the final SHA-256 before replacing the original
 - Atomic writes prevent corruption on crash
 - 128 MiB Argon2id makes GPU brute-force impractical
 

@@ -12,6 +12,10 @@ use aerovault::{CreateOptions, EncryptionMode, Vault};
 #[derive(Parser)]
 #[command(name = "aerovault", version, about, long_about = None)]
 struct Cli {
+    /// Print machine-readable JSON for commands that support structured output.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -143,6 +147,53 @@ enum Commands {
         /// Path to check.
         path: PathBuf,
     },
+
+    /// Error-correct any standalone file with a detached `.aerocorrect` sidecar.
+    Correct {
+        #[command(subcommand)]
+        command: CorrectCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CorrectCommands {
+    /// Generate a `.aerocorrect` recovery sidecar for a file.
+    Gen {
+        /// Path to the file to protect.
+        path: PathBuf,
+
+        /// Error-correction overhead level: low | medium | quartile | high | <5-50>.
+        #[arg(
+            long = "error-correction",
+            visible_alias = "ec",
+            default_value = "medium"
+        )]
+        error_correction: String,
+
+        /// Output sidecar path (default: `<file>.aerocorrect`).
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+    },
+
+    /// Verify a file against its `.aerocorrect` sidecar.
+    Verify {
+        /// Path to the file to verify.
+        path: PathBuf,
+
+        /// Sidecar path (default: `<file>.aerocorrect`).
+        #[arg(long)]
+        parity: Option<PathBuf>,
+    },
+
+    /// Repair a corrupted file in place from its `.aerocorrect` sidecar.
+    Repair {
+        /// Path to the file to repair.
+        path: PathBuf,
+
+        /// Sidecar path (default: `<file>.aerocorrect`).
+        #[arg(long)]
+        parity: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -155,6 +206,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let json = cli.json;
     match cli.command {
         Commands::Create {
             path,
@@ -261,7 +313,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let pb = spinner("Extracting all...");
                 let count = v.extract_all(&output)?;
-                pb.finish_with_message(format!("{count} entries extracted to {}", output.display()));
+                pb.finish_with_message(format!(
+                    "{count} entries extracted to {}",
+                    output.display()
+                ));
             }
         }
 
@@ -370,8 +425,106 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+
+        Commands::Correct { command } => {
+            cmd_correct(&command, json)?;
+        }
     }
 
+    Ok(())
+}
+
+const CORRECT_DEFAULT_PCT: u32 = 15;
+const CORRECT_MIN_PCT: u32 = 5;
+const CORRECT_MAX_PCT: u32 = 50;
+
+fn parse_correct_level_pct(level: &str) -> Result<u32, String> {
+    let normalized = level.trim().trim_end_matches('%').to_ascii_lowercase();
+    let pct = match normalized.as_str() {
+        "" | "medium" | "med" => CORRECT_DEFAULT_PCT,
+        "low" => 7,
+        "quartile" => 25,
+        "high" => 30,
+        other => other.parse::<u32>().map_err(|_| {
+            format!(
+                "invalid --error-correction level '{level}': expected low, medium, quartile, high, or a percentage from {CORRECT_MIN_PCT} to {CORRECT_MAX_PCT}"
+            )
+        })?,
+    };
+    Ok(pct.clamp(CORRECT_MIN_PCT, CORRECT_MAX_PCT))
+}
+
+fn path_arg(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn cmd_correct(command: &CorrectCommands, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        CorrectCommands::Gen {
+            path,
+            error_correction,
+            out,
+        } => {
+            let pct = parse_correct_level_pct(error_correction)?;
+            let path_s = path_arg(path);
+            let out_s = out.as_ref().map(|p| path_arg(p));
+            let report = aerovault::correct_generate(&path_s, pct, out_s.as_deref())?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "Wrote {} ({} bytes, {} segment(s), {} shards, {:.1}% overhead) for {}",
+                    report.sidecar,
+                    report.sidecar_size,
+                    report.segments,
+                    report.shards,
+                    report.overhead_pct,
+                    report.file
+                );
+            }
+        }
+        CorrectCommands::Verify { path, parity } => {
+            let path_s = path_arg(path);
+            let parity_s = parity.as_ref().map(|p| path_arg(p));
+            let report = aerovault::correct_verify(&path_s, parity_s.as_deref())?;
+            if json {
+                print_json(&report)?;
+            } else if report.verified {
+                println!("Verified: {} matches {}", report.file, report.sidecar);
+            } else {
+                println!(
+                    "Corruption detected in {}: run `correct repair` to recover from {}",
+                    report.file, report.sidecar
+                );
+            }
+            if !report.verified {
+                std::process::exit(1);
+            }
+        }
+        CorrectCommands::Repair { path, parity } => {
+            let path_s = path_arg(path);
+            let parity_s = parity.as_ref().map(|p| path_arg(p));
+            let report = aerovault::correct_repair(&path_s, parity_s.as_deref())?;
+            if json {
+                print_json(&report)?;
+            } else if report.repaired {
+                println!(
+                    "Repaired {} from {} ({} shard(s) reconstructed)",
+                    report.file, report.sidecar, report.recovered_shards
+                );
+            } else {
+                println!(
+                    "No repair needed: {} already matches {}",
+                    report.file, report.sidecar
+                );
+            }
+        }
+    }
     Ok(())
 }
 
