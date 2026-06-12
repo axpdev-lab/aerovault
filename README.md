@@ -1,8 +1,8 @@
-# AeroVault
-
 <p align="center">
-  <img src="docs/img/aerovault-icon-128.png" alt="AeroVault" width="96" />
+  <img src="docs/img/banner.png" alt="AeroVault" width="100%" />
 </p>
+
+# AeroVault
 
 [![Crates.io](https://img.shields.io/crates/v/aerovault)](https://crates.io/crates/aerovault)
 [![docs.rs](https://docs.rs/aerovault/badge.svg)](https://docs.rs/aerovault)
