@@ -6,8 +6,13 @@ All notable changes to the `aerovault` crate are documented here.
 
 ### Error Correction (`.aerocorrect`)
 
-- Add the unified detached `.aerocorrect` Reed-Solomon sidecar format for any
-  file, including `.aerovault` containers and arbitrary standalone payloads.
+- Add the unified detached `.aerocorrect` Reed-Solomon sidecar format (v2) for
+  any file, including `.aerovault` containers and arbitrary standalone payloads.
+- Self-healing sidecar: the critical locator metadata is stored in a
+  triplicated, per-copy-checksummed directory, so a lightly corrupted
+  `.aerocorrect` still recovers its file; the bulk parity carries no wholesale
+  checksum and rotted shards are routed around by per-shard erasure. Damage past
+  the self-heal budget fails closed. Legacy v1 sidecars are still read.
 - Add the public `correct_generate`, `correct_verify`, and `correct_repair` API,
   plus `AeroCorrectSidecar` parse / serialize helpers.
 - Add `aerovault correct {gen,verify,repair}` to generate, verify, and repair
