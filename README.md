@@ -14,7 +14,7 @@ AeroVault combines **AES-256-GCM-SIV** (nonce misuse-resistant), **Argon2id** (1
 
 The current container format is **v3**, which binds a per-file 16-byte `file_id` into the chunk AAD to prevent chunk splicing and reordering. Existing **v2** containers stay fully supported (read, write, and in-place re-encrypt); the crypto stack below is shared by both.
 
-Since 0.5.0 the crate also ships the unified `.aerocorrect` Reed-Solomon sidecar format: a detached, content-SHA-bound recovery file for any byte stream. It can protect `.aerovault` containers or ordinary files, and repair is atomic and all-or-nothing.
+Since 0.5.0 the crate also ships the unified `.aerocorrect` Reed-Solomon sidecar format: a detached, content-SHA-bound recovery file for any byte stream. It can protect `.aerovault` containers or ordinary files, repair is atomic and all-or-nothing, and the **format v2 sidecar is self-healing** so a lightly-corrupted recovery file still recovers. See [Error Correction](#error-correction-aerocorrect) below.
 
 ## Cryptographic Stack
 
@@ -27,7 +27,7 @@ Since 0.5.0 the crate also ships the unified `.aerocorrect` Reed-Solomon sidecar
 | Filename Encryption | AES-256-SIV | RFC 5297 |
 | Header Integrity | HMAC-SHA512 | RFC 2104 |
 | Key Separation | HKDF-SHA256 | RFC 5869 |
-| Error Correction | Reed-Solomon parity sidecar | `.aerocorrect` v1 |
+| Error Correction | Reed-Solomon parity sidecar | `.aerocorrect` v2 (self-healing) |
 
 ## Installation
 
@@ -154,6 +154,84 @@ fn protect_and_repair() -> Result<(), Box<dyn std::error::Error>> {
 ## Format Specification
 
 See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the base binary layout. The current **v3** container keeps that layout and adds a per-file 16-byte `file_id` to the chunk AAD (inner AEAD and the optional ChaCha20-Poly1305 cascade). The `file_id` is stored in the AES-SIV-authenticated manifest and the on-disk version is covered by the HMAC-SHA512 header MAC, so neither can be stripped to force the legacy path. See [docs/AEROCORRECT-SPEC.md](docs/AEROCORRECT-SPEC.md) for the detached Error Correction sidecar. See the [CHANGELOG](CHANGELOG.md) (0.4.0, 0.5.0) for the v3 and `.aerocorrect` deltas.
+
+## Error Correction (`.aerocorrect`)
+
+`.aerocorrect` is a detached, par2-style Reed-Solomon recovery sidecar for **any** byte stream. It protects the bytes of the target without embedding anything into it, so the same format repairs `.aerovault` containers, synced files, or ordinary standalone files. The sidecar binds to the **SHA-256 of the protected content**, not to a path, salt, account, or provider identity.
+
+<p align="center">
+  <img src="docs/img/01-where-ec-sits.png" alt="Where error correction sits in the wrapper stack" width="620" />
+</p>
+
+Error correction is the **last wrapper** in the AeroVault stack, so it protects the ciphertext bytes and never has to decode the format. For a `.aerovault` the parity lives in a sibling file by default, so the container stays byte-identical to a plain v3.
+
+<p align="center">
+  <img src="docs/img/02-placement.png" alt="Parity placement: detached sidecar by default" width="620" />
+</p>
+
+### CLI
+
+```bash
+# Generate a detached recovery sidecar (writes report.bin.aerocorrect)
+$ aerovault correct gen report.bin --ec medium
+Wrote report.bin.aerocorrect (31543 bytes, 1 segment(s), 15 shards, 15.5% overhead) for report.bin
+
+# Verify without modifying the file
+$ aerovault correct verify report.bin
+Verified: report.bin matches report.bin.aerocorrect
+
+# ...after a 4 KiB run in report.bin is overwritten with zeros...
+$ aerovault correct verify report.bin
+Corruption detected in report.bin: run `correct repair` to recover from report.bin.aerocorrect
+
+# Repair in place from the sidecar
+$ aerovault correct repair report.bin
+Repaired report.bin from report.bin.aerocorrect (1 shard(s) reconstructed)
+
+$ aerovault correct verify report.bin
+Verified: report.bin matches report.bin.aerocorrect
+```
+
+### Overhead levels
+
+CLI levels map to storage-overhead targets; the exact Reed-Solomon grid is stored in each payload, so readers reconstruct from the payload metadata rather than from a CLI-level assumption.
+
+| Level | Target overhead | Reed-Solomon grid |
+|-------|-----------------|-------------------|
+| `low` | ~7% | approx `K=14, P=1` |
+| `medium` | ~15% | approx `K=13, P=2` |
+| `quartile` | ~25% | `K=8, P=2` |
+| `high` | ~30% | approx `K=7, P=2` |
+| numeric | 5-50% | clamped into the supported range |
+
+### Self-healing (format v2)
+
+The small metadata that *locates* everything (the segment directory, content hash, and per-window geometry) is stored in **triplicate with per-copy checksums**, so a lightly-corrupted sidecar still recovers: a single rotted directory copy is detected and the read falls back to a good copy. The bulk parity carries no wholesale envelope checksum; every Reed-Solomon shard already carries its own checksum, so a rotted parity shard is treated as an erasure and routed around at repair time. (The pre-v2 framing used an all-or-nothing checksum that rejected any flip; v2 sidecars are written today, v1 sidecars are still read.)
+
+<p align="center">
+  <img src="docs/img/04-aerocorrect-layout.svg" alt=".aerocorrect v2 sidecar layout" width="640" />
+</p>
+
+<p align="center">
+  <img src="docs/img/03-recovery.png" alt="Recovery: file only versus file and sidecar both damaged" width="620" />
+</p>
+
+### Bounded memory
+
+Generation and repair run in **64 MiB windows** and read sidecar parity on demand, so memory is bounded to one window plus that window's parity payload regardless of file size (the EC file cap is 1 GiB).
+
+### Security model
+
+Repair is **fail-closed and all-or-nothing**: the rebuilt stream is re-verified against the bound content hash (and, for a vault, its authenticated header MAC / manifest `cipher_hash`) **before** the original is replaced. A corrupt or foreign sidecar can therefore only make a repair *fail*, never overwrite good data. The atomic temp-and-rename write means a crash mid-repair never leaves a half-written original.
+
+### Feature / version matrix
+
+| Surface | Reads | Writes |
+|---------|-------|--------|
+| Vault container | v2, v3 | v3 |
+| `.aerocorrect` sidecar | v1, v2 | v2 (self-healing) |
+
+The `.aerocorrect` format is shared byte-for-byte with AeroFTP v4: a sidecar produced by either implementation verifies and repairs with the other for the same file and overhead level (a cross-implementation fixture pins this). See [docs/AEROCORRECT-SPEC.md](docs/AEROCORRECT-SPEC.md) for the full binary layout.
 
 ## vs Cryptomator
 

@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="380" viewBox="0 0 1040 380" font-family="'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect width="1040" height="380" fill="#ffffff"/>
+
+  <text x="36" y="48" font-size="24" font-weight="700" fill="#0f172a">AeroVault: where error correction sits</text>
+  <text x="36" y="76" font-size="15" fill="#475569">Error correction is the last wrapper, so it protects ciphertext bytes, not your file. It never decodes the format.</text>
+
+  <!-- pipeline -->
+  <!-- b1 Your file -->
+  <rect x="36" y="116" width="136" height="64" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="104" y="146" font-size="15" font-weight="600" fill="#334155" text-anchor="middle">Your file</text>
+  <text x="104" y="166" font-size="11" fill="#64748b" text-anchor="middle">plaintext</text>
+
+  <line x1="174" y1="148" x2="198" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+  <!-- b2 Compress -->
+  <rect x="202" y="116" width="136" height="64" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="270" y="146" font-size="15" font-weight="600" fill="#334155" text-anchor="middle">Compress</text>
+  <text x="270" y="166" font-size="11" fill="#64748b" text-anchor="middle">zstd</text>
+
+  <line x1="340" y1="148" x2="364" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+  <!-- b3 Chunk -->
+  <rect x="368" y="116" width="136" height="64" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="436" y="146" font-size="15" font-weight="600" fill="#334155" text-anchor="middle">Chunk</text>
+  <text x="436" y="166" font-size="11" fill="#64748b" text-anchor="middle">content-defined</text>
+
+  <line x1="506" y1="148" x2="530" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+  <!-- b4 Encrypt -->
+  <rect x="534" y="116" width="136" height="64" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.8"/>
+  <text x="602" y="146" font-size="15" font-weight="600" fill="#4338ca" text-anchor="middle">Encrypt</text>
+  <text x="602" y="166" font-size="11" fill="#6366f1" text-anchor="middle">format is now gone</text>
+
+  <line x1="672" y1="148" x2="696" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+  <!-- b5 Error correction -->
+  <rect x="700" y="112" width="136" height="72" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2.6"/>
+  <text x="768" y="144" font-size="15" font-weight="700" fill="#047857" text-anchor="middle">Error</text>
+  <text x="768" y="162" font-size="15" font-weight="700" fill="#047857" text-anchor="middle">correction</text>
+  <text x="768" y="178" font-size="10.5" fill="#059669" text-anchor="middle">Reed-Solomon parity</text>
+
+  <line x1="838" y1="148" x2="862" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+  <!-- b6 .aerovault -->
+  <rect x="866" y="116" width="138" height="64" rx="10" fill="#d1fae5" stroke="#059669" stroke-width="2"/>
+  <text x="935" y="146" font-size="15" font-weight="700" fill="#065f46" text-anchor="middle">.aerovault</text>
+  <text x="935" y="166" font-size="11" fill="#047857" text-anchor="middle">sealed container</text>
+
+  <!-- what EC sees -->
+  <text x="36" y="244" font-size="14" font-weight="600" fill="#334155">What error correction actually protects:</text>
+
+  <rect x="36" y="258" width="968" height="52" rx="8" fill="#e2e8f0" stroke="#94a3b8" stroke-width="1.2"/>
+  <!-- parity region -->
+  <path d="M810 258 h186 a8 8 0 0 1 8 8 v36 a8 8 0 0 1 -8 8 h-186 Z" fill="#a7f3d0" stroke="#10b981" stroke-width="1.2"/>
+  <!-- shard ticks -->
+  <line x1="129" y1="258" x2="129" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="222" y1="258" x2="222" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="315" y1="258" x2="315" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="408" y1="258" x2="408" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="501" y1="258" x2="501" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="594" y1="258" x2="594" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="687" y1="258" x2="687" y2="310" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="903" y1="258" x2="903" y2="310" stroke="#6ee7b7" stroke-width="1"/>
+  <text x="423" y="289" font-size="13.5" font-weight="600" fill="#475569" text-anchor="middle">ciphertext: your encrypted data, opaque bytes</text>
+  <text x="907" y="289" font-size="13" font-weight="700" fill="#047857" text-anchor="middle">parity ~20%</text>
+
+  <text x="36" y="344" font-size="14.5" fill="#334155">Corrupt any byte and EC rebuilds the exact original bytes, then decryption gives your file back. So it works on any format.</text>
+</svg>
