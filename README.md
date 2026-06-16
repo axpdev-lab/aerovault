@@ -153,7 +153,7 @@ fn protect_and_repair() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Format Specification
 
-See [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md) for the base binary layout. The current **v3** container keeps that layout and adds a per-file 16-byte `file_id` to the chunk AAD (inner AEAD and the optional ChaCha20-Poly1305 cascade). The `file_id` is stored in the AES-SIV-authenticated manifest and the on-disk version is covered by the HMAC-SHA512 header MAC, so neither can be stripped to force the legacy path. See [docs/AEROCORRECT-SPEC.md](docs/AEROCORRECT-SPEC.md) for the detached Error Correction sidecar. See the [CHANGELOG](CHANGELOG.md) (0.4.0, 0.5.0) for the v3 and `.aerocorrect` deltas.
+The current version is **v4 = v3 container + Error Correction**. See [docs/AEROVAULT-V3-SPEC.md](docs/AEROVAULT-V3-SPEC.md) for the full v3 container specification (header, wrapper pipeline, manifest, extension directory, cryptography matrix) and the v4 Error Correction layer that rides on top of it. v4 is not a new on-disk major: the container stays v3 (magic `AEROVAULT3`, `format = 3`) and a plain v3 reader still opens a v4 container, skipping the non-critical Error Correction extension. The base binary layout that v3 builds on is in [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md), and the detached recovery sidecar is in [docs/AEROCORRECT-SPEC.md](docs/AEROCORRECT-SPEC.md). See the [CHANGELOG](CHANGELOG.md) (0.4.0, 0.5.0) for the v3 and `.aerocorrect` deltas.
 
 ## Error Correction (`.aerocorrect`)
 
