@@ -216,16 +216,23 @@ fn collect_live_block_refs(vault: &OpenVaultV3) -> Vec<&[u8]> {
         .manifest
         .chunks
         .values()
-        .map(|rec| (rec.data_offset as usize, 8 + rec.block_len as usize))
+        .map(|rec| (rec.data_offset as usize, rec.block_len as usize))
         .collect();
     ranges.sort_by_key(|(off, _)| *off);
     ranges
         .into_iter()
-        .map(|(start, full_len)| {
-            if start + full_len <= vault.data.len() {
-                &vault.data[start..start + full_len]
-            } else {
-                &[] as &[u8]
+        .map(|(start, block_len)| {
+            // Every add is checked: a corrupted manifest can drive data_offset or
+            // block_len near usize::MAX. An out-of-range block contributes an empty
+            // slice instead of panicking (matches scrub_vault's hardening). Repair
+            // re-verifies each block, so a dropped range can only make repair fail,
+            // never corrupt good data (CLAUDE-AV-ECC unchecked-add hardening).
+            let end = block_len
+                .checked_add(8)
+                .and_then(|full| start.checked_add(full));
+            match end {
+                Some(end) if end <= vault.data.len() => &vault.data[start..end],
+                _ => &[] as &[u8],
             }
         })
         .collect()
@@ -434,27 +441,46 @@ pub(super) fn scrub_vault(vault: &OpenVaultV3) -> Vec<DamagedChunk> {
 
     for rec in chunks {
         let start = rec.data_offset as usize;
-        if start + 8 > vault.data.len() {
-            // Truncated block - definitely damaged.
-            damaged.push(DamagedChunk {
-                record: rec.clone(),
-                on_disk_start: rec.data_offset,
-                on_disk_len: 8,
-            });
-            continue;
-        }
+        // A corrupted length prefix can make `data_offset` (or the stored block
+        // length below) point near usize::MAX; every offset add is checked so a
+        // hostile manifest is reported as damaged instead of panicking on
+        // overflow (CLAUDE-AV-ECC, unchecked-add hardening).
+        let len_end = match start.checked_add(8) {
+            Some(end) if end <= vault.data.len() => end,
+            _ => {
+                // Truncated or out-of-range block - definitely damaged.
+                damaged.push(DamagedChunk {
+                    record: rec.clone(),
+                    on_disk_start: rec.data_offset,
+                    on_disk_len: 8,
+                });
+                continue;
+            }
+        };
 
         let stored_len =
-            u64::from_le_bytes(vault.data[start..start + 8].try_into().expect("slice")) as usize;
+            u64::from_le_bytes(vault.data[start..len_end].try_into().expect("slice")) as usize;
 
-        let block_start = start + 8;
-        let block_end = block_start + stored_len;
+        let block_start = len_end;
+        let block_end = block_start.checked_add(stored_len);
 
-        if block_end > vault.data.len() || stored_len != rec.block_len as usize {
+        // `8 + stored_len` is reported even on the damaged path, so compute it
+        // saturating: a corrupted prefix can drive stored_len near usize::MAX.
+        let on_disk_len = (stored_len as u64).saturating_add(8);
+
+        let Some(block_end) = block_end.filter(|&end| end <= vault.data.len()) else {
             damaged.push(DamagedChunk {
                 record: rec.clone(),
                 on_disk_start: rec.data_offset,
-                on_disk_len: (8 + stored_len) as u64,
+                on_disk_len,
+            });
+            continue;
+        };
+        if stored_len != rec.block_len as usize {
+            damaged.push(DamagedChunk {
+                record: rec.clone(),
+                on_disk_start: rec.data_offset,
+                on_disk_len,
             });
             continue;
         }
@@ -466,7 +492,7 @@ pub(super) fn scrub_vault(vault: &OpenVaultV3) -> Vec<DamagedChunk> {
             damaged.push(DamagedChunk {
                 record: rec.clone(),
                 on_disk_start: rec.data_offset,
-                on_disk_len: (8 + stored_len) as u64,
+                on_disk_len,
             });
         }
     }
@@ -1090,5 +1116,68 @@ mod tests {
         let _ = std::fs::remove_file(&vp);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn scrub_reports_overflowing_block_offsets_without_panicking() {
+        // A corrupted manifest/length prefix can drive a block offset near
+        // usize::MAX. scrub must report such a chunk as damaged, never panic on
+        // an unchecked add (CLAUDE-AV-ECC unchecked-add hardening). In debug the
+        // pre-fix `start + 8` / `block_start + stored_len` would overflow-panic.
+        let vp = tmp("overflow.aerovault");
+        let src = tmp("overflow-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let only = src.join("solo.bin");
+        let mut payload = vec![0u8; super::super::constants::CDC_MIN + 20_000];
+        let mut x = 0xdead_beef_cafe_babeu64;
+        for b in payload.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        std::fs::write(&only, &payload).unwrap();
+
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(&mut vault, &[(only, "solo.bin".to_string())]).unwrap();
+        assert_eq!(
+            vault.manifest.chunks.len(),
+            1,
+            "expected a single data block"
+        );
+        let key = vault.manifest.chunks.keys().next().unwrap().clone();
+
+        // Case 1: data_offset near usize::MAX -> `start + 8` would overflow.
+        {
+            let rec = vault.manifest.chunks.get_mut(&key).unwrap();
+            rec.data_offset = u64::MAX - 3;
+        }
+        let damaged = VaultV3::scrub(&vault);
+        assert_eq!(
+            damaged.len(),
+            1,
+            "out-of-range offset must be flagged damaged"
+        );
+
+        // Case 2: valid offset but an on-disk length prefix of u64::MAX ->
+        // `block_start + stored_len` would overflow.
+        {
+            let rec = vault.manifest.chunks.get_mut(&key).unwrap();
+            rec.data_offset = 0;
+            for slot in vault.data.iter_mut().take(8) {
+                *slot = 0xFF;
+            }
+        }
+        let damaged = VaultV3::scrub(&vault);
+        assert_eq!(
+            damaged.len(),
+            1,
+            "overflowing block length must be flagged damaged"
+        );
+
+        drop(vault);
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_dir_all(&src);
     }
 }

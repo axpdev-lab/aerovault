@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::block::build_file_bytes;
 use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds};
@@ -1010,6 +1010,8 @@ fn change_password_in_place(vault: &mut OpenVaultV3, new_password: &str) -> Resu
     let salt = random_array::<SALT_SIZE>();
     let mut base_kek = derive_base_kek(new_password, &salt)?;
     let (kek_master, kek_mac) = derive_keks(&base_kek)?;
+    let kek_master = Zeroizing::new(kek_master);
+    let kek_mac = Zeroizing::new(kek_mac);
     base_kek.zeroize();
     vault.header.salt = salt;
     vault.header.wrapped_master_key = wrap_key(&kek_master, &vault.master_key)?;
@@ -1206,7 +1208,11 @@ pub(super) fn open_header_bytes(
 ) -> Result<(VaultHeaderV3, [u8; KEY_SIZE], [u8; KEY_SIZE]), String> {
     let header = VaultHeaderV3::from_bytes(header_bytes)?;
     let mut base_kek = derive_base_kek(password, &header.salt)?;
+    // Wrap the transient KEKs so they are wiped on every exit path (including the
+    // `?` early returns below), not just left in freed memory after use.
     let (kek_master, kek_mac) = derive_keks(&base_kek)?;
+    let kek_master = Zeroizing::new(kek_master);
+    let kek_mac = Zeroizing::new(kek_mac);
     base_kek.zeroize();
     let mac_key = unwrap_key(&kek_mac, &header.wrapped_mac_key)?;
     header.verify_mac(&mac_key)?;
@@ -1234,6 +1240,8 @@ fn create_empty_vault(
     let salt = random_array::<SALT_SIZE>();
     let mut base_kek = derive_base_kek(password, &salt)?;
     let (kek_master, kek_mac) = derive_keks(&base_kek)?;
+    let kek_master = Zeroizing::new(kek_master);
+    let kek_mac = Zeroizing::new(kek_mac);
     base_kek.zeroize();
 
     let mut master_key = random_array::<KEY_SIZE>();
