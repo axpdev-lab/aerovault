@@ -63,8 +63,7 @@ impl CreateOptionsV3 {
             password: password.into(),
             zstd_level: DEFAULT_ZSTD_LEVEL,
             error_correction: None,
-            error_correction_pct:
-                crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
+            error_correction_pct: crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
         }
     }
 
@@ -290,10 +289,7 @@ impl VaultV3 {
     }
 
     /// Add files into the vault at the given vault-relative paths, then persist.
-    pub fn add_files(
-        vault: &mut OpenVaultV3,
-        sources: &[(PathBuf, String)],
-    ) -> Result<(), String> {
+    pub fn add_files(vault: &mut OpenVaultV3, sources: &[(PathBuf, String)]) -> Result<(), String> {
         append_sources_batched(vault, sources)?;
         save_open_vault(vault)
     }
@@ -342,8 +338,11 @@ impl VaultV3 {
 
     /// Delete a single entry (file or empty directory), then persist.
     pub fn delete_entry(vault: &mut OpenVaultV3, entry_name: &str) -> Result<usize, String> {
-        let removed =
-            delete_entries_from_manifest(vault, std::slice::from_ref(&entry_name.to_string()), false)?;
+        let removed = delete_entries_from_manifest(
+            vault,
+            std::slice::from_ref(&entry_name.to_string()),
+            false,
+        )?;
         save_open_vault(vault)?;
         Ok(removed)
     }
@@ -446,7 +445,10 @@ fn normalize_vault_relative_path(path: &str) -> Result<String, String> {
         return Err("Invalid AeroVault path: empty".to_string());
     }
     validate_vault_path(trimmed)?;
-    if trimmed.split('/').any(|part| part.is_empty() || part == ".") {
+    if trimmed
+        .split('/')
+        .any(|part| part.is_empty() || part == ".")
+    {
         return Err(format!("Invalid AeroVault path: {trimmed}"));
     }
     Ok(trimmed.to_string())
@@ -476,7 +478,10 @@ fn validate_manifest_paths(manifest: &VaultManifestV3) -> Result<(), String> {
             ));
         }
         if !seen.insert(entry.path.as_str()) {
-            return Err(format!("Duplicate AeroVault path in manifest: {}", entry.path));
+            return Err(format!(
+                "Duplicate AeroVault path in manifest: {}",
+                entry.path
+            ));
         }
     }
     Ok(())
@@ -1357,15 +1362,11 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
         match decrypt_manifest(&master_key, &encrypted_manifest) {
             Ok(m) => (m, false),
             Err(orig) => {
-                let embedded = super::ec::reconstruct_encrypted_manifest(
-                    &mut file, &header, file_len,
-                )?;
+                let embedded =
+                    super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
                 let rebuilt = match embedded {
                     Some(r) if r != encrypted_manifest => Some(r),
-                    _ => super::ec::reconstruct_manifest_from_sidecar(
-                        &path,
-                        &encrypted_manifest,
-                    )?,
+                    _ => super::ec::reconstruct_manifest_from_sidecar(&path, &encrypted_manifest)?,
                 };
                 match rebuilt {
                     Some(r) if r != encrypted_manifest => {
@@ -1548,7 +1549,11 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_entry(vault: &OpenVaultV3, entry_name: &str, dest_path: &Path) -> Result<PathBuf, String> {
+fn extract_entry(
+    vault: &OpenVaultV3,
+    entry_name: &str,
+    dest_path: &Path,
+) -> Result<PathBuf, String> {
     let entry_name = normalize_vault_relative_path(entry_name)?;
     match entry_kind(&vault.manifest, &entry_name) {
         Some(EntryKindV3::File) => {
@@ -1569,7 +1574,7 @@ fn extract_entry(vault: &OpenVaultV3, entry_name: &str, dest_path: &Path) -> Res
             let output_root = if dest_path.exists() {
                 if !dest_path.is_dir() {
                     return Err(
-                        "Destination for directory extraction must be a directory".to_string(),
+                        "Destination for directory extraction must be a directory".to_string()
                     );
                 }
                 dest_path.join(path_basename(&entry_name))
@@ -1792,7 +1797,9 @@ mod tests {
         let listed = VaultV3::list(&vault);
         assert!(listed.iter().any(|e| e.path == "a.txt" && !e.is_dir));
         assert!(listed.iter().any(|e| e.path == "docs/sub" && e.is_dir));
-        assert!(listed.iter().any(|e| e.path == "big.bin" && e.size == payload.len() as u64));
+        assert!(listed
+            .iter()
+            .any(|e| e.path == "big.bin" && e.size == payload.len() as u64));
 
         // Extract all and verify byte-identity.
         let out = scratch_dir();
@@ -1803,7 +1810,10 @@ mod tests {
             std::fs::read(out.join("b.txt")).unwrap(),
             b"beta contents which differ"
         );
-        assert_eq!(std::fs::read(out.join("docs/sub/c.txt")).unwrap(), vec![0x5au8; 4096]);
+        assert_eq!(
+            std::fs::read(out.join("docs/sub/c.txt")).unwrap(),
+            vec![0x5au8; 4096]
+        );
         assert_eq!(std::fs::read(out.join("big.bin")).unwrap(), payload);
 
         std::fs::remove_file(&vp).ok();
@@ -1846,8 +1856,20 @@ mod tests {
         let stored = vault.manifest.chunks.len();
         assert!(total_refs > stored, "dedup must collapse identical content");
         // Both files reference the exact same chunk id set.
-        let c1: Vec<&String> = entries.iter().find(|e| e.path == "one.bin").unwrap().chunks.iter().collect();
-        let c2: Vec<&String> = entries.iter().find(|e| e.path == "two.bin").unwrap().chunks.iter().collect();
+        let c1: Vec<&String> = entries
+            .iter()
+            .find(|e| e.path == "one.bin")
+            .unwrap()
+            .chunks
+            .iter()
+            .collect();
+        let c2: Vec<&String> = entries
+            .iter()
+            .find(|e| e.path == "two.bin")
+            .unwrap()
+            .chunks
+            .iter()
+            .collect();
         assert_eq!(c1, c2);
 
         std::fs::remove_file(&vp).ok();
@@ -1863,13 +1885,19 @@ mod tests {
 
         let mut vault = VaultV3::open(&vp, PW).unwrap();
         VaultV3::create_directory(&mut vault, "src").unwrap();
-        VaultV3::add_files(&mut vault, &[(src.join("doc.txt"), "src/doc.txt".to_string())]).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[(src.join("doc.txt"), "src/doc.txt".to_string())],
+        )
+        .unwrap();
 
         let chunks_before = vault.manifest.chunks.len();
         VaultV3::copy_entry(&mut vault, "src/doc.txt", "src/doc-copy.txt").unwrap();
         // Copy reuses chunk records: no new chunks stored.
         assert_eq!(vault.manifest.chunks.len(), chunks_before);
-        assert!(VaultV3::list(&vault).iter().any(|e| e.path == "src/doc-copy.txt"));
+        assert!(VaultV3::list(&vault)
+            .iter()
+            .any(|e| e.path == "src/doc-copy.txt"));
 
         // Move directory updates descendants.
         VaultV3::move_entry(&mut vault, "src", "moved").unwrap();
@@ -1880,7 +1908,9 @@ mod tests {
 
         // Rename within parent.
         VaultV3::rename_entry(&mut vault, "moved/doc.txt", "renamed.txt").unwrap();
-        assert!(VaultV3::list(&vault).iter().any(|e| e.path == "moved/renamed.txt"));
+        assert!(VaultV3::list(&vault)
+            .iter()
+            .any(|e| e.path == "moved/renamed.txt"));
 
         // Delete then re-open round-trips.
         VaultV3::delete_entries(&mut vault, &["moved".to_string()], true).unwrap();
@@ -1930,7 +1960,10 @@ mod tests {
 
         let out = scratch_dir();
         VaultV3::extract_all(&vault, &out).unwrap();
-        assert_eq!(std::fs::read(out.join("imported/top.txt")).unwrap(), b"top file");
+        assert_eq!(
+            std::fs::read(out.join("imported/top.txt")).unwrap(),
+            b"top file"
+        );
         assert_eq!(
             std::fs::read(out.join("imported/nested/deep/bottom.txt")).unwrap(),
             b"bottom file"

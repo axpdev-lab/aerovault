@@ -181,7 +181,11 @@ mod tests {
         assert_eq!(got, data);
 
         // total length is exactly header+data+manifest+dir+payload.
-        let expected = HEADER_SIZE as u64 + h.data_len + h.manifest_len + h.extension_dir_len + h.extension_payload_len;
+        let expected = HEADER_SIZE as u64
+            + h.data_len
+            + h.manifest_len
+            + h.extension_dir_len
+            + h.extension_payload_len;
         assert_eq!(bytes.len() as u64, expected);
         let _ = read_u64(&bytes, 128);
     }

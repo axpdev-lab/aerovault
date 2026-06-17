@@ -145,9 +145,21 @@ mod tests {
         assert_eq!(CdcBounds::for_level(9).avg, CDC_AVG);
         assert_eq!(CdcBounds::for_level(19).avg, 4 * 1024 * 1024);
         // avg not power of two -> invalid.
-        assert!(CdcBounds { min: 4096, avg: 3000, max: 4096 }.validate().is_err());
+        assert!(CdcBounds {
+            min: 4096,
+            avg: 3000,
+            max: 4096
+        }
+        .validate()
+        .is_err());
         // min > avg -> invalid.
-        assert!(CdcBounds { min: 8192, avg: 4096, max: 8192 }.validate().is_err());
+        assert!(CdcBounds {
+            min: 8192,
+            avg: 4096,
+            max: 8192
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

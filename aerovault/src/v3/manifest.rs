@@ -10,9 +10,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::chunking::CdcBounds;
-use super::constants::{
-    BLOCK_AAD_PREFIX, DEFAULT_ZSTD_LEVEL, MANIFEST_AAD, VERSION,
-};
+use super::constants::{BLOCK_AAD_PREFIX, DEFAULT_ZSTD_LEVEL, MANIFEST_AAD, VERSION};
 use crate::aerocrypt::{decrypt_with_aad, encrypt_with_aad, KEY_SIZE};
 
 /// One wrapper-stack layer: an algorithm id + version, optional zstd level,
@@ -191,10 +189,7 @@ pub fn encrypt_manifest(
     encrypt_with_aad(key, &json, MANIFEST_AAD)
 }
 
-pub fn decrypt_manifest(
-    key: &[u8; KEY_SIZE],
-    encrypted: &[u8],
-) -> Result<VaultManifestV3, String> {
+pub fn decrypt_manifest(key: &[u8; KEY_SIZE], encrypted: &[u8]) -> Result<VaultManifestV3, String> {
     let json = decrypt_with_aad(key, encrypted, MANIFEST_AAD)?;
     serde_json::from_slice(&json).map_err(|e| format!("Manifest parse: {e}"))
 }

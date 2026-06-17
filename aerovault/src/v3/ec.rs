@@ -757,8 +757,8 @@ pub(super) fn reconstruct_encrypted_manifest(
 /// Lightweight check for the embedded Error Correction extension. Reads only the
 /// header and the plaintext extension directory; no password needed.
 pub(super) fn has_error_correction(path: &Path) -> Result<bool, String> {
-    let mut file = File::open(path)
-        .map_err(|e| format!("Open vault for Error Correction check: {e}"))?;
+    let mut file =
+        File::open(path).map_err(|e| format!("Open vault for Error Correction check: {e}"))?;
 
     let mut header_bytes = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_bytes)
@@ -858,7 +858,10 @@ mod tests {
     /// Returns the byte length flipped.
     fn corrupt_data_section(vault_path: &Path, span: usize) -> usize {
         let info = VaultV3::peek(vault_path).unwrap();
-        assert!(info.data_len as usize >= span, "vault has enough data to corrupt");
+        assert!(
+            info.data_len as usize >= span,
+            "vault has enough data to corrupt"
+        );
         let mut bytes = std::fs::read(vault_path).unwrap();
         let start = DATA_OFFSET as usize + 64; // skip the first block's len prefix region
         for b in bytes.iter_mut().skip(start).take(span) {
@@ -1019,7 +1022,11 @@ mod tests {
         std::fs::write(&only, &payload).unwrap();
         let mut vault = VaultV3::open(&vp, PW).unwrap();
         VaultV3::add_files(&mut vault, &[(only, "solo.bin".to_string())]).unwrap();
-        assert_eq!(vault.manifest.chunks.len(), 1, "expected a single data block");
+        assert_eq!(
+            vault.manifest.chunks.len(),
+            1,
+            "expected a single data block"
+        );
         drop(vault);
         VaultV3::export_parity(&vp, PW, None).unwrap();
 

@@ -167,7 +167,13 @@ pub fn encrypt_with_aad(
     let nonce_bytes = random_array::<NONCE_SIZE>();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| "AES-GCM-SIV encrypt failed".to_string())?;
     let mut out = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);

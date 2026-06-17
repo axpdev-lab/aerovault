@@ -71,12 +71,12 @@
 //! for the complete format specification.
 
 pub mod aerocrypt;
-pub mod v3;
 pub(crate) mod constants;
 pub(crate) mod crypto;
 pub mod error;
 pub mod error_correction;
 pub mod format;
+pub mod v3;
 pub mod vault;
 
 // Re-export primary API

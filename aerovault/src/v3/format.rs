@@ -215,8 +215,7 @@ mod tests {
         let bytes = fixed_header().to_bytes();
         let digest = blake3::hash(&bytes).to_hex().to_string();
         assert_eq!(
-            digest,
-            "77cecd7ba9f74fe3683e99d2ff7774915d00914e55bdf059d63df0915d92e9d3",
+            digest, "77cecd7ba9f74fe3683e99d2ff7774915d00914e55bdf059d63df0915d92e9d3",
             "AEROVAULT3 header layout drifted"
         );
     }
