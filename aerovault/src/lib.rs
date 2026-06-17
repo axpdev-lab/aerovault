@@ -71,6 +71,7 @@
 //! for the complete format specification.
 
 pub mod aerocrypt;
+pub mod v3;
 pub(crate) mod constants;
 pub(crate) mod crypto;
 pub mod error;
