@@ -6,6 +6,8 @@ use zeroize::Zeroize;
 
 use aerovault::{CreateOptions, EncryptionMode, Vault};
 
+mod v3cmd;
+
 /// AeroVault — Military-grade encrypted vault manager.
 ///
 /// Create, manage, and extract files from AES-256-GCM-SIV encrypted containers.
@@ -152,6 +154,17 @@ enum Commands {
     Correct {
         #[command(subcommand)]
         command: CorrectCommands,
+    },
+
+    /// Operate on AEROVAULT3 containers (revision 4 = AEROVAULT3 + Error Correction).
+    ///
+    /// The top-level commands above target the legacy AEROVAULT2 container; this
+    /// group targets the modern AEROVAULT3 format (1024-byte header, gear-CDC
+    /// chunking, zstd, keyed-BLAKE3 dedup, packing) and its rev-4 Reed-Solomon
+    /// recovery surfaces.
+    Vault {
+        #[command(subcommand)]
+        command: v3cmd::VaultCommands,
     },
 }
 
@@ -429,6 +442,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Correct { command } => {
             cmd_correct(&command, json)?;
         }
+
+        Commands::Vault { command } => {
+            v3cmd::run(command, json)?;
+        }
     }
 
     Ok(())
@@ -458,7 +475,7 @@ fn path_arg(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn print_json<T: serde::Serialize>(value: &T) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn print_json<T: serde::Serialize>(value: &T) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
@@ -528,13 +545,13 @@ fn cmd_correct(command: &CorrectCommands, json: bool) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn read_password(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn read_password(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
     eprint!("{prompt}");
     let password = rpassword::read_password()?;
     Ok(password)
 }
 
-fn spinner(msg: &str) -> ProgressBar {
+pub(crate) fn spinner(msg: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -546,7 +563,7 @@ fn spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = bytes as f64;
     for unit in UNITS {

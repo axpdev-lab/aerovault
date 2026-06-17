@@ -70,11 +70,13 @@
 //! See [`AEROVAULT-V2-SPEC.md`](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V2-SPEC.md)
 //! for the complete format specification.
 
+pub mod aerocrypt;
 pub(crate) mod constants;
 pub(crate) mod crypto;
 pub mod error;
 pub mod error_correction;
 pub mod format;
+pub mod v3;
 pub mod vault;
 
 // Re-export primary API

@@ -3,7 +3,7 @@ members = ["aerovault", "aerovault-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["axpdev-lab <dev@axpdev.it>"]
@@ -15,7 +15,7 @@ keywords = ["encryption", "vault", "argon2", "error-correction", "reed-solomon"]
 categories = ["cryptography", "command-line-utilities"]
 
 [workspace.dependencies]
-aerovault = { path = "aerovault", version = "0.5.0" }
+aerovault = { path = "aerovault", version = "0.6.0" }
 aes-gcm-siv = "0.11"
 aes-kw = { version = "0.2", features = ["std"] }
 aes-siv = "0.7"
@@ -24,6 +24,8 @@ blake3 = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 data-encoding = "2"
+zstd = "0.13"
+hex = "0.4"
 clap = { version = "4", features = ["derive"] }
 hmac = "0.12"
 indicatif = "0.18"
@@ -34,6 +36,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
+walkdir = "2"
 hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 libc = "0.2"

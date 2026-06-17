@@ -8,6 +8,12 @@ repository.workspace = true
 description.workspace = true
 readme = "../README.md"
 
+[features]
+# Test-only: replace the CSPRNG with a deterministic stream and freeze the
+# timestamp so containers are byte-reproducible for the cross-impl golden (T5).
+# Never enable in a production build.
+test-vectors = []
+
 [dependencies]
 aes-gcm-siv = { workspace = true }
 aes-kw = { workspace = true }
@@ -17,6 +23,8 @@ blake3 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 data-encoding = { workspace = true }
+zstd = { workspace = true }
+hex = { workspace = true }
 hmac = { workspace = true }
 rand = { workspace = true }
 reed-solomon-erasure = { workspace = true }
@@ -25,6 +33,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+walkdir = { workspace = true }
 hkdf = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
