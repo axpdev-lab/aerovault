@@ -39,8 +39,17 @@ cargo install --path aerovault-cli
 
 ### From crates.io
 
+Both crates are published on crates.io:
+
+- Library: [crates.io/crates/aerovault](https://crates.io/crates/aerovault) - [docs.rs/aerovault](https://docs.rs/aerovault)
+- CLI: [crates.io/crates/aerovault-cli](https://crates.io/crates/aerovault-cli)
+
 ```bash
+# Add the library to your project
 cargo add aerovault
+
+# Or install the CLI
+cargo install aerovault-cli
 ```
 
 ## CLI Usage
