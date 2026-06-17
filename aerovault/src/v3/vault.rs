@@ -78,7 +78,6 @@ impl CreateOptionsV3 {
 ///
 /// Holds the decrypted master and MAC keys plus the whole data section in RAM.
 /// Drop it when done: the [`Drop`] impl zeroizes the key material.
-#[derive(Debug)]
 pub struct OpenVaultV3 {
     pub(super) path: PathBuf,
     pub(super) header: VaultHeaderV3,
@@ -95,6 +94,27 @@ pub struct OpenVaultV3 {
     /// Set when `open_vault` had to rebuild a corrupted header from the detached
     /// sidecar's header parity (rev. 4). `repair` persists the healed region.
     pub(super) header_repaired_on_open: bool,
+    /// Optional embedder telemetry sink (see [`super::telemetry`]). `None` by
+    /// default, so the content pipeline emits nothing and produces identical
+    /// bytes; attach one with [`OpenVaultV3::set_telemetry_sink`].
+    pub(super) telemetry: Option<Box<dyn super::telemetry::VaultTelemetrySink + Send>>,
+}
+
+impl std::fmt::Debug for OpenVaultV3 {
+    /// Manual `Debug` (the optional telemetry sink is not `Debug`); never prints
+    /// key material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenVaultV3")
+            .field("path", &self.path)
+            .field("opened_file_len", &self.opened_file_len)
+            .field("entries", &self.manifest.entries.len())
+            .field("chunks", &self.manifest.chunks.len())
+            .field("data_len", &self.data.len())
+            .field("manifest_repaired_on_open", &self.manifest_repaired_on_open)
+            .field("header_repaired_on_open", &self.header_repaired_on_open)
+            .field("telemetry", &self.telemetry.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for OpenVaultV3 {
@@ -112,6 +132,28 @@ impl OpenVaultV3 {
     /// The container's filesystem path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Attach an embedder telemetry sink to receive content-pipeline events for
+    /// the operations run on this open vault (see [`super::telemetry`]). Without
+    /// one the pipeline emits nothing; attaching one never changes the bytes
+    /// written.
+    pub fn set_telemetry_sink(
+        &mut self,
+        sink: Box<dyn super::telemetry::VaultTelemetrySink + Send>,
+    ) {
+        self.telemetry = Some(sink);
+    }
+
+    /// Run `f` against the attached telemetry sink, if any. A no-op when no sink
+    /// is attached.
+    pub(super) fn emit(
+        &mut self,
+        f: impl FnOnce(&mut (dyn super::telemetry::VaultTelemetrySink + Send)),
+    ) {
+        if let Some(sink) = self.telemetry.as_deref_mut() {
+            f(sink);
+        }
     }
 }
 
@@ -623,6 +665,9 @@ fn ingest_chunk(
                 cipher_hash,
             },
         );
+        vault.emit(|s| s.on_chunk(true, pt, cz, enc));
+    } else {
+        vault.emit(|s| s.on_chunk(false, chunk.len() as u64, 0, 0));
     }
     Ok(chunk_id)
 }
@@ -673,6 +718,7 @@ fn append_file_at(vault: &mut OpenVaultV3, source: &Path, entry_path: &str) -> R
         chunks: entry_chunks,
         pack_offset: None,
     });
+    vault.emit(|s| s.on_file(false));
     sort_entries(&mut vault.manifest);
     vault.manifest.modified = now_iso();
     Ok(())
@@ -693,6 +739,7 @@ fn flush_pack(
     if members.is_empty() {
         return Ok(());
     }
+    vault.emit(|s| s.on_pack());
 
     let ranges = chunk_ranges_with(pack, bounds);
     let mut chunks: Vec<(String, u64, u64)> = Vec::with_capacity(ranges.len());
@@ -700,6 +747,12 @@ fn flush_pack(
         let id = ingest_chunk(vault, &pack[*start..*end], chunk_key, level)?;
         chunks.push((id, *start as u64, *end as u64));
     }
+    let (member_count, pack_len, chunk_count) = (members.len(), pack.len(), chunks.len());
+    vault.emit(|s| {
+        s.step(&format!(
+            "pack: {member_count} file(s), {pack_len} B -> chunk+compress+encrypt {chunk_count} chunk(s)"
+        ))
+    });
 
     for (entry_path, fstart, flen) in members {
         let fstart_v = *fstart;
@@ -745,6 +798,7 @@ fn flush_pack(
             chunks: covering,
             pack_offset,
         });
+        vault.emit(|s| s.on_file(true));
     }
     Ok(())
 }
@@ -759,8 +813,13 @@ fn append_sources_batched(
     let chunk_key = hkdf_expand::<KEY_SIZE>(&vault.master_key, HKDF_CHUNK_ID)?;
     let level = manifest_zstd_level(&vault.manifest);
     let bounds = manifest_cdc_bounds(&vault.manifest)?;
+    let (cdc_min, cdc_avg, cdc_max) = (bounds.min, bounds.avg, bounds.max);
+    vault.emit(|s| s.set_cdc(cdc_min, cdc_avg, cdc_max));
+    let source_count = sources.len();
+    vault.emit(|s| s.step(&format!("scan: {source_count} source(s) to add")));
 
     let mut small_meta: Vec<(PathBuf, String)> = Vec::new();
+    let mut large_count = 0usize;
     for (source, entry_path) in sources {
         let entry_path = normalize_vault_relative_path(entry_path)?;
         if !source.is_file() {
@@ -772,9 +831,16 @@ fn append_sources_batched(
         if (len as usize) < PACK_SMALL_FILE_THRESHOLD {
             small_meta.push((source.clone(), entry_path));
         } else {
+            large_count += 1;
             append_file_at(vault, source, &entry_path)?;
         }
     }
+    let small_count = small_meta.len();
+    vault.emit(|s| {
+        s.step(&format!(
+            "partition: {small_count} small (< {PACK_SMALL_FILE_THRESHOLD} B, batched) / {large_count} large (per-file)"
+        ))
+    });
 
     if !small_meta.is_empty() {
         small_meta.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1434,6 +1500,7 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
         data,
         manifest_repaired_on_open,
         header_repaired_on_open,
+        telemetry: None,
     })
 }
 
@@ -1489,6 +1556,7 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
 
     let mut extensions = vault.extensions.clone();
     let mut ext_payloads = vec![];
+    let mut ec_stats: Option<(u64, u64, f64)> = None;
 
     // rev. 4: if the Error-Correction extension is present, recompute the shards
     // over the current data section and update the entry + payload. Recompute on
@@ -1499,7 +1567,9 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
         .position(|e| e.extension_id == super::constants::ERROR_CORRECTION_EXTENSION_ID)
     {
         // On-disk blocks in data-section order (sorted by data_offset). Each
-        // full block is [u64 len][ciphertext of that len].
+        // full block is [u64 len][ciphertext of that len]. Offset arithmetic is
+        // checked so a manifest record near usize::MAX yields an empty slice
+        // instead of panicking (matches collect_live_block_refs / scrub_vault).
         let mut chunk_records: Vec<_> = vault.manifest.chunks.values().cloned().collect();
         chunk_records.sort_by_key(|r| r.data_offset);
 
@@ -1507,11 +1577,12 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
             .iter()
             .map(|rec| {
                 let start = rec.data_offset as usize;
-                let full_len = 8 + rec.block_len as usize;
-                if start + full_len <= vault.data.len() {
-                    &vault.data[start..start + full_len]
-                } else {
-                    &[] as &[u8]
+                let end = (rec.block_len as usize)
+                    .checked_add(8)
+                    .and_then(|full| start.checked_add(full));
+                match end {
+                    Some(end) if end <= vault.data.len() => &vault.data[start..end],
+                    _ => &[] as &[u8],
                 }
             })
             .collect();
@@ -1519,7 +1590,7 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
         let (k, p) = crate::error_correction::manifest_error_correction_grid(
             vault.manifest.error_correction_pct,
         );
-        let (payload, _shards, _protected, _overhead) =
+        let (payload, shards, protected, overhead) =
             crate::error_correction::compute_error_correction_shards_grid(&blocks, k, p);
 
         let entry = &mut extensions[error_correction_idx];
@@ -1527,6 +1598,13 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
         entry.length = payload.len() as u64;
 
         ext_payloads = payload;
+        if shards > 0 || protected > 0 {
+            ec_stats = Some((shards, protected, overhead));
+        }
+    }
+    // Surface Error Correction telemetry once the data borrow above is released.
+    if let Some((shards, protected, overhead)) = ec_stats {
+        vault.emit(|s| s.set_error_correction(shards, protected, overhead));
     }
 
     let bytes = build_file_bytes(
@@ -1829,6 +1907,107 @@ mod tests {
         std::fs::remove_dir_all(&out).ok();
     }
 
+    #[derive(Default)]
+    struct CountingSink {
+        chunks_new: u64,
+        chunks_dedup: u64,
+        files_packed: u64,
+        files_unpacked: u64,
+        packs: u64,
+        cdc_set: bool,
+        steps: Vec<String>,
+        plaintext: u64,
+    }
+
+    impl super::super::telemetry::VaultTelemetrySink
+        for std::sync::Arc<std::sync::Mutex<CountingSink>>
+    {
+        fn on_chunk(&mut self, is_new: bool, plaintext: u64, _c: u64, _e: u64) {
+            let mut g = self.lock().unwrap();
+            if is_new {
+                g.chunks_new += 1;
+            } else {
+                g.chunks_dedup += 1;
+            }
+            g.plaintext += plaintext;
+        }
+        fn on_file(&mut self, packed: bool) {
+            let mut g = self.lock().unwrap();
+            if packed {
+                g.files_packed += 1;
+            } else {
+                g.files_unpacked += 1;
+            }
+        }
+        fn on_pack(&mut self) {
+            self.lock().unwrap().packs += 1;
+        }
+        fn set_cdc(&mut self, _min: usize, _avg: usize, _max: usize) {
+            self.lock().unwrap().cdc_set = true;
+        }
+        fn step(&mut self, message: &str) {
+            self.lock().unwrap().steps.push(message.to_string());
+        }
+    }
+
+    #[test]
+    fn telemetry_sink_receives_content_pipeline_events() {
+        // An attached sink must observe the same events the app historically
+        // inlined: per-chunk, per-file (packed vs per-file), per-pack, CDC bounds,
+        // and step lines. With no sink the bytes are unchanged (T5 golden).
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        let src = scratch_dir();
+        // Two small files (packed path) + one large file (per-file CDC path).
+        std::fs::write(src.join("s1.txt"), b"small one").unwrap();
+        std::fs::write(src.join("s2.txt"), b"small two differs").unwrap();
+        let large = src.join("big.bin");
+        let mut payload = vec![0u8; PACK_SMALL_FILE_THRESHOLD + 200_000];
+        let mut x = 0xfeed_face_dead_beefu64;
+        for b in payload.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        std::fs::write(&large, &payload).unwrap();
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(CountingSink::default()));
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        vault.set_telemetry_sink(Box::new(sink.clone()));
+        VaultV3::add_files(
+            &mut vault,
+            &[
+                (src.join("s1.txt"), "s1.txt".to_string()),
+                (src.join("s2.txt"), "s2.txt".to_string()),
+                (large.clone(), "big.bin".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(vault);
+
+        let g = sink.lock().unwrap();
+        assert!(g.cdc_set, "CDC bounds reported");
+        assert_eq!(g.packs, 1, "one pack for the two small files");
+        assert_eq!(g.files_packed, 2, "two small files via the packed path");
+        assert_eq!(g.files_unpacked, 1, "one large file via the per-file path");
+        assert!(
+            g.chunks_new >= 2,
+            "at least the pack chunk + a large-file chunk"
+        );
+        assert!(
+            g.steps.iter().any(|s| s.starts_with("scan:"))
+                && g.steps.iter().any(|s| s.starts_with("partition:"))
+                && g.steps.iter().any(|s| s.starts_with("pack:")),
+            "scan / partition / pack step lines present: {:?}",
+            g.steps
+        );
+        assert!(g.plaintext > 0);
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+    }
+
     #[test]
     fn dedup_same_content_stored_once() {
         let vp = vault_path();
@@ -2039,6 +2218,7 @@ mod tests {
             data: Vec::new(),
             manifest_repaired_on_open: false,
             header_repaired_on_open: false,
+            telemetry: None,
         };
         let out = scratch_dir();
         assert!(VaultV3::extract_entry(&vault, "../escape.txt", &out).is_err());

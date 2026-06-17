@@ -21,6 +21,7 @@ pub mod ec;
 pub mod format;
 pub mod manifest;
 pub mod packing;
+pub mod telemetry;
 pub mod vault;
 
 pub use chunking::{chunk_ranges_with, gear_table, keyed_chunk_id, CdcBounds};
@@ -32,4 +33,5 @@ pub use format::{derive_keks, VaultHeaderV3};
 pub use manifest::{
     ChunkRecordV3, ExtensionEntryV3, ManifestEntryV3, VaultManifestV3, WrapperManifest,
 };
+pub use telemetry::VaultTelemetrySink;
 pub use vault::{CreateOptionsV3, EntryInfo, OpenVaultV3, PeekInfo, VaultV3};
