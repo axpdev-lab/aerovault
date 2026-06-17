@@ -99,11 +99,22 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
+          # Extract the matching CHANGELOG section.
           awk -v ver="$VERSION" '
             $0 ~ "^## \\[" ver "\\]" { capture=1; next }
             capture && /^## \[/ { exit }
             capture { print }
-          ' CHANGELOG.md > release-notes.md
+          ' CHANGELOG.md > section.md
+          # Reflow soft-wrapped lines into single-line bullets/paragraphs, because
+          # GitHub renders every single newline as a <br>, which would otherwise
+          # break sentences mid-line. Blank lines and headings stay as separators.
+          awk '
+            /^[[:space:]]*$/ { if (buf != "") { print buf; buf="" } print ""; next }
+            /^#/             { if (buf != "") { print buf; buf="" } print $0; next }
+            /^[-*] /         { if (buf != "") print buf; buf=$0; next }
+            { sub(/^[[:space:]]+/, ""); if (buf == "") buf=$0; else buf=buf " " $0 }
+            END { if (buf != "") print buf }
+          ' section.md > release-notes.md
           if [ ! -s release-notes.md ]; then
             echo "Prebuilt aerovault CLI binaries for $TAG." > release-notes.md
           fi
