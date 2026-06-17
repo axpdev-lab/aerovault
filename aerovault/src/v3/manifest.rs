@@ -88,8 +88,16 @@ pub struct ExtensionEntryV3 {
 }
 
 /// UTC timestamp in the app's exact `%Y-%m-%dT%H:%M:%SZ` form.
+#[cfg(not(feature = "test-vectors"))]
 pub fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Fixed timestamp under the `test-vectors` feature so deterministic golden
+/// containers are reproducible. MUST match the app's test-vector timestamp.
+#[cfg(feature = "test-vectors")]
+pub fn now_iso() -> String {
+    "2026-06-17T00:00:00Z".to_string()
 }
 
 pub fn default_wrappers(level: i32) -> WrapperManifest {

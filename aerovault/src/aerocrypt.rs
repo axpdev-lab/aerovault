@@ -21,6 +21,7 @@
 use aes_gcm_siv::aead::{Aead, Payload};
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use aes_kw::Kek;
+#[cfg(not(feature = "test-vectors"))]
 use rand::RngCore;
 
 /// AES-256 key length, in bytes.
@@ -54,9 +55,59 @@ pub fn argon2_lanes() -> u32 {
 }
 
 /// Fill an `N`-byte array from the OS CSPRNG.
+#[cfg(not(feature = "test-vectors"))]
 pub fn random_array<const N: usize>() -> [u8; N] {
     let mut out = [0u8; N];
     rand::rngs::OsRng.fill_bytes(&mut out);
+    out
+}
+
+// --- Deterministic test-vector mode (feature `test-vectors`) -----------------
+//
+// Replaces the CSPRNG with a reproducible byte stream so a container built with
+// a fixed password is byte-identical across runs AND across implementations
+// (the crate and the AeroFTP app define the SAME generator). This is what makes
+// the T5 cross-impl byte-compat golden possible. The seed string and the
+// per-call fill rule below MUST stay byte-identical to the app's copy, or the
+// goldens diverge. Never enabled in a production build.
+//
+// Fill rule for `random_array::<N>()`: pull successive 32-byte blocks
+// `BLAKE3(SEED || counter_le)` (counter incremented per block consumed), copy
+// the first `min(32, remaining)` bytes of each into the output, and discard any
+// leftover of the final block (no carry across calls). `reset_test_vectors()`
+// rewinds the counter to 0 so each vault starts from a known point.
+#[cfg(feature = "test-vectors")]
+const TEST_VECTOR_SEED: &[u8] = b"AEROVAULT3 test-vectors v1";
+
+#[cfg(feature = "test-vectors")]
+thread_local! {
+    static TEST_VECTOR_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Rewind the deterministic test-vector stream to its start. Call once before
+/// building a golden container. Only present under the `test-vectors` feature.
+#[cfg(feature = "test-vectors")]
+pub fn reset_test_vectors() {
+    TEST_VECTOR_COUNTER.with(|c| c.set(0));
+}
+
+#[cfg(feature = "test-vectors")]
+pub fn random_array<const N: usize>() -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut off = 0usize;
+    while off < N {
+        let ctr = TEST_VECTOR_COUNTER.with(|c| {
+            let v = c.get();
+            c.set(v + 1);
+            v
+        });
+        let mut input = TEST_VECTOR_SEED.to_vec();
+        input.extend_from_slice(&ctr.to_le_bytes());
+        let block = blake3::hash(&input);
+        let take = core::cmp::min(32, N - off);
+        out[off..off + take].copy_from_slice(&block.as_bytes()[..take]);
+        off += take;
+    }
     out
 }
 
