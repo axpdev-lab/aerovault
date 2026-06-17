@@ -118,7 +118,7 @@ mod tests {
     fn pack_flushes_at_target() {
         // Three ~half-target small files -> flush after the first crosses target
         // would need >= PACK_TARGET; build members each just under threshold.
-        let chunk = (PACK_SMALL_FILE_THRESHOLD - 1) as usize; // < threshold => small
+        let chunk = PACK_SMALL_FILE_THRESHOLD - 1; // < threshold => small
         let small = vec![
             ("a".to_string(), vec![0u8; chunk]),
             ("b".to_string(), vec![0u8; chunk]),

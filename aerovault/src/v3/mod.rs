@@ -14,8 +14,15 @@
 
 // SPDX-License-Identifier: GPL-3.0-only
 
+pub mod block;
 pub mod chunking;
 pub mod constants;
+pub mod format;
+pub mod manifest;
 pub mod packing;
 
 pub use chunking::{chunk_ranges_with, gear_table, keyed_chunk_id, CdcBounds};
+pub use format::{derive_keks, VaultHeaderV3};
+pub use manifest::{
+    ChunkRecordV3, ExtensionEntryV3, ManifestEntryV3, VaultManifestV3, WrapperManifest,
+};

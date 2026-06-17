@@ -124,7 +124,7 @@ pub fn zstd_compress(chunk: &[u8], level: i32) -> Result<Vec<u8>, String> {
 /// (CLAUDE-AV-005); the caller verifies the exact length afterwards.
 pub fn zstd_decompress_bounded(compressed: &[u8], plaintext_len: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let mut decoder = zstd::stream::read::Decoder::new(compressed)
+    let decoder = zstd::stream::read::Decoder::new(compressed)
         .map_err(|e| format!("zstd decoder init failed: {e}"))?;
     let mut out = Vec::with_capacity(plaintext_len.min(1 << 20) as usize);
     decoder
