@@ -2,6 +2,18 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.0] - 2026-06-17
+
+### Real AEROVAULT3 container (revision 4)
+
+- Implement the real **AEROVAULT3 container** in the crate (`aerovault::v3`): 1024-byte header, gear content-defined chunking (256 KiB / 1 MiB / 4 MiB), per-chunk zstd, keyed-BLAKE3 128-bit chunk ids with deduplication, small-file packing, an authenticated JSON manifest, and a forward-compatible extension directory. Until now the crate shipped only the legacy AEROVAULT2 lineage (512-byte header, fixed 64 KiB chunks) while its docs described AEROVAULT3, so the published format did not match the published spec. It does now.
+- Port is **byte-for-byte** with the AeroFTP application: a deterministic cross-implementation fixture (`tests/aerovault3_cross_impl_v3.rs`) pins the crate's container bytes to a golden produced by the app, so a vault created by either side opens and extracts in the other.
+- **Revision 4 = AEROVAULT3 + Error Correction.** Wire the `.aerocorrect` Reed-Solomon codec into the container: embedded (non-critical in-container extension), detached (sibling `.aerocorrect` sidecar, container stays byte-identical to a plain vault), or both. A plain rev. 3 reader still opens a rev. 4 file and skips the non-critical extension; the on-disk major stays 3. Header and manifest parity let a vault with a damaged header or manifest region rebuild from the sidecar on open. Repair is all-or-nothing: every reconstructed block is re-verified against the manifest before the original is replaced.
+- Add the AEROVAULT3 surface to `aerovault-cli` under a new `vault` command group (`create`, `add`, `add-dir`, `list`/`ls`, `extract`, `mkdir`, `rm`, `rename`, `move`/`mv`, `copy`/`cp`, `info`, `change-password`, `check`) plus the rev. 4 recovery subset (`scrub`, `repair`, `export-parity`, `strip-parity`). Every command supports `--json`. The top-level commands stay the legacy AEROVAULT2 surface.
+- Add the embedder API the AeroFTP application uses to consume the crate without manifest access: `VaultV3::summary` (`VaultSummaryV3`), `EntryInfo::chunk_count`, `VaultV3::resolve_parity_source` parity-source preflight, an optional `VaultTelemetrySink` content-pipeline seam (no-op by default, byte-neutral), and `VaultV3::create_directory` now returning whether the leaf was newly created.
+- The shared `aerocrypt` crypto core (Argon2id + AES-256-KW + AES-256-GCM-SIV + AES-256-SIV + HKDF-SHA256 + HMAC-SHA512) is exported as `aerovault::aerocrypt` for reuse, byte-identical to the app's primitives.
+- Credit to **Ehud Kirsh** (@EhudKirsh) for driving the AEROVAULT3 wrapper-stack design and the unified `.aerocorrect` direction in AeroFTP issue #162 and discussion #276.
+
 ## [0.5.0] - 2026-06-12
 
 ### Error Correction (`.aerocorrect`)

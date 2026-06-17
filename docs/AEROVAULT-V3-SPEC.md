@@ -1,9 +1,9 @@
-# AeroVault Format Specification (v3 container, v4 = v3 + EC)
+# AeroVault Format Specification (AEROVAULT3 container, rev. 4 = rev. 3 + EC)
 
-**Current version**: v4 (= v3 container + Reed-Solomon Error Correction)
+**Current revision**: rev. 4 (= rev. 3 container + Reed-Solomon Error Correction)
 **Container format major**: 3 (magic `AEROVAULT3`, `format = 3`)
-**Status**: Shipped (crate `aerovault` 0.5.0)
-**Date**: 2026-06-16
+**Status**: Implemented in crate `aerovault` 0.6.0 (byte-compatible with the AeroFTP application; cross-impl fixture pinned)
+**Date**: 2026-06-17
 **Authors**: axpdev-lab
 
 > **Versioning convention.** AeroVault **v4 is v3 + Error Correction, and it is the current version.**

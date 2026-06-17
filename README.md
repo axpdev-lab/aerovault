@@ -12,9 +12,17 @@ Military-grade encrypted vault format for single-file encrypted containers.
 
 AeroVault combines **AES-256-GCM-SIV** (nonce misuse-resistant), **Argon2id** (128 MiB), **AES-256-KW** key wrapping, and optional **ChaCha20-Poly1305** cascade encryption into a portable `.aerovault` file format.
 
-The current container format is **v3**, which binds a per-file 16-byte `file_id` into the chunk AAD to prevent chunk splicing and reordering. Existing **v2** containers stay fully supported (read, write, and in-place re-encrypt); the crypto stack below is shared by both.
+The crate ships two container lineages, sharing the crypto stack below. The legacy **AEROVAULT2 lineage** (`Vault`, magic `AEROVAULT2`, 512-byte header, fixed 64 KiB chunks) binds a per-file 16-byte `file_id` into the chunk AAD to prevent chunk splicing and reordering, and stays fully supported (read, write, in-place re-encrypt). Since **0.6.0** the crate also ships the modern **AEROVAULT3 container** (`VaultV3`, magic `AEROVAULT3`, 1024-byte header): gear content-defined chunking, per-chunk zstd, keyed-BLAKE3 deduplication, small-file packing, and an extension directory for **revision 4** Reed-Solomon Error Correction. AEROVAULT3 is byte-for-byte identical to the AeroFTP application's container (a cross-implementation fixture is pinned).
 
 Since 0.5.0 the crate also ships the unified `.aerocorrect` Reed-Solomon sidecar format: a detached, content-SHA-bound recovery file for any byte stream. It can protect `.aerovault` containers or ordinary files, repair is atomic and all-or-nothing, and the **format v2 sidecar is self-healing** so a lightly-corrupted recovery file still recovers. See [Error Correction](#error-correction-aerocorrect) below.
+
+### Versioning: three independent axes
+
+Three different numbers are easy to conflate; they are independent:
+
+- **Container on-disk major** is the magic plus format byte in the file. Two lineages exist: legacy `AEROVAULT2` (512-byte header) and `AEROVAULT3` (1024-byte header).
+- **Container product revision** is `rev. 3` for the AEROVAULT3 container alone, `rev. 4` once the non-critical Reed-Solomon Error Correction extension is added. The on-disk major stays 3 either way (a rev. 3 reader opens a rev. 4 file).
+- **Crate package version** is this crate's semver (`0.6.0`), unrelated to either of the above.
 
 ## Cryptographic Stack
 
@@ -108,6 +116,34 @@ aerovault correct verify my-vault.aerovault
 
 # Repair in place from my-vault.aerovault.aerocorrect
 aerovault correct repair my-vault.aerovault
+```
+
+### AEROVAULT3 containers (revision 4)
+
+The commands above operate on the legacy AEROVAULT2 container. The modern AEROVAULT3 format (gear-CDC, zstd, dedup, packing) and its Reed-Solomon recovery surfaces live under `vault`:
+
+```bash
+# Create an AEROVAULT3 container
+aerovault vault create my.aerovault
+
+# Create with embedded plus detached Error Correction (revision 4)
+aerovault vault create my.aerovault --error-correction both
+
+# Add files or a directory tree
+aerovault vault add my.aerovault report.pdf photo.jpg
+aerovault vault add-dir my.aerovault ./project --prefix work
+
+# List, extract, info (all support --json)
+aerovault vault ls my.aerovault -H
+aerovault vault extract my.aerovault -o ./out
+aerovault --json vault info my.aerovault
+
+# Verify every block, then repair from parity if damaged
+aerovault vault scrub my.aerovault
+aerovault vault repair my.aerovault
+
+# Add or refresh a detached recovery sidecar for an existing vault
+aerovault vault export-parity my.aerovault
 ```
 
 ## Library Usage
@@ -244,14 +280,26 @@ The `.aerocorrect` format is shared byte-for-byte with AeroFTP v4: a sidecar pro
 
 ## vs Cryptomator
 
-| | AeroVault | Cryptomator v8 |
+| | AeroVault (AEROVAULT3) | Cryptomator v8 |
 |---|---|---|
-| KDF | Argon2id (128 MiB) | scrypt (64 MiB) |
-| Content cipher | AES-256-GCM-SIV | AES-256-GCM |
-| Nonce misuse resistance | Yes | No |
-| Cascade mode | Optional | No |
-| Storage | Single file | Directory tree |
+| Password KDF | Argon2id, 128 MiB / t=4 / p=4 | scrypt, N=2¹⁵ / r=8 / p=1 (~32 MiB) |
+| Key hierarchy | HKDF-SHA256, domain-separated KEKs | HMAC-SHA256 derived subkeys |
+| Master-key wrapping | AES-256-KW (RFC 3394) | AES-256-KW (RFC 3394) |
+| Content cipher | AES-256-GCM-SIV (RFC 8452) | AES-256-GCM |
+| Nonce-misuse resistance | Yes (synthetic IV) | No |
+| Optional cascade | AES-256-GCM-SIV then ChaCha20-Poly1305 | No |
+| Filename encryption | AES-256-SIV (deterministic) | AES-256-SIV (deterministic) |
+| Cleartext chunking | Content-defined (gear-CDC, 256 KiB-4 MiB, ~1 MiB target) | Fixed 32 KiB |
+| Compression | Per-chunk zstd | None |
+| Deduplication | Keyed-BLAKE3 128-bit chunk ids | None |
+| Chunk AAD binding | Block index + keyed chunk id | Chunk number + header nonce |
+| Header integrity | HMAC-SHA512 (64-byte MAC) | Per-chunk GCM tag |
+| Container format | Single `.aerovault` file (internal folder tree) | Directory tree of encrypted files on disk |
+| Error correction | Reed-Solomon `.aerocorrect` sidecar (rev. 4) | None |
+| Memory hygiene | Rust, `zeroize` + constant-time MAC | Java/JVM (GC, no guaranteed key wipe) |
 | Implementation | Rust | Java |
+
+The KDF, cipher, wrapping and filename rows are shared by both container lineages; the chunking, compression, dedup and AAD rows describe the AEROVAULT3 container. The legacy AEROVAULT2 lineage uses fixed 64 KiB chunks with no compression and a per-file `file_id` AAD binding.
 
 ## Security
 
