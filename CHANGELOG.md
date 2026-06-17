@@ -2,6 +2,12 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.1] - 2026-06-17
+
+### Docs
+
+- Switch the README logo, diagrams and document links from repository-relative paths to absolute GitHub URLs so they render on the crates.io page (relative paths only resolve on GitHub). No code change; identical to 0.6.0.
+
 ## [0.6.0] - 2026-06-17
 
 ### Real AEROVAULT3 container (revision 4)

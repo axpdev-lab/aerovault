@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/img/banner.png" alt="AeroVault" width="100%" />
+  <img src="https://raw.githubusercontent.com/axpdev-lab/aerovault/main/docs/img/banner.png" alt="AeroVault" width="100%" />
 </p>
 
 # AeroVault
 
 [![Crates.io](https://img.shields.io/crates/v/aerovault)](https://crates.io/crates/aerovault)
 [![docs.rs](https://docs.rs/aerovault/badge.svg)](https://docs.rs/aerovault)
-[![License: GPL-3.0](https://img.shields.io/crates/l/aerovault)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/crates/l/aerovault)](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE)
 
 Military-grade encrypted vault format for single-file encrypted containers.
 
@@ -198,20 +198,20 @@ fn protect_and_repair() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Format Specification
 
-The current version is **v4 = v3 container + Error Correction**. See [docs/AEROVAULT-V3-SPEC.md](docs/AEROVAULT-V3-SPEC.md) for the full v3 container specification (header, wrapper pipeline, manifest, extension directory, cryptography matrix) and the v4 Error Correction layer that rides on top of it. v4 is not a new on-disk major: the container stays v3 (magic `AEROVAULT3`, `format = 3`) and a plain v3 reader still opens a v4 container, skipping the non-critical Error Correction extension. The base binary layout that v3 builds on is in [docs/AEROVAULT-V2-SPEC.md](docs/AEROVAULT-V2-SPEC.md), and the detached recovery sidecar is in [docs/AEROCORRECT-SPEC.md](docs/AEROCORRECT-SPEC.md). See the [CHANGELOG](CHANGELOG.md) (0.4.0, 0.5.0) for the v3 and `.aerocorrect` deltas.
+The current version is **v4 = v3 container + Error Correction**. See [docs/AEROVAULT-V3-SPEC.md](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V3-SPEC.md) for the full v3 container specification (header, wrapper pipeline, manifest, extension directory, cryptography matrix) and the v4 Error Correction layer that rides on top of it. v4 is not a new on-disk major: the container stays v3 (magic `AEROVAULT3`, `format = 3`) and a plain v3 reader still opens a v4 container, skipping the non-critical Error Correction extension. The base binary layout that v3 builds on is in [docs/AEROVAULT-V2-SPEC.md](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V2-SPEC.md), and the detached recovery sidecar is in [docs/AEROCORRECT-SPEC.md](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROCORRECT-SPEC.md). See the [CHANGELOG](https://github.com/axpdev-lab/aerovault/blob/main/CHANGELOG.md) (0.4.0, 0.5.0) for the v3 and `.aerocorrect` deltas.
 
 ## Error Correction (`.aerocorrect`)
 
 `.aerocorrect` is a detached, par2-style Reed-Solomon recovery sidecar for **any** byte stream. It protects the bytes of the target without embedding anything into it, so the same format repairs `.aerovault` containers, synced files, or ordinary standalone files. The sidecar binds to the **SHA-256 of the protected content**, not to a path, salt, account, or provider identity.
 
 <p align="center">
-  <img src="docs/img/01-where-ec-sits.png" alt="Where error correction sits in the wrapper stack" width="620" />
+  <img src="https://raw.githubusercontent.com/axpdev-lab/aerovault/main/docs/img/01-where-ec-sits.png" alt="Where error correction sits in the wrapper stack" width="620" />
 </p>
 
 Error correction is the **last wrapper** in the AeroVault stack, so it protects the ciphertext bytes and never has to decode the format. For a `.aerovault` the parity lives in a sibling file by default, so the container stays byte-identical to a plain v3.
 
 <p align="center">
-  <img src="docs/img/02-placement.png" alt="Parity placement: detached sidecar by default" width="620" />
+  <img src="https://raw.githubusercontent.com/axpdev-lab/aerovault/main/docs/img/02-placement.png" alt="Parity placement: detached sidecar by default" width="620" />
 </p>
 
 ### CLI
@@ -254,11 +254,11 @@ CLI levels map to storage-overhead targets; the exact Reed-Solomon grid is store
 The small metadata that *locates* everything (the segment directory, content hash, and per-window geometry) is stored in **triplicate with per-copy checksums**, so a lightly-corrupted sidecar still recovers: a single rotted directory copy is detected and the read falls back to a good copy. The bulk parity carries no wholesale envelope checksum; every Reed-Solomon shard already carries its own checksum, so a rotted parity shard is treated as an erasure and routed around at repair time. (The pre-v2 framing used an all-or-nothing checksum that rejected any flip; v2 sidecars are written today, v1 sidecars are still read.)
 
 <p align="center">
-  <img src="docs/img/04-aerocorrect-layout.svg" alt=".aerocorrect v2 sidecar layout" width="640" />
+  <img src="https://raw.githubusercontent.com/axpdev-lab/aerovault/main/docs/img/04-aerocorrect-layout.svg" alt=".aerocorrect v2 sidecar layout" width="640" />
 </p>
 
 <p align="center">
-  <img src="docs/img/03-recovery.png" alt="Recovery: file only versus file and sidecar both damaged" width="620" />
+  <img src="https://raw.githubusercontent.com/axpdev-lab/aerovault/main/docs/img/03-recovery.png" alt="Recovery: file only versus file and sidecar both damaged" width="620" />
 </p>
 
 ### Bounded memory
@@ -276,7 +276,7 @@ Repair is **fail-closed and all-or-nothing**: the rebuilt stream is re-verified 
 | Vault container | v2, v3 | v3 |
 | `.aerocorrect` sidecar | v1, v2 | v2 (self-healing) |
 
-The `.aerocorrect` format is shared byte-for-byte with AeroFTP v4: a sidecar produced by either implementation verifies and repairs with the other for the same file and overhead level (a cross-implementation fixture pins this). See [docs/AEROCORRECT-SPEC.md](docs/AEROCORRECT-SPEC.md) for the full binary layout.
+The `.aerocorrect` format is shared byte-for-byte with AeroFTP v4: a sidecar produced by either implementation verifies and repairs with the other for the same file and overhead level (a cross-implementation fixture pins this). See [docs/AEROCORRECT-SPEC.md](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROCORRECT-SPEC.md) for the full binary layout.
 
 ## vs Cryptomator
 
@@ -314,7 +314,7 @@ The KDF, cipher, wrapping and filename rows are shared by both container lineage
 
 ## License
 
-GPL-3.0 -- See [LICENSE](LICENSE) for details.
+GPL-3.0 -- See [LICENSE](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE) for details.
 
 ## Origin
 
