@@ -70,6 +70,7 @@
 //! See [`AEROVAULT-V2-SPEC.md`](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V2-SPEC.md)
 //! for the complete format specification.
 
+pub mod aerocrypt;
 pub(crate) mod constants;
 pub(crate) mod crypto;
 pub mod error;
