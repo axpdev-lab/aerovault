@@ -168,6 +168,32 @@ pub struct EntryInfo {
     pub is_dir: bool,
     /// Last-modified timestamp in the app's `%Y-%m-%dT%H:%M:%SZ` form.
     pub modified: String,
+    /// Number of logical content chunks this entry references (0 for
+    /// directories). Logical, not deduplicated: two entries sharing a chunk
+    /// each count it.
+    pub chunk_count: usize,
+}
+
+/// Aggregate view of an open vault, sufficient for an embedder to build a
+/// JSON/info summary without reaching into the (private) manifest. Mirrors the
+/// totals the app historically derived from the manifest.
+#[derive(Debug, Clone)]
+pub struct VaultSummaryV3 {
+    /// On-disk format version ([`VERSION`]).
+    pub version: u8,
+    /// Number of file (non-directory) entries.
+    pub file_count: usize,
+    /// Number of distinct physical content chunks stored.
+    pub chunk_count: usize,
+    /// Deduplicated chunks: logical chunk references minus physical chunks.
+    pub dedup_chunks: usize,
+    /// Effective zstd compression level recorded in the manifest.
+    pub compression_level: i32,
+    /// Ordered wrapper chain (`"packing:small-file-batching v1"`, ...) derived
+    /// from the manifest, for the technical receipt.
+    pub algorithms: Vec<String>,
+    /// Every entry (files and directories) with its logical chunk count.
+    pub entries: Vec<EntryInfo>,
 }
 
 /// Header-only info available without a password.
@@ -273,6 +299,19 @@ impl VaultV3 {
         super::ec::has_error_correction(path)
     }
 
+    /// Pre-flight: which Error-Correction parity source a [`repair`](Self::repair)
+    /// would draw from (`explicit` path wins, else the detached sidecar, else the
+    /// embedded extension). An explicit path that is unreadable/malformed is a
+    /// hard error; an absent default source returns
+    /// [`ParitySource::None`](super::ec::ParitySource). Read-only; discards the
+    /// resolved parity bytes.
+    pub fn resolve_parity_source(
+        vault: &OpenVaultV3,
+        explicit: Option<&Path>,
+    ) -> Result<super::ec::ParitySource, String> {
+        super::ec::resolve_parity_source(vault, explicit).map(|(_, source)| source)
+    }
+
     /// Recovery surfaces available for a vault without the password.
     pub fn recovery_status(path: &Path) -> Result<super::ec::RecoveryStatus, String> {
         super::ec::recovery_status(path)
@@ -326,8 +365,29 @@ impl VaultV3 {
                 size: entry.size,
                 is_dir: entry.is_dir,
                 modified: entry.modified.clone(),
+                chunk_count: entry.chunks.len(),
             })
             .collect()
+    }
+
+    /// Aggregate stats + entry list for an open vault, mirroring the totals the
+    /// app historically derived from the manifest (file count, physical/dedup
+    /// chunk counts, compression level). Lets an embedder build an info/JSON
+    /// view without manifest access.
+    pub fn summary(vault: &OpenVaultV3) -> VaultSummaryV3 {
+        let entries = Self::list(vault);
+        let file_count = entries.iter().filter(|e| !e.is_dir).count();
+        let logical_chunks: usize = entries.iter().map(|e| e.chunk_count).sum();
+        let chunk_count = vault.manifest.chunks.len();
+        VaultSummaryV3 {
+            version: VERSION,
+            file_count,
+            chunk_count,
+            dedup_chunks: logical_chunks.saturating_sub(chunk_count),
+            compression_level: super::manifest::manifest_zstd_level(&vault.manifest),
+            algorithms: algorithm_chain(&vault.manifest),
+            entries,
+        }
     }
 
     /// Add files into the vault at the given vault-relative paths, then persist.
@@ -363,9 +423,12 @@ impl VaultV3 {
     }
 
     /// Create a directory (and any missing parents) inside the vault, persist.
-    pub fn create_directory(vault: &mut OpenVaultV3, dir_path: &str) -> Result<(), String> {
-        create_directory_in_manifest(&mut vault.manifest, dir_path)?;
-        save_open_vault(vault)
+    /// Returns `true` when the leaf directory was newly created, `false` when it
+    /// already existed.
+    pub fn create_directory(vault: &mut OpenVaultV3, dir_path: &str) -> Result<bool, String> {
+        let created = create_directory_in_manifest(&mut vault.manifest, dir_path)?;
+        save_open_vault(vault)?;
+        Ok(created)
     }
 
     /// Recursively add `source_dir` (depth <= 100, <= 500000 entries) under
@@ -455,6 +518,23 @@ impl VaultV3 {
 enum EntryKindV3 {
     File,
     Directory,
+}
+
+/// Ordered wrapper chain for the technical receipt, derived from the manifest
+/// wrappers (`"packing:small-file-batching v1"`, `"chunking:gear-cdc v1"`, ...).
+fn algorithm_chain(manifest: &VaultManifestV3) -> Vec<String> {
+    let w = &manifest.wrappers;
+    let line = |name: &str, s: &AlgorithmSpec| {
+        format!("{name}:{} v{}", s.algorithm_id, s.algorithm_version)
+    };
+    vec![
+        line("packing", &w.packing),
+        line("chunking", &w.chunking),
+        line("chunk_id", &w.chunk_id),
+        line("compression", &w.compression),
+        line("crypt", &w.crypt),
+        line("cipher_hash", &w.cipher_hash),
+    ]
 }
 
 fn validate_vault_path(path: &str) -> Result<(), String> {

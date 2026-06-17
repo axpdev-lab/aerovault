@@ -34,4 +34,4 @@ pub use manifest::{
     ChunkRecordV3, ExtensionEntryV3, ManifestEntryV3, VaultManifestV3, WrapperManifest,
 };
 pub use telemetry::VaultTelemetrySink;
-pub use vault::{CreateOptionsV3, EntryInfo, OpenVaultV3, PeekInfo, VaultV3};
+pub use vault::{CreateOptionsV3, EntryInfo, OpenVaultV3, PeekInfo, VaultSummaryV3, VaultV3};

@@ -263,7 +263,7 @@ fn read_embedded_error_correction(vault: &OpenVaultV3) -> Result<Option<Vec<u8>>
 /// order: explicit `parity` path -> detached `.aerocorrect` sidecar -> embedded
 /// extension. The content binding is NOT enforced here; a stale/foreign sidecar
 /// can only make a repair fail the caller's re-verify, never overwrite good data.
-fn resolve_parity_source(
+pub(super) fn resolve_parity_source(
     vault: &OpenVaultV3,
     explicit: Option<&Path>,
 ) -> Result<(Vec<u8>, ParitySource), String> {
