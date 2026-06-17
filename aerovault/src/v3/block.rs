@@ -8,10 +8,16 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use super::constants::{DATA_OFFSET, HEADER_SIZE, MAC_SIZE};
+use super::constants::{
+    DATA_OFFSET, ERROR_CORRECTION_ALGORITHM_ID, ERROR_CORRECTION_ALGORITHM_VERSION,
+    ERROR_CORRECTION_EXTENSION_ID, ERROR_CORRECTION_META_EXTENSION_ID, HEADER_SIZE, MAC_SIZE,
+};
 use super::format::VaultHeaderV3;
 use super::manifest::{encrypt_manifest, ExtensionEntryV3, VaultManifestV3};
 use crate::aerocrypt::KEY_SIZE;
+use crate::error_correction::{
+    compute_error_correction_shards_grid, manifest_error_correction_grid,
+};
 
 /// Read a `[offset, offset+len)` window from `reader`, rejecting `len > cap`
 /// before allocating (DoS guard).
@@ -54,6 +60,40 @@ pub fn build_file_bytes(
 ) -> Result<Vec<u8>, String> {
     let encrypted_manifest = encrypt_manifest(master_key, manifest)?;
 
+    // GAP-4 (rev. 4): when Error Correction is enabled (the data-block parity
+    // extension is present), also protect the locator. The per-block cipher_hash
+    // that scrub reads lives inside the encrypted manifest, so a corrupted
+    // manifest would leave scrub with no map to repair from. Compute a fixed-rate
+    // Reed-Solomon parity over the encrypted manifest bytes (manifest treated as
+    // one block) and store it as a second non-critical extension, rebuilt on
+    // every seal. It is located via the MAC-verified header (whose offsets
+    // survive a manifest hit), so repair can rebuild the manifest before reading
+    // any cipher_hash. build_file_bytes is the sole author: any inbound
+    // ERROR_CORRECTION_META_EXTENSION_ID is dropped and recomputed here.
+    let mut extensions: Vec<ExtensionEntryV3> = extensions
+        .iter()
+        .filter(|e| e.extension_id != ERROR_CORRECTION_META_EXTENSION_ID)
+        .cloned()
+        .collect();
+    let mut extension_payloads = extension_payloads.to_vec();
+    if extensions
+        .iter()
+        .any(|e| e.extension_id == ERROR_CORRECTION_EXTENSION_ID)
+    {
+        let (k, p) = manifest_error_correction_grid(manifest.error_correction_pct);
+        let (meta_payload, _shards, _prot, _ov) =
+            compute_error_correction_shards_grid(&[&encrypted_manifest], k, p);
+        extensions.push(ExtensionEntryV3 {
+            extension_id: ERROR_CORRECTION_META_EXTENSION_ID.to_string(),
+            algorithm_id: ERROR_CORRECTION_ALGORITHM_ID.to_string(),
+            algorithm_version: ERROR_CORRECTION_ALGORITHM_VERSION,
+            critical: false,
+            offset: extension_payloads.len() as u64,
+            length: meta_payload.len() as u64,
+        });
+        extension_payloads.extend_from_slice(&meta_payload);
+    }
+
     let extension_dir =
         serde_json::to_vec(&extensions).map_err(|e| format!("Extension serialize: {e}"))?;
 
@@ -79,7 +119,7 @@ pub fn build_file_bytes(
     out.extend_from_slice(data);
     out.extend_from_slice(&encrypted_manifest);
     out.extend_from_slice(&extension_dir);
-    out.extend_from_slice(extension_payloads);
+    out.extend_from_slice(&extension_payloads);
     Ok(out)
 }
 

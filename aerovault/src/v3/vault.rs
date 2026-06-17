@@ -38,7 +38,9 @@ use crate::aerocrypt::{
     wrap_key, KEY_SIZE, SALT_SIZE,
 };
 
-/// Options for creating a new rev. 3 (no Error Correction) AEROVAULT3 container.
+/// Options for creating an AEROVAULT3 container. Without an Error-Correction
+/// placement this produces a plain rev. 3 container; setting one (see
+/// [`VaultV3::create_with_error_correction`]) opts into rev. 4.
 pub struct CreateOptionsV3 {
     /// Destination path for the `.aerovault` container.
     pub path: PathBuf,
@@ -46,6 +48,11 @@ pub struct CreateOptionsV3 {
     pub password: String,
     /// zstd compression level recorded on the `compression` wrapper.
     pub zstd_level: i32,
+    /// rev. 4 Error-Correction placement. `None` keeps the container plain rev. 3.
+    pub(super) error_correction: Option<super::ec::RecoveryPlacement>,
+    /// QR-style EC overhead percentage; only meaningful when
+    /// `error_correction` is `Some`. Defaults to the original K=10/P=2 grid.
+    pub(super) error_correction_pct: u32,
 }
 
 impl CreateOptionsV3 {
@@ -55,6 +62,9 @@ impl CreateOptionsV3 {
             path: path.into(),
             password: password.into(),
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            error_correction: None,
+            error_correction_pct:
+                crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
         }
     }
 
@@ -71,15 +81,21 @@ impl CreateOptionsV3 {
 /// Drop it when done: the [`Drop`] impl zeroizes the key material.
 #[derive(Debug)]
 pub struct OpenVaultV3 {
-    path: PathBuf,
-    header: VaultHeaderV3,
-    opened_file_len: u64,
-    opened_header_mac: [u8; MAC_SIZE],
-    master_key: [u8; KEY_SIZE],
-    mac_key: [u8; KEY_SIZE],
-    manifest: VaultManifestV3,
-    extensions: Vec<ExtensionEntryV3>,
-    data: Vec<u8>,
+    pub(super) path: PathBuf,
+    pub(super) header: VaultHeaderV3,
+    pub(super) opened_file_len: u64,
+    pub(super) opened_header_mac: [u8; MAC_SIZE],
+    pub(super) master_key: [u8; KEY_SIZE],
+    pub(super) mac_key: [u8; KEY_SIZE],
+    pub(super) manifest: VaultManifestV3,
+    pub(super) extensions: Vec<ExtensionEntryV3>,
+    pub(super) data: Vec<u8>,
+    /// Set when `open_vault` had to rebuild a corrupted encrypted manifest from
+    /// Error-Correction parity (rev. 4). `repair` persists the healed region.
+    pub(super) manifest_repaired_on_open: bool,
+    /// Set when `open_vault` had to rebuild a corrupted header from the detached
+    /// sidecar's header parity (rev. 4). `repair` persists the healed region.
+    pub(super) header_repaired_on_open: bool,
 }
 
 impl Drop for OpenVaultV3 {
@@ -134,9 +150,91 @@ pub struct PeekInfo {
 pub struct VaultV3;
 
 impl VaultV3 {
-    /// Create a new empty rev. 3 container at `opts.path`.
+    /// Create a new empty container at `opts.path`. A plain rev. 3 container
+    /// unless `opts` carries an Error-Correction placement (rev. 4).
     pub fn create(opts: &CreateOptionsV3) -> Result<(), String> {
-        create_empty_vault(&opts.path, &opts.password, opts.zstd_level)
+        create_empty_vault(
+            &opts.path,
+            &opts.password,
+            opts.zstd_level,
+            opts.error_correction,
+            opts.error_correction_pct,
+        )
+    }
+
+    /// Create a new empty rev. 4 container with Reed-Solomon Error Correction.
+    ///
+    /// `placement` selects where parity lives: `Embedded` (non-critical
+    /// in-container extension, recomputed on every seal), `Detached` (a sibling
+    /// `.aerocorrect` sidecar, container stays byte-identical to a plain vault),
+    /// or `Both`. The embedded extension is non-critical so rev. 3 readers can
+    /// still open + extract (#276). `pct` is the QR-style overhead level
+    /// (clamped to `[MIN_PCT, MAX_PCT]`); the default reproduces the original
+    /// K=10/P=2 (~20%) grid.
+    pub fn create_with_error_correction(
+        opts: &CreateOptionsV3,
+        placement: super::ec::RecoveryPlacement,
+        pct: u32,
+    ) -> Result<(), String> {
+        create_empty_vault(
+            &opts.path,
+            &opts.password,
+            opts.zstd_level,
+            Some(placement),
+            pct,
+        )
+    }
+
+    /// Write a detached `.aerocorrect` recovery file for an existing vault
+    /// without rewriting the container ("add Error Correction later"). Defaults
+    /// to `<vault>.aerocorrect`; pass `out` to override.
+    pub fn export_parity(
+        vault_path: &Path,
+        password: &str,
+        out: Option<&Path>,
+    ) -> Result<super::ec::ExportParityResult, String> {
+        super::ec::export_parity(vault_path, password, out)
+    }
+
+    /// Drop the embedded Error-Correction extension on the next seal. Refuses
+    /// unless a detached sidecar already exists or `force` is set, so a vault is
+    /// never silently left with zero recovery.
+    pub fn strip_parity(
+        vault_path: &Path,
+        password: &str,
+        force: bool,
+    ) -> Result<super::ec::StripParityResult, String> {
+        super::ec::strip_parity(vault_path, password, force)
+    }
+
+    /// Verify every stored content block against its manifest `cipher_hash`,
+    /// returning the damaged chunks (read-only).
+    pub fn scrub(vault: &OpenVaultV3) -> Vec<super::ec::DamagedChunk> {
+        super::ec::scrub_vault(vault)
+    }
+
+    /// Repair damaged blocks from Error-Correction parity (explicit `parity`
+    /// path, else detached sidecar, else embedded extension). All-or-nothing:
+    /// every reconstructed block is re-verified against the manifest
+    /// `cipher_hash` and persisted only if all pass; on `dry_run` nothing is
+    /// written. Returns `(repaired_block_count, parity_source)`.
+    pub fn repair(
+        vault: &mut OpenVaultV3,
+        dry_run: bool,
+        parity: Option<&Path>,
+    ) -> Result<(usize, super::ec::ParitySource), String> {
+        super::ec::repair_vault(vault, dry_run, parity)
+    }
+
+    /// True if `path` carries the embedded Error-Correction extension (no
+    /// password needed; reads only the header + plaintext extension directory).
+    pub fn has_error_correction(path: &Path) -> Result<bool, String> {
+        super::ec::has_error_correction(path)
+    }
+
+    /// Recovery surfaces available for a vault without the password.
+    pub fn recovery_status(path: &Path) -> Result<super::ec::RecoveryStatus, String> {
+        super::ec::recovery_status(path)
     }
 
     /// True if `path` begins with the AEROVAULT3 magic + version.
@@ -1026,7 +1124,7 @@ fn extract_file_entry(
     Ok(output_path.to_path_buf())
 }
 
-fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1055,7 +1153,7 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_capped(
+pub(super) fn read_capped(
     file: &mut std::fs::File,
     offset: u64,
     len: u64,
@@ -1097,7 +1195,7 @@ fn validate_supported_wrappers(w: &WrapperManifest) -> Result<(), String> {
     Ok(())
 }
 
-fn open_header_bytes(
+pub(super) fn open_header_bytes(
     header_bytes: &[u8],
     password: &str,
 ) -> Result<(VaultHeaderV3, [u8; KEY_SIZE], [u8; KEY_SIZE]), String> {
@@ -1117,7 +1215,13 @@ fn open_header_bytes(
     Ok((header, mac_key, master_key))
 }
 
-fn create_empty_vault(path: &Path, password: &str, level: i32) -> Result<(), String> {
+fn create_empty_vault(
+    path: &Path,
+    password: &str,
+    level: i32,
+    error_correction: Option<super::ec::RecoveryPlacement>,
+    error_correction_pct: u32,
+) -> Result<(), String> {
     if password.len() < MIN_PASSWORD_LEN {
         return Err("Password must be at least 8 characters".to_string());
     }
@@ -1149,16 +1253,56 @@ fn create_empty_vault(path: &Path, password: &str, level: i32) -> Result<(), Str
         header_mac: [0u8; MAC_SIZE],
     };
 
-    // T6: the app seeds an Error-Correction extension + sidecar here when
-    // requested. rev. 3 carries no extensions and no parity payload.
-    let manifest = empty_manifest(level);
-    let bytes = build_file_bytes(header, &mac_key, &master_key, &manifest, &[], &[], &[])?;
+    let mut manifest = empty_manifest(level);
+    // Record the QR-style overhead level so every later seal / export uses the
+    // same grid (#276). Only meaningful when Error Correction is enabled.
+    if error_correction.is_some() {
+        manifest.error_correction_pct = Some(error_correction_pct.clamp(
+            crate::error_correction::ERROR_CORRECTION_MIN_PCT,
+            crate::error_correction::ERROR_CORRECTION_MAX_PCT,
+        ));
+    }
+    // Embed the extension only when the placement keeps an in-container copy.
+    let embed = error_correction.is_some_and(|p| p.embeds());
+    let mut extensions = if embed {
+        vec![super::ec::error_correction_stub_extension()]
+    } else {
+        vec![]
+    };
+    let ext_payloads = if embed {
+        let (p, _shards, _prot, _ov) =
+            crate::error_correction::compute_error_correction_shards(&[]);
+        if let Some(e) = extensions.first_mut() {
+            e.offset = 0;
+            e.length = p.len() as u64;
+        }
+        p
+    } else {
+        vec![]
+    };
+    let bytes = build_file_bytes(
+        header,
+        &mac_key,
+        &master_key,
+        &manifest,
+        &extensions,
+        &ext_payloads,
+        &[],
+    )?;
     master_key.zeroize();
     mac_key.zeroize();
-    atomic_write(path, &bytes)
+    atomic_write(path, &bytes)?;
+
+    // Detached/both placements seed the sidecar so the file exists from
+    // creation. An empty vault has an empty parity payload; re-run
+    // `export-parity` after adding files (par2 semantics).
+    if error_correction.is_some_and(|p| p.writes_sidecar()) {
+        super::ec::seed_empty_sidecar(path, &bytes)?;
+    }
+    Ok(())
 }
 
-fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
+pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
     let path = path.into();
     let mut file = std::fs::File::open(&path).map_err(|e| format!("Open vault: {e}"))?;
     let file_len = file
@@ -1169,9 +1313,21 @@ fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, S
     file.read_exact(&mut header_bytes)
         .map_err(|e| format!("Read header: {e}"))?;
 
-    // T6: the app falls back to rebuilding a corrupted header from the detached
-    // sidecar's header parity here. rev. 3 keeps the original error.
-    let (header, mac_key, master_key) = open_header_bytes(&header_bytes, password)?;
+    // HEADER parity (rev. 4): the on-disk header is the happy path. If it fails
+    // to parse or its MAC does not verify (bit-rot / bad sector), fall back to
+    // rebuilding it from the detached sidecar's header parity. A missing sidecar
+    // / no header parity / a rebuild that still does not unlock keeps the
+    // original error. The MAC verify inside `open_header_bytes` is the proof.
+    let (header, mac_key, master_key, header_repaired_on_open) =
+        match open_header_bytes(&header_bytes, password) {
+            Ok((h, mac, master)) => (h, mac, master, false),
+            Err(orig) => {
+                match super::ec::recover_header_from_sidecar(&path, &header_bytes, password)? {
+                    Some((h, mac, master)) => (h, mac, master, true),
+                    None => return Err(orig),
+                }
+            }
+        };
 
     validate_ranges(&header, file_len)?;
 
@@ -1191,9 +1347,34 @@ fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, S
         MAX_MANIFEST_SIZE,
         "manifest",
     )?;
-    // T6: the app rebuilds a corrupted manifest from parity here. rev. 3
-    // returns the decrypt error directly.
-    let manifest = decrypt_manifest(&master_key, &encrypted_manifest)?;
+    // GAP-4 (rev. 4): the manifest region may be corrupted (bit-rot, bad
+    // sector). Rebuild the encrypted manifest from parity and retry. Try the
+    // embedded metadata extension first (auto-fresh on the embedded path), then
+    // the detached sidecar's manifest parity (the only copy a pure-detached
+    // vault keeps). A successful AEAD decrypt on the rebuilt bytes is the
+    // correctness proof; otherwise keep the original error.
+    let (manifest, manifest_repaired_on_open) =
+        match decrypt_manifest(&master_key, &encrypted_manifest) {
+            Ok(m) => (m, false),
+            Err(orig) => {
+                let embedded = super::ec::reconstruct_encrypted_manifest(
+                    &mut file, &header, file_len,
+                )?;
+                let rebuilt = match embedded {
+                    Some(r) if r != encrypted_manifest => Some(r),
+                    _ => super::ec::reconstruct_manifest_from_sidecar(
+                        &path,
+                        &encrypted_manifest,
+                    )?,
+                };
+                match rebuilt {
+                    Some(r) if r != encrypted_manifest => {
+                        (decrypt_manifest(&master_key, &r)?, true)
+                    }
+                    _ => return Err(orig),
+                }
+            }
+        };
     if manifest.format != VERSION {
         return Err(format!(
             "Unsupported AeroVault manifest version: {}",
@@ -1214,7 +1395,8 @@ fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, S
         .map_err(|e| format!("Extension directory parse: {e}"))?;
 
     for ext in &extensions {
-        // T6: the app notes the presence of the EC extension here.
+        // A rev. 3 reader rejects any critical extension; the rev. 4 EC layers
+        // are deliberately non-critical so this stays a forward-compat skip.
         if ext.critical {
             return Err(format!(
                 "Unsupported critical AeroVault v3 extension: {}",
@@ -1224,7 +1406,8 @@ fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, S
     }
 
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
-    // its sole author. T6: this filter is a no-op in rev. 3 (no EC extensions).
+    // its sole author and recomputes it on every seal from the freshly
+    // encrypted manifest. (No-op when no EC extension is present.)
     let extensions: Vec<ExtensionEntryV3> = extensions
         .into_iter()
         .filter(|e| e.extension_id != super::constants::ERROR_CORRECTION_META_EXTENSION_ID)
@@ -1240,6 +1423,8 @@ fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, S
         manifest,
         extensions,
         data,
+        manifest_repaired_on_open,
+        header_repaired_on_open,
     })
 }
 
@@ -1290,18 +1475,58 @@ fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
     Ok(())
 }
 
-fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
+pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     assert_vault_generation_current(vault)?;
 
-    // T6: the app recomputes Reed-Solomon shards over the data section here when
-    // the EC extension is present. rev. 3 has no extensions and no payload.
+    let mut extensions = vault.extensions.clone();
+    let mut ext_payloads = vec![];
+
+    // rev. 4: if the Error-Correction extension is present, recompute the shards
+    // over the current data section and update the entry + payload. Recompute on
+    // every seal (cost is acceptable for the EC use case; most vaults won't have
+    // it enabled).
+    if let Some(error_correction_idx) = extensions
+        .iter()
+        .position(|e| e.extension_id == super::constants::ERROR_CORRECTION_EXTENSION_ID)
+    {
+        // On-disk blocks in data-section order (sorted by data_offset). Each
+        // full block is [u64 len][ciphertext of that len].
+        let mut chunk_records: Vec<_> = vault.manifest.chunks.values().cloned().collect();
+        chunk_records.sort_by_key(|r| r.data_offset);
+
+        let blocks: Vec<&[u8]> = chunk_records
+            .iter()
+            .map(|rec| {
+                let start = rec.data_offset as usize;
+                let full_len = 8 + rec.block_len as usize;
+                if start + full_len <= vault.data.len() {
+                    &vault.data[start..start + full_len]
+                } else {
+                    &[] as &[u8]
+                }
+            })
+            .collect();
+
+        let (k, p) = crate::error_correction::manifest_error_correction_grid(
+            vault.manifest.error_correction_pct,
+        );
+        let (payload, _shards, _protected, _overhead) =
+            crate::error_correction::compute_error_correction_shards_grid(&blocks, k, p);
+
+        let entry = &mut extensions[error_correction_idx];
+        entry.offset = 0;
+        entry.length = payload.len() as u64;
+
+        ext_payloads = payload;
+    }
+
     let bytes = build_file_bytes(
         vault.header.clone(),
         &vault.mac_key,
         &vault.master_key,
         &vault.manifest,
-        &vault.extensions,
-        &[],
+        &extensions,
+        &ext_payloads,
         &vault.data,
     )?;
     atomic_write(&vault.path, &bytes)?;
@@ -1771,6 +1996,8 @@ mod tests {
             manifest,
             extensions: Vec::new(),
             data: Vec::new(),
+            manifest_repaired_on_open: false,
+            header_repaired_on_open: false,
         };
         let out = scratch_dir();
         assert!(VaultV3::extract_entry(&vault, "../escape.txt", &out).is_err());
