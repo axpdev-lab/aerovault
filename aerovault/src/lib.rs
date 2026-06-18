@@ -83,9 +83,23 @@ pub mod vault;
 pub use error::Error;
 pub use error_correction::{
     aerocorrect_sidecar_path_for, correct_generate, correct_repair, correct_repair_anchored,
-    correct_verify,
-    AeroCorrectSegment, AeroCorrectSidecar, CorrectGenerateReport, CorrectRepairReport,
-    CorrectVerifyReport, AEROCORRECT_EXTENSION, AEROCORRECT_MAGIC, AEROCORRECT_VERSION,
+    correct_verify, AeroCorrectSegment, AeroCorrectSidecar, CorrectGenerateReport,
+    CorrectRepairReport, CorrectVerifyReport, AEROCORRECT_EXTENSION, AEROCORRECT_MAGIC,
+    AEROCORRECT_VERSION,
+};
+// AeroSync windowed-sidecar error-correction API: windowed `.aerocorrect` generation
+// (from a path or from bytes, with cap + minimum-benefit gate) and verify/repair against
+// an out-of-band expected SHA-256. This is the single implementation; the AeroFTP app
+// routes its AeroSync download EC and standalone `correct` here (M7 convergence).
+pub use error_correction::sync::{
+    estimate_aerorec_sidecar_len, generate_sync_sidecar_for_bytes,
+    generate_sync_sidecar_for_bytes_capped, generate_sync_sidecar_for_file_capped,
+    parse_sha256_hex, sync_error_correction_sidecar_path, verify_repair_sync_bytes,
+    verify_repair_sync_file, verify_repair_sync_file_streamed, SyncEcGenerateResult,
+    SyncEcGeneratedSidecar, SyncEcRepairResult, AEROSYNC_EC_MAX_FILE_SIZE,
+};
+pub use error_correction::{
+    ERROR_CORRECTION_DEFAULT_PCT, ERROR_CORRECTION_MAX_PCT, ERROR_CORRECTION_MIN_PCT,
 };
 pub use format::{EncryptionMode, HeaderFlags, ManifestEntry, VaultHeader, VaultManifest};
 pub use vault::{CompactResult, CreateOptions, EntryInfo, PeekInfo, Vault};

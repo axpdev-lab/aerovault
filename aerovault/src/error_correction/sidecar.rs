@@ -564,7 +564,6 @@ pub(crate) fn estimate_single_segment_sidecar_len(content_len: u64, pct: u32) ->
 /// Serialized AVEC parity payload bytes for ONE protected window of `content_len`
 /// bytes at overhead level `pct`, derived from the same v2 fixed-grid geometry
 /// WITHOUT allocating or hashing. An empty window has an empty AVEC payload.
-#[allow(dead_code)]
 pub(crate) fn avec_len_for(content_len: u64, pct: u32) -> u64 {
     avec_len_for_checked(content_len, pct).unwrap_or(u64::MAX)
 }
@@ -631,7 +630,6 @@ pub(crate) fn aerocorrect_windows(total_len: u64, window: u64) -> Vec<(u64, u64)
 /// stream at overhead `pct`, tiled at `window`. Equals one per-sidecar frame plus, per
 /// window, the per-segment header and that window's AVEC payload. Reduces to
 /// `estimate_single_segment_sidecar_len` when the stream fits in a single window.
-#[allow(dead_code)]
 pub(crate) fn estimate_windowed_sidecar_len(total_len: u64, pct: u32, window: u64) -> u64 {
     let mut total = V2_SIDECAR_FIXED_LEN as u64;
     let segment_len = |len| (V2_SEGMENT_FRAMING_LEN as u64).saturating_add(avec_len_for(len, pct));
@@ -655,7 +653,6 @@ pub(crate) fn estimate_windowed_sidecar_len(total_len: u64, pct: u32, window: u6
 /// streaming verify/repair reads the file sequentially window by window, so a sidecar
 /// whose windows do not tile cleanly (a forged or foreign layout) is rejected before
 /// any repair touches the file.
-#[allow(dead_code)]
 pub(crate) fn validate_window_tiling(
     segments: &[AeroCorrectSegment],
     total_len: u64,
@@ -1293,36 +1290,29 @@ mod tests {
     /// sidecar before the repair path can touch the file.
     #[test]
     fn locator_destroyed_beyond_budget_fails_repair_closed() {
-        use super::super::standalone::{
-            generate_sidecar_for_file_capped, verify_repair_standalone_file_streamed,
-            StandaloneEcGenerateResult, STANDALONE_EC_MAX_FILE_SIZE,
+        use super::super::sync::{
+            generate_sync_sidecar_for_bytes, verify_repair_sync_file_streamed,
         };
         let data = sample(80_000);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("payload.bin");
-        std::fs::write(&path, &data).unwrap();
-        let sidecar_path = dir.path().join("payload.bin.aerocorrect");
-        let generated =
-            match generate_sidecar_for_file_capped("rel", &path, 20, STANDALONE_EC_MAX_FILE_SIZE)
-                .unwrap()
-            {
-                StandaloneEcGenerateResult::Generated(g) => g,
-                other => panic!("should generate, got {other:?}"),
-            };
+        let generated = generate_sync_sidecar_for_bytes("rel", &data, 20);
         let mut bytes = generated.sidecar_bytes.clone();
         // Clobber the binding in all three directory copies (past majority-vote recovery).
         for i in 0..DIRECTORY_COPIES {
             bytes[v2_copy_base(1, i) + 10] = 0xFF;
         }
-        std::fs::write(&sidecar_path, &bytes).unwrap();
 
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join("wrecked.aerocorrect");
+        std::fs::write(&sidecar_path, &bytes).unwrap();
+        let path = dir.path().join("payload.bin");
         let mut corrupt = data.clone();
         corrupt[5_000] ^= 0xAA; // a normally-recoverable hit
         std::fs::write(&path, &corrupt).unwrap();
         let before = std::fs::read(&path).unwrap();
 
         assert!(
-            verify_repair_standalone_file_streamed("rel", &path, &sidecar_path, None).is_err(),
+            verify_repair_sync_file_streamed("rel", &generated.file_sha256, &path, &sidecar_path)
+                .is_err(),
             "a sidecar damaged past self-heal must not repair"
         );
         assert_eq!(

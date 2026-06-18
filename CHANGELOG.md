@@ -2,6 +2,29 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.2] - 2026-06-18
+
+### Security (audit 2026-06-18 remediation)
+
+Hardening from an independent dual blind audit (Claude Opus 4.8 + Codex GPT-5) followed by a two-round adversarial controaudit. No on-disk format change; existing `.aerovault` containers and `.aerocorrect` sidecars round-trip identically.
+
+- **M1 (High):** standalone `.aerocorrect` repair on Windows held the target read handle across the atomic `persist`, failing the rename with `ERROR_ACCESS_DENIED` (the original stayed corrupt) and could leave a decrypted-plaintext temp beside the target on the error branch. The read handle is now dropped before `persist`, and the temp is scrubbed on the persist-error branch.
+- **M2 (Medium):** v3 extract could follow a pre-planted intermediate reparse point (a Windows directory junction, no admin needed) out of the destination root. Each path component is now created refusing to follow a pre-existing reparse point, with the canonical parent asserted to stay within the canonical root, on `extract_all`, `extract_entry`, and `extract_file_entry`.
+- **M3 (Low):** added an out-of-band `--expect-sha256` authenticity anchor to standalone repair (`correct_repair_anchored`): a sidecar declaring a different content hash is refused before any write. Bare `correct repair` stays an integrity tool; the anchor adds authenticity.
+- **M4 (Low):** forged, critical, duplicate, or out-of-range v3 extension-directory entries are now rejected at open, hoisted above the manifest-recovery consumption, so a forged directory fails closed before any use. Full byte authentication of the directory is tracked for a future v2 header.
+- **M6 (Info):** documented that `save_open_vault` is generation-check-only (the embedder owns the cross-process lock).
+- **M8 (Info):** documented the `cargo-audit` ignore for RUSTSEC-2024-0384 (`instant` unmaintained), with corrected attribution (transitive via `reed-solomon-erasure 6.0.0` -> `parking_lot 0.11`, not the CLI progress stack; not locally fixable while the RS crate pins parking_lot 0.11).
+
+### Error-correction convergence (M7) + AeroSync sidecar API
+
+- **One implementation of the `.aerocorrect` engine.** The AeroFTP application's forked standalone error correction (the `correct` command and the `aeroftp_correct_*` MCP tools) and its AeroSync download error correction now route into this crate instead of an app-local copy, so the format has a single audited implementation. Standalone repair and AeroSync verify/repair share one persist path (one handle-drop site, one M3 anchor). The cross-impl golden (`tests/aerocorrect_cross_impl.rs`) still pins crate-generated sidecars byte-for-byte to the application's output.
+- **New public `error_correction::sync` module** (re-exported at the crate root) for windowed-sidecar use cases: windowed `.aerocorrect` generation from a path or from bytes with a per-file size cap and an opt-in minimum-benefit gate (`generate_sync_sidecar_for_file_capped`, `generate_sync_sidecar_for_bytes`, `generate_sync_sidecar_for_bytes_capped`); verify/repair against an out-of-band expected SHA-256 from an on-disk sidecar, an in-memory sidecar, or in-memory bytes (`verify_repair_sync_file_streamed`, `verify_repair_sync_file`, `verify_repair_sync_bytes`); plus `estimate_aerorec_sidecar_len`, `sync_error_correction_sidecar_path`, and `parse_sha256_hex`. The overhead-level constants `ERROR_CORRECTION_DEFAULT_PCT`, `ERROR_CORRECTION_MIN_PCT`, and `ERROR_CORRECTION_MAX_PCT` are now public.
+
+### Notes
+
+- The AeroFTP application pins this release to consume the converged error-correction engine.
+- Credit to **Ehud Kirsh** (@EhudKirsh) for the abort-cleanup report that M1 helps close.
+
 ## [0.6.1] - 2026-06-17
 
 ### Docs

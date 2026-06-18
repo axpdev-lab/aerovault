@@ -1,7 +1,7 @@
 use reed_solomon_erasure::ReedSolomon;
 
 pub(crate) mod sidecar;
-pub(crate) mod standalone;
+pub mod sync;
 
 pub use sidecar::{
     AeroCorrectSegment, AeroCorrectSidecar, AEROCORRECT_EXTENSION, AEROCORRECT_MAGIC,
@@ -59,10 +59,9 @@ pub(crate) const ERROR_CORRECTION_SHARD_CKSUM_LEN: usize = 16;
 /// percentage; the grid below maps it to a Reed-Solomon (K, P). The default 20%
 /// reproduces the original fixed K=10/P=2 grid, so payloads created before this knob
 /// (no recorded percentage) keep their exact geometry.
-#[allow(dead_code)]
-pub(crate) const ERROR_CORRECTION_DEFAULT_PCT: u32 = 20;
-pub(crate) const ERROR_CORRECTION_MIN_PCT: u32 = 5;
-pub(crate) const ERROR_CORRECTION_MAX_PCT: u32 = 50;
+pub const ERROR_CORRECTION_DEFAULT_PCT: u32 = 20;
+pub const ERROR_CORRECTION_MIN_PCT: u32 = 5;
+pub const ERROR_CORRECTION_MAX_PCT: u32 = 50;
 
 /// Map a target storage-overhead percentage to a Reed-Solomon (K data, P parity)
 /// group. Overhead is P/K; we fix P (one parity shard for the lowest band, two above
@@ -569,21 +568,26 @@ pub fn correct_generate(
     let rel = rel_name(file);
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
     // it even for tiny files (the gate is a sync-pipeline opt-in, not a CLI-of-one concern).
-    let result = standalone::generate_sidecar_for_file_capped(
+    let result = sync::generate_sync_sidecar_for_file_capped(
         &rel,
         path,
         pct,
-        standalone::STANDALONE_EC_MAX_FILE_SIZE,
+        sync::AEROSYNC_EC_MAX_FILE_SIZE,
+        0,
     )?;
     let generated = match result {
-        standalone::StandaloneEcGenerateResult::Generated(g) => g,
-        standalone::StandaloneEcGenerateResult::SkippedTooLarge {
+        sync::SyncEcGenerateResult::Generated(g) => g,
+        sync::SyncEcGenerateResult::SkippedTooLarge {
             file_size,
             max_file_size,
         } => {
             return Err(format!(
                 "{file} is {file_size} bytes, above the {max_file_size}-byte error-correction cap"
             ));
+        }
+        sync::SyncEcGenerateResult::SkippedLowBenefit { .. } => {
+            // Unreachable: the gate is disabled above (max_overhead_pct = 0).
+            unreachable!("correct gen does not enable the minimum-benefit gate")
         }
     };
     let sidecar_path = out
@@ -615,8 +619,8 @@ pub fn correct_verify(file: &str, parity: Option<&str>) -> Result<CorrectVerifyR
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
     let verified = matches!(
-        standalone::verify_standalone_file_streamed(&rel, path, Path::new(&sidecar_path))?,
-        standalone::StandaloneVerifyResult::Verified
+        sync::verify_standalone_file_streamed(&rel, path, Path::new(&sidecar_path))?,
+        sync::StandaloneVerifyResult::Verified
     );
     Ok(CorrectVerifyReport {
         file: file.to_string(),
@@ -633,7 +637,7 @@ pub fn correct_verify(file: &str, parity: Option<&str>) -> Result<CorrectVerifyR
 /// declares. To additionally assert AUTHENTICITY (that the recovered content is the one
 /// you expect, not whatever a planted sidecar declares), use [`correct_repair_anchored`]
 /// with an out-of-band good SHA-256. See the audit-M3 trust-model note on
-/// `standalone::verify_repair_standalone_file_streamed`.
+/// `sync::verify_repair_standalone_file_streamed`.
 pub fn correct_repair(file: &str, parity: Option<&str>) -> Result<CorrectRepairReport, String> {
     correct_repair_anchored(file, parity, None)
 }
@@ -653,21 +657,20 @@ pub fn correct_repair_anchored(
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
     let anchor = match expect_sha256 {
-        Some(hex) => Some(parse_sha256_hex(hex)?),
+        Some(hex) => Some(sync::parse_sha256_hex(hex)?),
         None => None,
     };
-    let (status, repaired, recovered_shards) =
-        match standalone::verify_repair_standalone_file_streamed(
-            &rel,
-            path,
-            Path::new(&sidecar_path),
-            anchor.as_ref(),
-        )? {
-            standalone::StandaloneEcRepairResult::Verified => ("verified".to_string(), false, 0u64),
-            standalone::StandaloneEcRepairResult::Repaired { recovered_shards } => {
-                ("repaired".to_string(), true, recovered_shards as u64)
-            }
-        };
+    let (status, repaired, recovered_shards) = match sync::verify_repair_standalone_file_streamed(
+        &rel,
+        path,
+        Path::new(&sidecar_path),
+        anchor.as_ref(),
+    )? {
+        sync::SyncEcRepairResult::Verified => ("verified".to_string(), false, 0u64),
+        sync::SyncEcRepairResult::Repaired { recovered_shards } => {
+            ("repaired".to_string(), true, recovered_shards as u64)
+        }
+    };
     Ok(CorrectRepairReport {
         file: file.to_string(),
         sidecar: sidecar_path,
@@ -677,23 +680,8 @@ pub fn correct_repair_anchored(
     })
 }
 
-/// Parse a 64-char hex SHA-256 into 32 bytes, failing closed on malformed input.
-fn parse_sha256_hex(hex: &str) -> Result<[u8; 32], String> {
-    let hex = hex.trim();
-    if hex.len() != 64 {
-        return Err(format!(
-            "expected SHA-256 must be 64 hex chars, got {}",
-            hex.len()
-        ));
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let s = &hex[i * 2..i * 2 + 2];
-        *byte = u8::from_str_radix(s, 16)
-            .map_err(|_| "expected SHA-256 is not valid hex".to_string())?;
-    }
-    Ok(out)
-}
+// `parse_sha256_hex` for the `--expect-sha256` anchor now lives in `sync` (the single
+// EC implementation); see `sync::parse_sha256_hex`.
 
 #[cfg(test)]
 mod tests {
@@ -972,7 +960,11 @@ mod tests {
         };
         let r = correct_repair_anchored(&file, None, Some(&good)).unwrap();
         assert!(r.repaired && r.status == "repaired");
-        assert_eq!(std::fs::read(&file).unwrap(), original, "byte-identical repair");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            original,
+            "byte-identical repair"
+        );
     }
 
     #[test]
