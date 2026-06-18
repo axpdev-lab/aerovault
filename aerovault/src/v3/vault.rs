@@ -1653,6 +1653,23 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
         MAX_MANIFEST_SIZE,
         "manifest",
     )?;
+
+    // Read, parse and VALIDATE the extension directory up front (audit M4) so a forged
+    // directory is rejected at open BEFORE the manifest-recovery block below can consume
+    // it (`reconstruct_encrypted_manifest` reads its own copy of the directory region to
+    // locate the EC parity extension). `read_capped` seeks per call, so this read does
+    // not perturb the later reads. Reject critical / duplicate / out-of-range entries.
+    let extension_json = read_capped(
+        &mut file,
+        header.extension_dir_offset,
+        header.extension_dir_len,
+        MAX_EXTENSION_DIR_SIZE,
+        "extension directory",
+    )?;
+    let extensions: Vec<ExtensionEntryV3> = serde_json::from_slice(&extension_json)
+        .map_err(|e| format!("Extension directory parse: {e}"))?;
+    validate_extension_dir(&extensions, header.extension_payload_len)?;
+
     // GAP-4 (rev. 4): the manifest region may be corrupted (bit-rot, bad
     // sector). Rebuild the encrypted manifest from parity and retry. Try the
     // embedded metadata extension first (auto-fresh on the embedded path), then
@@ -1685,20 +1702,6 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
     }
     validate_supported_wrappers(&manifest.wrappers)?;
     validate_manifest_paths(&manifest)?;
-
-    let extension_json = read_capped(
-        &mut file,
-        header.extension_dir_offset,
-        header.extension_dir_len,
-        MAX_EXTENSION_DIR_SIZE,
-        "extension directory",
-    )?;
-    let extensions: Vec<ExtensionEntryV3> = serde_json::from_slice(&extension_json)
-        .map_err(|e| format!("Extension directory parse: {e}"))?;
-
-    // Reject critical / duplicate / out-of-range extensions, failing a forged
-    // extension directory closed at open time (audit M4; see fn docs).
-    validate_extension_dir(&extensions, header.extension_payload_len)?;
 
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
     // its sole author and recomputes it on every seal from the freshly
@@ -1884,7 +1887,10 @@ fn extract_entry(
                 let output_path = dest_path.join(&entry.path);
                 extract_file_entry(vault, entry, &output_path, dest_path)
             } else {
-                // Caller named an exact output file: contain it within its parent dir.
+                // Caller named an EXACT output file path (not manifest-derived); the
+                // single leaf is replaced by atomic_write's rename. The destination is
+                // the caller's own choice, so its parent is a trust boundary the caller
+                // owns (no manifest-controlled component is appended here).
                 let parent = dest_path
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
@@ -1895,17 +1901,27 @@ fn extract_entry(
             }
         }
         Some(EntryKindV3::Directory) => {
-            let output_root = if dest_path.exists() {
+            // Containment root is the user's chosen destination. When it already exists
+            // we extract the subtree under `dest/<basename>`, and the manifest-derived
+            // `<basename>` component is created through create_contained_dirs so a
+            // pre-planted junction there is refused (audit M2 residual) rather than
+            // followed; the subtree is then contained under the REAL `dest` (`root`),
+            // not under a possibly-redirected `output_root`. When dest does not exist
+            // we create it fresh and it is its own root.
+            let (root, output_root) = if dest_path.exists() {
                 if !dest_path.is_dir() {
                     return Err(
                         "Destination for directory extraction must be a directory".to_string()
                     );
                 }
-                dest_path.join(path_basename(&entry_name))
+                let basename = path_basename(&entry_name);
+                create_contained_dirs(dest_path, Path::new(basename))?;
+                (dest_path.to_path_buf(), dest_path.join(basename))
             } else {
-                dest_path.to_path_buf()
+                std::fs::create_dir_all(dest_path)
+                    .map_err(|e| format!("Create output dir: {e}"))?;
+                (dest_path.to_path_buf(), dest_path.to_path_buf())
             };
-            std::fs::create_dir_all(&output_root).map_err(|e| format!("Create output dir: {e}"))?;
 
             let prefix = format!("{entry_name}/");
             let mut descendants: Vec<&ManifestEntryV3> = vault
@@ -1932,11 +1948,21 @@ fn extract_entry(
                     output_root.join(&rel)
                 };
                 if entry.is_dir {
-                    if !rel.is_empty() {
-                        create_contained_dirs(&output_root, Path::new(&rel))?;
+                    // Contain every created directory under the REAL root (dest), which
+                    // includes the basename component, so a planted reparse point
+                    // anywhere on the path is refused.
+                    let rel_from_root = child_output.strip_prefix(&root).map_err(|_| {
+                        format!(
+                            "Refusing extraction: {} escapes destination root {}",
+                            child_output.display(),
+                            root.display()
+                        )
+                    })?;
+                    if !rel_from_root.as_os_str().is_empty() {
+                        create_contained_dirs(&root, rel_from_root)?;
                     }
                 } else {
-                    extract_file_entry(vault, entry, &child_output, &output_root)?;
+                    extract_file_entry(vault, entry, &child_output, &root)?;
                 }
             }
 
@@ -2551,6 +2577,47 @@ mod tests {
         let mut critical = ok.clone();
         critical.critical = true;
         assert!(validate_extension_dir(std::slice::from_ref(&critical), 100).is_err());
+    }
+
+    /// Audit M2 residual (controaudit): the single-entry `extract_entry` directory
+    /// path builds its subtree root from a manifest-derived basename. A pre-planted
+    /// junction at `dest/<basename>` must be refused, not followed into a victim.
+    #[test]
+    fn extract_entry_dir_refuses_planted_output_root_junction() {
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+
+        let src = scratch_dir();
+        let secret = src.join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET PLAINTEXT THAT MUST STAY CONTAINED").unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(&mut vault, &[(secret.clone(), "sub/secret.txt".to_string())]).unwrap();
+
+        let dest = scratch_dir(); // exists & is a dir -> output_root = dest/sub
+        let victim = scratch_dir();
+        let link = dest.join("sub"); // the manifest-derived basename component
+        if !plant_dir_reparse_point(&link, &victim) {
+            eprintln!("skipping extract_entry_dir_refuses_planted_output_root_junction: no reparse support");
+            std::fs::remove_dir_all(&dest).ok();
+            std::fs::remove_dir_all(&victim).ok();
+            std::fs::remove_file(&vp).ok();
+            return;
+        }
+
+        let result = VaultV3::extract_entry(&vault, "sub", &dest);
+        assert!(
+            result.is_err(),
+            "extract_entry must fail closed on a planted output_root junction, got {result:?}"
+        );
+        assert!(
+            !victim.join("secret.txt").exists(),
+            "plaintext escaped into the victim via extract_entry"
+        );
+
+        std::fs::remove_dir_all(&dest).ok();
+        std::fs::remove_dir_all(&victim).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_file(&vp).ok();
     }
 
     /// Plant `link` as a directory reparse point targeting `target`. Returns false
