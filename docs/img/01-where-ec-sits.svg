@@ -18,14 +18,14 @@
   <line x1="174" y1="148" x2="198" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
   <!-- b2 Compress -->
   <rect x="202" y="116" width="136" height="64" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
-  <text x="270" y="146" font-size="15" font-weight="600" fill="#334155" text-anchor="middle">Compress</text>
-  <text x="270" y="166" font-size="11" fill="#64748b" text-anchor="middle">zstd</text>
+  <text x="270" y="146" font-size="15" font-weight="600" fill="#334155" text-anchor="middle">Chunk</text>
+  <text x="270" y="166" font-size="11" fill="#64748b" text-anchor="middle">content-defined</text>
 
   <line x1="340" y1="148" x2="364" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
   <!-- b3 Chunk -->
   <rect x="368" y="116" width="136" height="64" rx="10" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
-  <text x="436" y="146" font-size="15" font-weight="600" fill="#334155" text-anchor="middle">Chunk</text>
-  <text x="436" y="166" font-size="11" fill="#64748b" text-anchor="middle">content-defined</text>
+  <text x="436" y="146" font-size="15" font-weight="600" fill="#334155" text-anchor="middle">Compress</text>
+  <text x="436" y="166" font-size="11" fill="#64748b" text-anchor="middle">zstd</text>
 
   <line x1="506" y1="148" x2="530" y2="148" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
   <!-- b4 Encrypt -->
