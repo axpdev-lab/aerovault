@@ -609,6 +609,48 @@ fn validate_manifest_paths(manifest: &VaultManifestV3) -> Result<(), String> {
     Ok(())
 }
 
+/// Audit M4 hardening: validate the extension directory at open time. The header
+/// MAC authenticates the directory's offset/length but NOT its JSON bytes, so a
+/// file-level attacker could forge the entry list within the MAC-fixed window. Bound
+/// the blast radius to a clean refusal (it is otherwise DoS-only, since every recovery
+/// re-verifies reconstructed bytes against authenticated material): reject duplicate
+/// extension ids and any entry whose payload slice escapes the authenticated
+/// extension-payload region. Full authentication of the directory bytes is a version-2
+/// header change (breaks v1 cross-compat) and is tracked as a follow-up.
+fn validate_extension_dir(
+    extensions: &[ExtensionEntryV3],
+    extension_payload_len: u64,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for ext in extensions {
+        // A rev. 3 reader rejects any critical extension; the rev. 4 EC layers are
+        // deliberately non-critical so this stays a forward-compat skip.
+        if ext.critical {
+            return Err(format!(
+                "Unsupported critical AeroVault v3 extension: {}",
+                ext.extension_id
+            ));
+        }
+        if !seen.insert(ext.extension_id.as_str()) {
+            return Err(format!(
+                "Duplicate AeroVault v3 extension id: {}",
+                ext.extension_id
+            ));
+        }
+        let end = ext
+            .offset
+            .checked_add(ext.length)
+            .ok_or_else(|| format!("Extension {} payload range overflow", ext.extension_id))?;
+        if end > extension_payload_len {
+            return Err(format!(
+                "Extension {} payload slice [{}..{}] escapes the {extension_payload_len}-byte extension payload",
+                ext.extension_id, ext.offset, end
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn join_vault_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.to_string()
@@ -1654,16 +1696,9 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
     let extensions: Vec<ExtensionEntryV3> = serde_json::from_slice(&extension_json)
         .map_err(|e| format!("Extension directory parse: {e}"))?;
 
-    for ext in &extensions {
-        // A rev. 3 reader rejects any critical extension; the rev. 4 EC layers
-        // are deliberately non-critical so this stays a forward-compat skip.
-        if ext.critical {
-            return Err(format!(
-                "Unsupported critical AeroVault v3 extension: {}",
-                ext.extension_id
-            ));
-        }
-    }
+    // Reject critical / duplicate / out-of-range extensions, failing a forged
+    // extension directory closed at open time (audit M4; see fn docs).
+    validate_extension_dir(&extensions, header.extension_payload_len)?;
 
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
     // its sole author and recomputes it on every seal from the freshly
@@ -1736,6 +1771,16 @@ fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
     Ok(())
 }
 
+/// Persist the in-memory vault back to disk with an atomic single-rename seal.
+///
+/// Concurrency contract (audit M6): this provides only a *same-open generation
+/// check* via [`assert_vault_generation_current`] (it refuses to seal if the file
+/// length or header MAC changed since open). It takes **no cross-process lock**, so
+/// two writers that both opened the same generation can each pass the check and race
+/// the final rename, last-writer-wins. Cross-process safety is the **embedder's
+/// responsibility**: the AeroFTP app serializes all mutations behind an O_EXCL
+/// `.{name}.lock`. Direct crate users that mutate a vault from more than one process
+/// must apply their own external lock.
 pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     assert_vault_generation_current(vault)?;
 
@@ -2470,6 +2515,42 @@ mod tests {
         std::fs::remove_dir_all(&victim).ok();
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_file(&vp).ok();
+    }
+
+    /// Audit M4: a forged extension directory (duplicate id, or a payload slice that
+    /// escapes the authenticated extension payload, or a critical extension) must be
+    /// rejected at validation time. The header MAC covers the directory offset/len but
+    /// not its bytes, so this is the open-time fail-closed gate.
+    #[test]
+    fn validate_extension_dir_rejects_forged_entries() {
+        let ok = ExtensionEntryV3 {
+            extension_id: "error-correction.reed-solomon".to_string(),
+            algorithm_id: "rs".to_string(),
+            algorithm_version: 1,
+            critical: false,
+            offset: 0,
+            length: 100,
+        };
+        assert!(validate_extension_dir(std::slice::from_ref(&ok), 100).is_ok());
+
+        // Payload slice escapes the declared extension-payload length.
+        let mut oob = ok.clone();
+        oob.length = 101;
+        assert!(validate_extension_dir(std::slice::from_ref(&oob), 100).is_err());
+
+        // offset + length overflow.
+        let mut overflow = ok.clone();
+        overflow.offset = u64::MAX;
+        overflow.length = 1;
+        assert!(validate_extension_dir(std::slice::from_ref(&overflow), 100).is_err());
+
+        // Duplicate extension ids.
+        assert!(validate_extension_dir(&[ok.clone(), ok.clone()], 1000).is_err());
+
+        // Critical (unknown) extension is rejected.
+        let mut critical = ok.clone();
+        critical.critical = true;
+        assert!(validate_extension_dir(std::slice::from_ref(&critical), 100).is_err());
     }
 
     /// Plant `link` as a directory reparse point targeting `target`. Returns false
