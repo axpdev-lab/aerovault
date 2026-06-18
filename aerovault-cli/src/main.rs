@@ -206,6 +206,13 @@ enum CorrectCommands {
         /// Sidecar path (default: `<file>.aerocorrect`).
         #[arg(long)]
         parity: Option<PathBuf>,
+
+        /// Authenticity anchor: a 64-char hex SHA-256 of the KNOWN-GOOD content. A bare
+        /// repair reconstructs toward whatever the sidecar declares (integrity only); with
+        /// this flag a sidecar declaring a different content hash is refused before any
+        /// write, so a planted sidecar cannot drive the repair toward attacker content.
+        #[arg(long = "expect-sha256")]
+        expect_sha256: Option<String>,
     },
 }
 
@@ -523,10 +530,18 @@ fn cmd_correct(command: &CorrectCommands, json: bool) -> Result<(), Box<dyn std:
                 std::process::exit(1);
             }
         }
-        CorrectCommands::Repair { path, parity } => {
+        CorrectCommands::Repair {
+            path,
+            parity,
+            expect_sha256,
+        } => {
             let path_s = path_arg(path);
             let parity_s = parity.as_ref().map(|p| path_arg(p));
-            let report = aerovault::correct_repair(&path_s, parity_s.as_deref())?;
+            let report = aerovault::correct_repair_anchored(
+                &path_s,
+                parity_s.as_deref(),
+                expect_sha256.as_deref(),
+            )?;
             if json {
                 print_json(&report)?;
             } else if report.repaired {
