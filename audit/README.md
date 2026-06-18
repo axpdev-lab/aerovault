@@ -25,6 +25,7 @@ corresponding AeroFTP release; crate fixes ship on
 |-------|------|--------|----------------------|---------|
 | [1](2026-05-30_deep-audit/REPORT.md) | 2026-05-30 | Deep single-perspective audit (multi-dimension swarm with skeptic verification) | 0 critical, 1 high, 8 medium, plus low/info | Remediated. Crate `v3` (0.4.0), app fixes landed. |
 | [2](2026-06-03_dual-independent/REPORT.md) | 2026-06-03 | Dual independent cross-audit (two separate reviewers, identical commits) | 3 high, ~10 medium, plus low/info | Remediated. Crate 0.4.1 / 0.4.2, app fixes landed. v4 development cleared to start. |
+| [3](2026-06-18_phase2-controaudit/REPORT.md) | 2026-06-18 | Dual blind audit + remediation + 3-pass adversarial controaudit | 1 high, 1 medium, 3 low, 4 info, 0 critical | Remediated. Crate 0.6.2 (M1-M8 + the M7 standalone-EC convergence); app fixes landed. Grade A. |
 
 ## Current status
 
@@ -41,6 +42,12 @@ corresponding AeroFTP release; crate fixes ship on
   stable without reservations" claim remains conditional on a live validation
   matrix (real GUI, real 2FA unlock, multi-GiB round-trips, crash injection),
   which is a validation gap, not a known defect. See round 2 for the verdict.
+- **Round 3 (2026-06-18):** dual blind audit + 3-pass controaudit, grade A,
+  0 open findings. `aerovault 0.6.2` ships the M1 (standalone repair) and
+  M2/M4/M6 (container) fixes and converges the app's forked standalone
+  `.aerocorrect` engine onto the crate (M7) — one audited implementation,
+  byte-identical sidecars, verified by an adversarial round-3 pass. AeroCrypt
+  (the separate transparent-overlay codec) was out of scope.
 
 ## Disclosure policy
 
