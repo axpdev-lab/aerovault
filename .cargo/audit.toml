@@ -1,0 +1,41 @@
+# cargo-audit configuration for the `aerovault` crate workspace.
+#
+# Each ignore carries a written justification. We do NOT ignore advisories
+# without a tracked rationale. Mirrors the posture of the AeroFTP app's
+# src-tauri/.cargo/audit.toml for the one advisory the crate shares.
+#
+# Reviewed: 2026-06-18 (audit 2026-06-18, finding M8): the dual audit flagged
+#           `instant` as unmaintained and attributed it to "the CLI progress
+#           stack". Re-verified against Cargo.lock during Phase 2: the real and
+#           ONLY source is the core Reed-Solomon dependency, not any progress bar:
+#             instant 0.1.13 <- parking_lot 0.11.2 <- parking_lot_core 0.8.6
+#                            <- reed-solomon-erasure 6.0.0 <- aerovault
+#           `reed-solomon-erasure 6.0.0` pins `parking_lot = "^0.11.2"`, which
+#           cannot resolve to parking_lot 0.12 (the release that dropped
+#           `instant`), so the advisory is not locally fixable without forking
+#           or replacing the RS crate. `cargo update -p parking_lot --precise
+#           0.12.x` was confirmed to fail the version selection.
+
+[advisories]
+ignore = [
+    # ----------------------------------------------------------------
+    # instant 0.1.13 unmaintained (transitive via reed-solomon-erasure)
+    # ----------------------------------------------------------------
+    # RUSTSEC-2024-0384. `instant` is unmaintained (superseded by `web-time`).
+    # No security surface: it is a monotonic-clock shim. On aerovault's native
+    # targets (Linux/macOS/Windows; never wasm) it compiles to a thin wrapper
+    # over std::time::Instant; the wasm-specific path that carries any concern
+    # is never built. parking_lot uses it only for internal lock-elapsed
+    # bookkeeping, reached exclusively from reed-solomon-erasure's in-memory
+    # parity compute/reconstruct. No untrusted input, parsing, or crypto
+    # decision flows through it.
+    #
+    # Exit path: move to a maintained RS crate (reed-solomon-simd /
+    # reed-solomon-novelpoly) or wait for reed-solomon-erasure to bump
+    # parking_lot. Tracked in aerovault Discussion #5.
+    "RUSTSEC-2024-0384",  # instant unmaintained (RS engine via parking_lot 0.11)
+]
+
+[output]
+deny = ["unmaintained", "unsound", "yanked"]
+quiet = false
