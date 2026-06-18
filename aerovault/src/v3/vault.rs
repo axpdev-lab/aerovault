@@ -1166,14 +1166,119 @@ fn change_password_in_place(vault: &mut OpenVaultV3, new_password: &str) -> Resu
     Ok(())
 }
 
+/// True if `meta` (obtained via `symlink_metadata`, i.e. about the link itself, not
+/// its target) describes a reparse point. On Windows this covers BOTH directory
+/// junctions (`mklink /J`, no admin needed) and symlinks via the
+/// `FILE_ATTRIBUTE_REPARSE_POINT` bit; on Unix it is any symlink.
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
+}
+
+/// Create the directory chain `root/rel` one component at a time, refusing to
+/// FOLLOW any pre-existing reparse point (Windows junction/symlink). This closes
+/// the intermediate-directory extract escape (audit M2): a pre-planted
+/// `dest/sub -> victim` junction would otherwise let `create_dir_all` + the temp
+/// rename write decrypted plaintext into `victim`. The prior AV-001 fix only
+/// covered a *leaf* reparse point (replaced by the rename); an intermediate
+/// directory component was uncovered.
+///
+/// `rel` is a relative path whose components have already been validated
+/// (`validate_manifest_paths` / `normalize_vault_relative_path`: no `..`, absolute,
+/// or drive component). Any non-`Normal` component is still rejected defensively.
+fn create_contained_dirs(root: &Path, rel: &Path) -> Result<(), String> {
+    use std::path::Component;
+    let mut current = root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(part) => current.push(part),
+            Component::CurDir => continue,
+            _ => {
+                return Err(format!(
+                    "Refusing extraction: unexpected path component in {}",
+                    rel.display()
+                ))
+            }
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if is_reparse_point(&meta) {
+                    return Err(format!(
+                        "Refusing extraction: {} is a reparse point; it would redirect writes outside {}",
+                        current.display(),
+                        root.display()
+                    ));
+                }
+                if !meta.is_dir() {
+                    return Err(format!(
+                        "Refusing extraction: {} exists and is not a directory",
+                        current.display()
+                    ));
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)
+                    .map_err(|e| format!("Create output dir {}: {e}", current.display()))?;
+            }
+            Err(e) => {
+                return Err(format!("Resolve output dir {}: {e}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Safely create `output`'s parent directory chain under `root` and confirm the
+/// resolved parent is still contained in `root`. Fails closed on any reparse-point
+/// escape (audit M2). `output` is always built as `root.join(rel)` by the extract
+/// callers, so its parent is lexically under `root`; `root` may be a friendly
+/// (non-canonical) path — the containment assertion canonicalizes both sides.
+fn prepare_output_parent(root: &Path, output: &Path) -> Result<(), String> {
+    let parent = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return Ok(()),
+    };
+    let rel = parent.strip_prefix(root).map_err(|_| {
+        format!(
+            "Refusing extraction: {} is outside destination root {}",
+            parent.display(),
+            root.display()
+        )
+    })?;
+    create_contained_dirs(root, rel)?;
+    // Defense in depth: the fully-resolved parent must still live inside the
+    // fully-resolved root (both canonicalize to `\\?\`-verbatim paths on Windows).
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("Resolve destination {}: {e}", root.display()))?;
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Resolve output dir {}: {e}", parent.display()))?;
+    if !canon_parent.starts_with(&canon_root) {
+        return Err(format!(
+            "Refusing extraction: resolved {} escapes destination root {}",
+            canon_parent.display(),
+            canon_root.display()
+        ));
+    }
+    Ok(())
+}
+
 fn extract_file_entry(
     vault: &OpenVaultV3,
     entry: &ManifestEntryV3,
     output_path: &Path,
+    dest_root: &Path,
 ) -> Result<PathBuf, String> {
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Create output dir: {e}"))?;
-    }
+    // Create + contain the parent before decoding/writing any plaintext (audit M2).
+    prepare_output_parent(dest_root, output_path)?;
 
     // We only ever slice `out[offset..offset+size]`, so decoding never needs to
     // grow `out` past that bound. Tracking it lets us stop early and refuse a
@@ -1729,12 +1834,20 @@ fn extract_entry(
                 .iter()
                 .find(|entry| entry.path == entry_name)
                 .ok_or_else(|| format!("Entry not found: {entry_name}"))?;
-            let output_path = if dest_path.is_dir() {
-                dest_path.join(&entry.path)
+            if dest_path.is_dir() {
+                // Extracting into an existing directory: contain under it.
+                let output_path = dest_path.join(&entry.path);
+                extract_file_entry(vault, entry, &output_path, dest_path)
             } else {
-                dest_path.to_path_buf()
-            };
-            extract_file_entry(vault, entry, &output_path)
+                // Caller named an exact output file: contain it within its parent dir.
+                let parent = dest_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Create output dir: {e}"))?;
+                extract_file_entry(vault, entry, dest_path, parent)
+            }
         }
         Some(EntryKindV3::Directory) => {
             let output_root = if dest_path.exists() {
@@ -1774,10 +1887,11 @@ fn extract_entry(
                     output_root.join(&rel)
                 };
                 if entry.is_dir {
-                    std::fs::create_dir_all(&child_output)
-                        .map_err(|e| format!("Create output dir: {e}"))?;
+                    if !rel.is_empty() {
+                        create_contained_dirs(&output_root, Path::new(&rel))?;
+                    }
                 } else {
-                    extract_file_entry(vault, entry, &child_output)?;
+                    extract_file_entry(vault, entry, &child_output, &output_root)?;
                 }
             }
 
@@ -1799,9 +1913,11 @@ fn extract_all_entries(vault: &OpenVaultV3, dest_root: &Path) -> Result<u64, Str
         let rel = normalize_vault_relative_path(&entry.path)?;
         let output = dest_root.join(&rel);
         if entry.is_dir {
-            std::fs::create_dir_all(&output).map_err(|e| format!("Create output dir: {e}"))?;
+            // Create directory entries through the same reparse-point-refusing path
+            // as file parents, so a planted intermediate junction cannot redirect them.
+            create_contained_dirs(dest_root, Path::new(&rel))?;
         } else {
-            extract_file_entry(vault, entry, &output)?;
+            extract_file_entry(vault, entry, &output, dest_root)?;
             files_written += 1;
         }
     }
@@ -2303,5 +2419,76 @@ mod tests {
         let out = scratch_dir();
         assert!(VaultV3::extract_entry(&vault, "../escape.txt", &out).is_err());
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    /// Audit M2 regression: a pre-planted intermediate reparse point in the
+    /// destination (a directory that is really a junction/symlink to a sibling
+    /// "victim") must not let extraction write decrypted plaintext outside the
+    /// chosen root. Build a real sealed vault with a nested entry `sub/secret.txt`,
+    /// plant `dest/sub -> victim`, then assert `extract_all` fails closed and the
+    /// victim directory stays empty. (Junctions need no admin on Windows.)
+    #[test]
+    fn extract_refuses_planted_reparse_point_parent() {
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+
+        let src = scratch_dir();
+        let secret = src.join("secret.txt");
+        let secret_bytes = b"TOP SECRET PLAINTEXT THAT MUST STAY CONTAINED";
+        std::fs::write(&secret, secret_bytes).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(&mut vault, &[(secret.clone(), "sub/secret.txt".to_string())]).unwrap();
+
+        let dest = scratch_dir();
+        let victim = scratch_dir();
+        // Plant `dest/sub` as a reparse point pointing at `victim`.
+        let link = dest.join("sub");
+        let planted = plant_dir_reparse_point(&link, &victim);
+        if !planted {
+            // Environment cannot create a junction/symlink (e.g. Developer Mode off and
+            // no junction support); skip rather than give a false pass.
+            eprintln!("skipping extract_refuses_planted_reparse_point_parent: no reparse support");
+            std::fs::remove_dir_all(&dest).ok();
+            std::fs::remove_dir_all(&victim).ok();
+            std::fs::remove_file(&vp).ok();
+            return;
+        }
+
+        let result = VaultV3::extract_all(&vault, &dest);
+        assert!(
+            result.is_err(),
+            "extract must fail closed on a planted reparse-point parent, got {result:?}"
+        );
+        // The decrypted plaintext must NOT have been written through the junction.
+        assert!(
+            !victim.join("secret.txt").exists(),
+            "plaintext escaped the destination root into the victim directory"
+        );
+
+        std::fs::remove_dir_all(&dest).ok();
+        std::fs::remove_dir_all(&victim).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_file(&vp).ok();
+    }
+
+    /// Plant `link` as a directory reparse point targeting `target`. Returns false
+    /// if the platform/environment cannot create one (caller then skips).
+    #[cfg(windows)]
+    fn plant_dir_reparse_point(link: &Path, target: &Path) -> bool {
+        // `mklink /J` creates a directory junction and needs no admin / Developer Mode.
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(s) if s.success()) && link.exists()
+    }
+
+    #[cfg(not(windows))]
+    fn plant_dir_reparse_point(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok() && link.exists()
     }
 }
