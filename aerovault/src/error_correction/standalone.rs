@@ -260,14 +260,25 @@ pub(crate) fn verify_repair_standalone_file_streamed(
     if finalize_sha256(hasher) != expected {
         return Err("Error Correction repair failed post-repair SHA-256 verification".to_string());
     }
+    // Release the read handle on the target before persisting. On Windows, renaming the
+    // repaired temp onto a file that still has a live read handle fails with
+    // ERROR_ACCESS_DENIED (os error 5), which left the original corrupt and the repair
+    // non-functional on the primary desktop OS (audit M1). The reconstruct loop above is
+    // the only reader of `src`, so the handle is safe to drop here.
+    drop(src);
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
     }
+    // On a persist failure, recover the NamedTempFile from the error and delete it so a
+    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
     tmp.persist(path).map_err(|e| {
-        format!(
-            "persist repaired Error Correction target {}: {e}",
-            path.display()
-        )
+        let msg = format!(
+            "persist repaired Error Correction target {}: {}",
+            path.display(),
+            e.error
+        );
+        let _ = e.file.close();
+        msg
     })?;
     Ok(StandaloneEcRepairResult::Repaired { recovered_shards })
 }
@@ -330,6 +341,57 @@ mod tests {
         assert_eq!(
             verify_standalone_file_streamed("payload.bin", &path, &sidecar_path).unwrap(),
             StandaloneVerifyResult::Verified
+        );
+    }
+
+    /// Audit M1 regression: on Windows the target read handle used to be held across
+    /// `persist`, which failed the rename (os error 5) and left a decrypted-plaintext
+    /// `.tmp*` beside the target. After the fix the repair must succeed, restore the
+    /// original bytes, and leave no temp artifact in the directory.
+    #[test]
+    fn repair_restores_and_leaves_no_temp_artifact() {
+        let window = 40_000u64;
+        let data = sample_data(135_000);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let sidecar_path = dir.path().join("payload.bin.aerocorrect");
+        std::fs::write(&path, &data).unwrap();
+
+        let generated = match generate_sidecar_for_file_capped_windowed(
+            "payload.bin",
+            &path,
+            20,
+            STANDALONE_EC_MAX_FILE_SIZE,
+            window,
+        )
+        .unwrap()
+        {
+            StandaloneEcGenerateResult::Generated(g) => g,
+            other => panic!("should generate, got {other:?}"),
+        };
+        std::fs::write(&sidecar_path, &generated.sidecar_bytes).unwrap();
+
+        let mut corrupt = data.clone();
+        for off in [5_000usize, 50_000, 100_000, 130_000] {
+            corrupt[off] ^= 0xA5;
+        }
+        std::fs::write(&path, &corrupt).unwrap();
+
+        let result = verify_repair_standalone_file_streamed("payload.bin", &path, &sidecar_path)
+            .expect("streamed repair should succeed on every OS");
+        assert!(matches!(result, StandaloneEcRepairResult::Repaired { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), data, "repair must restore bytes");
+
+        // No leftover temp file (NamedTempFile prefix or any stray entry) beside the target.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "payload.bin" && n != "payload.bin.aerocorrect")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "repair must not leave a temp artifact, found: {leftovers:?}"
         );
     }
 
