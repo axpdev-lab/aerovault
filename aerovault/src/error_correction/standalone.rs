@@ -206,16 +206,37 @@ pub(crate) fn verify_standalone_file_streamed(
 }
 
 /// Repair a standalone file from an on-disk `.aerocorrect` sidecar. The sidecar's
-/// content SHA-256 is the expected good hash. The original file is replaced only
-/// after every window has been repaired and the full repaired stream hashes back to
-/// that expected value.
+/// content SHA-256 is the expected good hash and the reconstruction TARGET. The
+/// original file is replaced only after every window has been repaired and the full
+/// repaired stream hashes back to that expected value.
+///
+/// Trust model (audit M3): the sidecar's declared content hash is the reconstruction
+/// target, so a *bare* `.aerocorrect` repair reconstructs toward WHATEVER the sidecar
+/// declares. This makes standalone `correct` an INTEGRITY tool (recover the content the
+/// sidecar was made for), not an AUTHENTICITY one (prove that content is the one you
+/// want). A planted sidecar for attacker-chosen same-length content would drive the
+/// repair toward that content and report success. Where a higher layer authenticates
+/// (the vault path re-verifies against the header-MAC / manifest `cipher_hash`), this
+/// is moot. For the bare CLI, pass `expect_sha256` (an out-of-band good hash, e.g.
+/// `--expect-sha256`) to anchor authenticity: a sidecar whose declared hash differs is
+/// refused before any write.
 pub(crate) fn verify_repair_standalone_file_streamed(
     rel_path: &str,
     path: &Path,
     sidecar_path: &Path,
+    expect_sha256: Option<&[u8; 32]>,
 ) -> Result<StandaloneEcRepairResult, String> {
     let mut reader = AeroCorrectSidecarReader::open(sidecar_path)?;
     let expected = validate_reader_for_path(rel_path, path, &reader)?;
+    // M3 authenticity anchor: if the caller supplied an out-of-band expected hash,
+    // refuse a sidecar that declares a different target before touching the file.
+    if let Some(anchor) = expect_sha256 {
+        if anchor != &expected {
+            return Err(format!(
+                "aerocorrect sidecar for {rel_path} declares a content hash that does not match the expected (anchored) hash; refusing repair"
+            ));
+        }
+    }
     if hash_file_streaming(path)? == expected {
         return Ok(StandaloneEcRepairResult::Verified);
     }
@@ -333,7 +354,7 @@ mod tests {
         }
         std::fs::write(&path, &corrupt).unwrap();
 
-        let result = verify_repair_standalone_file_streamed("payload.bin", &path, &sidecar_path)
+        let result = verify_repair_standalone_file_streamed("payload.bin", &path, &sidecar_path, None)
             .expect("streamed repair should succeed");
         assert!(matches!(result, StandaloneEcRepairResult::Repaired { .. }));
         assert_eq!(std::fs::read(&path).unwrap(), data);
@@ -377,7 +398,7 @@ mod tests {
         }
         std::fs::write(&path, &corrupt).unwrap();
 
-        let result = verify_repair_standalone_file_streamed("payload.bin", &path, &sidecar_path)
+        let result = verify_repair_standalone_file_streamed("payload.bin", &path, &sidecar_path, None)
             .expect("streamed repair should succeed on every OS");
         assert!(matches!(result, StandaloneEcRepairResult::Repaired { .. }));
         assert_eq!(std::fs::read(&path).unwrap(), data, "repair must restore bytes");
@@ -423,7 +444,7 @@ mod tests {
         std::fs::write(&sidecar_path, &generated.sidecar_bytes).unwrap();
 
         let before = std::fs::read(&path).unwrap();
-        let err = verify_repair_standalone_file_streamed("payload.bin", &path, &sidecar_path)
+        let err = verify_repair_standalone_file_streamed("payload.bin", &path, &sidecar_path, None)
             .expect_err("foreign sidecar must fail closed");
         assert!(err.contains("post-repair SHA-256"));
         assert_eq!(std::fs::read(&path).unwrap(), before);

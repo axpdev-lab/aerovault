@@ -1322,7 +1322,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
 
         assert!(
-            verify_repair_standalone_file_streamed("rel", &path, &sidecar_path).is_err(),
+            verify_repair_standalone_file_streamed("rel", &path, &sidecar_path, None).is_err(),
             "a sidecar damaged past self-heal must not repair"
         );
         assert_eq!(
