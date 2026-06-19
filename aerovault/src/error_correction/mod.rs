@@ -672,16 +672,29 @@ pub fn correct_generate(
     pct: u32,
     out: Option<&str>,
 ) -> Result<CorrectGenerateReport, String> {
+    correct_generate_with_progress(file, pct, out, &mut |_, _| {})
+}
+
+/// [`correct_generate`] with a `(bytes_done, bytes_total)` progress callback,
+/// invoked after each window's parity is computed (#5: progress for `correct`,
+/// GUI + CLI). [`correct_generate`] is the no-op-callback shorthand.
+pub fn correct_generate_with_progress(
+    file: &str,
+    pct: u32,
+    out: Option<&str>,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<CorrectGenerateReport, String> {
     let path = Path::new(file);
     let rel = rel_name(file);
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
     // it even for tiny files (the gate is a sync-pipeline opt-in, not a CLI-of-one concern).
-    let result = sync::generate_sync_sidecar_for_file_capped(
+    let result = sync::generate_sync_sidecar_for_file_capped_with_progress(
         &rel,
         path,
         pct,
         sync::AEROSYNC_EC_MAX_FILE_SIZE,
         0,
+        progress,
     )?;
     let generated = match result {
         sync::SyncEcGenerateResult::Generated(g) => g,
@@ -721,6 +734,16 @@ pub fn correct_generate(
 /// Verify `file` against its `.aerocorrect` sidecar (read-only, never mutates the file).
 /// `parity` overrides the default `<file>.aerocorrect` path.
 pub fn correct_verify(file: &str, parity: Option<&str>) -> Result<CorrectVerifyReport, String> {
+    correct_verify_with_progress(file, parity, &mut |_, _| {})
+}
+
+/// [`correct_verify`] with a `(bytes_done, bytes_total)` progress callback,
+/// invoked after each window is scanned (#5: progress for `correct verify`).
+pub fn correct_verify_with_progress(
+    file: &str,
+    parity: Option<&str>,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<CorrectVerifyReport, String> {
     let path = Path::new(file);
     let rel = rel_name(file);
     let sidecar_path = parity
@@ -731,7 +754,7 @@ pub fn correct_verify(file: &str, parity: Option<&str>) -> Result<CorrectVerifyR
     // hash-only verify_standalone_file_streamed; this deeper scan is the explicit
     // `correct verify` health readout.)
     let (result, health) =
-        sync::scan_standalone_file_streamed(&rel, path, Path::new(&sidecar_path))?;
+        sync::scan_standalone_file_streamed(&rel, path, Path::new(&sidecar_path), progress)?;
     let verified = matches!(result, sync::StandaloneVerifyResult::Verified);
     Ok(CorrectVerifyReport {
         file: file.to_string(),
@@ -763,6 +786,18 @@ pub fn correct_repair_anchored(
     parity: Option<&str>,
     expect_sha256: Option<&str>,
 ) -> Result<CorrectRepairReport, String> {
+    correct_repair_anchored_with_progress(file, parity, expect_sha256, &mut |_, _| {})
+}
+
+/// [`correct_repair_anchored`] with a `(bytes_done, bytes_total)` progress
+/// callback, invoked after each window is streamed/repaired (#5: progress for
+/// `correct repair`). The fast already-intact path fires no per-window callback.
+pub fn correct_repair_anchored_with_progress(
+    file: &str,
+    parity: Option<&str>,
+    expect_sha256: Option<&str>,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<CorrectRepairReport, String> {
     let path = Path::new(file);
     let rel = rel_name(file);
     let sidecar_path = parity
@@ -772,17 +807,19 @@ pub fn correct_repair_anchored(
         Some(hex) => Some(sync::parse_sha256_hex(hex)?),
         None => None,
     };
-    let (status, repaired, recovered_shards) = match sync::verify_repair_standalone_file_streamed(
-        &rel,
-        path,
-        Path::new(&sidecar_path),
-        anchor.as_ref(),
-    )? {
-        sync::SyncEcRepairResult::Verified => ("verified".to_string(), false, 0u64),
-        sync::SyncEcRepairResult::Repaired { recovered_shards } => {
-            ("repaired".to_string(), true, recovered_shards as u64)
-        }
-    };
+    let (status, repaired, recovered_shards) =
+        match sync::verify_repair_standalone_file_streamed_with_progress(
+            &rel,
+            path,
+            Path::new(&sidecar_path),
+            anchor.as_ref(),
+            progress,
+        )? {
+            sync::SyncEcRepairResult::Verified => ("verified".to_string(), false, 0u64),
+            sync::SyncEcRepairResult::Repaired { recovered_shards } => {
+                ("repaired".to_string(), true, recovered_shards as u64)
+            }
+        };
     Ok(CorrectRepairReport {
         file: file.to_string(),
         sidecar: sidecar_path,

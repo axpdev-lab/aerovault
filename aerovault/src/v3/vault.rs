@@ -510,6 +510,18 @@ impl VaultV3 {
     pub fn extract_all(vault: &OpenVaultV3, dest: &Path) -> Result<u64, String> {
         extract_all_entries(vault, dest)
     }
+
+    /// `extract_all` with a `(bytes_done, bytes_total)` progress callback invoked
+    /// after each file is written (#5: progress for extract, GUI + CLI). The
+    /// embedder turns this into a live bar; `extract_all` is the no-op-callback
+    /// shorthand.
+    pub fn extract_all_with_progress(
+        vault: &OpenVaultV3,
+        dest: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<u64, String> {
+        extract_all_entries_with_progress(vault, dest, progress)
+    }
 }
 
 // --- Internal port of the app sync core ---------------------------------------
@@ -1976,9 +1988,22 @@ fn extract_entry(
 /// under it. Returns the number of files written. Every entry path is
 /// normalized first, so a crafted manifest cannot escape `dest_root`.
 fn extract_all_entries(vault: &OpenVaultV3, dest_root: &Path) -> Result<u64, String> {
+    extract_all_entries_with_progress(vault, dest_root, &mut |_, _| {})
+}
+
+/// `extract_all_entries` with a `(bytes_done, bytes_total)` progress callback
+/// invoked after each file is written (#5: progress for extract). `bytes_total`
+/// is the sum of file-entry plaintext sizes; directory entries do not move it.
+fn extract_all_entries_with_progress(
+    vault: &OpenVaultV3,
+    dest_root: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<u64, String> {
     std::fs::create_dir_all(dest_root).map_err(|e| format!("Create output dir: {e}"))?;
     let mut entries: Vec<&ManifestEntryV3> = vault.manifest.entries.iter().collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let total: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+    let mut done = 0u64;
     let mut files_written = 0u64;
     for entry in entries {
         let rel = normalize_vault_relative_path(&entry.path)?;
@@ -1990,6 +2015,8 @@ fn extract_all_entries(vault: &OpenVaultV3, dest_root: &Path) -> Result<u64, Str
         } else {
             extract_file_entry(vault, entry, &output, dest_root)?;
             files_written += 1;
+            done = done.saturating_add(entry.size);
+            progress(done, total);
         }
     }
     Ok(files_written)
