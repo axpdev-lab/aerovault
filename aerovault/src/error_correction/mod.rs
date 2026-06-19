@@ -498,6 +498,109 @@ pub(crate) fn reconstruct_from_error_correction(
     Ok(recovered)
 }
 
+/// Per-shard / per-copy health readout for a verify (Ehud #9). Aggregated across
+/// every window of a standalone file (or every block group). Counts are additive
+/// so a caller can fold one window's scan into a running total.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ShardHealth {
+    /// Total data shards examined.
+    pub total_data_shards: u64,
+    /// Total parity shards (copies) examined.
+    pub total_parity_shards: u64,
+    /// Data shards whose checksum did not match (rotted / damaged).
+    pub damaged_data_shards: u64,
+    /// Parity shards (copies) whose checksum did not match.
+    pub damaged_parity_shards: u64,
+    /// Reed-Solomon groups examined.
+    pub groups: u64,
+    /// Groups where damaged data shards exceed the surviving parity, i.e. the
+    /// damage is beyond what error correction can recover.
+    pub unrecoverable_groups: u64,
+}
+
+/// Non-mutating counterpart of [`reconstruct_from_error_correction`]: scans the
+/// same shard grid and folds per-shard damage counts into `health` WITHOUT
+/// reconstructing or touching `blocks`. Used by the read-only verify health
+/// readout (#9). Mirrors the checksum logic of the reconstruct path exactly so
+/// the two agree on what "damaged" means.
+pub(crate) fn scan_error_correction_health(
+    blocks: &[Vec<u8>],
+    error_correction_payload_bytes: &[u8],
+    health: &mut ShardHealth,
+) -> Result<(), String> {
+    if error_correction_payload_bytes.is_empty() {
+        return Ok(());
+    }
+    let payload = ErrorCorrectionPayload::from_bytes(error_correction_payload_bytes)?;
+    let k = payload.header.data_shards as usize;
+    let p = payload.header.parity_shards as usize;
+    let s = payload.header.shard_size as usize;
+    let l = payload.header.total_data_len as usize;
+
+    let total: usize = blocks.iter().map(|b| b.len()).sum();
+    if total != l {
+        return Err(format!(
+            "Error Correction scan: block stream length {} != payload stream length {}",
+            total, l
+        ));
+    }
+
+    let mut d = Vec::with_capacity(l);
+    for b in blocks.iter() {
+        d.extend_from_slice(b);
+    }
+
+    let (num_data_shards, num_groups) = error_correction_geometry(&payload.header);
+
+    let shard_at = |d: &[u8], idx: usize| -> Vec<u8> {
+        let start = idx * s;
+        let end = (start + s).min(l);
+        let mut v = vec![0u8; s];
+        if start < end {
+            v[..end - start].copy_from_slice(&d[start..end]);
+        }
+        v
+    };
+
+    for g in 0..num_groups {
+        let mut damaged_data = 0usize;
+        for local in 0..k {
+            let gi = g * k + local;
+            if gi >= num_data_shards {
+                continue; // virtual zero-pad slot, not a stored shard
+            }
+            health.total_data_shards += 1;
+            let sh = shard_at(&d, gi);
+            if error_correction_shard_checksum(&sh) != payload.data_checksums[gi] {
+                damaged_data += 1;
+                health.damaged_data_shards += 1;
+            }
+        }
+
+        let mut surviving_parity = 0usize;
+        for pp in 0..p {
+            let pidx = g * p + pp;
+            let start = pidx * s;
+            health.total_parity_shards += 1;
+            if start + s <= payload.parity_data.len()
+                && error_correction_shard_checksum(&payload.parity_data[start..start + s])
+                    == payload.parity_checksums[pidx]
+            {
+                surviving_parity += 1;
+            } else {
+                health.damaged_parity_shards += 1;
+            }
+        }
+
+        health.groups += 1;
+        if damaged_data > surviving_parity {
+            health.unrecoverable_groups += 1;
+        }
+    }
+
+    Ok(())
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Public standalone API: error-correct ANY file with a detached `.aerocorrect`
 // sidecar (the `aeroftp correct` subcommand). The format binds by content
@@ -530,6 +633,11 @@ pub struct CorrectVerifyReport {
     /// `"verified"` (intact) or `"needs_repair"` (corruption detected).
     pub status: String,
     pub verified: bool,
+    /// Per-shard / per-copy health readout from a full grid scan (Ehud #9): how
+    /// many data/parity shards are damaged and whether any group is beyond
+    /// recovery. `None` only if a scan was not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<ShardHealth>,
 }
 
 /// Result of a standalone repair attempt.
@@ -618,15 +726,19 @@ pub fn correct_verify(file: &str, parity: Option<&str>) -> Result<CorrectVerifyR
     let sidecar_path = parity
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
-    let verified = matches!(
-        sync::verify_standalone_file_streamed(&rel, path, Path::new(&sidecar_path))?,
-        sync::StandaloneVerifyResult::Verified
-    );
+    // #9: a full grid scan gives both the verified verdict and a per-shard health
+    // readout in one streamed pass. (The hot sync path keeps using the lighter
+    // hash-only verify_standalone_file_streamed; this deeper scan is the explicit
+    // `correct verify` health readout.)
+    let (result, health) =
+        sync::scan_standalone_file_streamed(&rel, path, Path::new(&sidecar_path))?;
+    let verified = matches!(result, sync::StandaloneVerifyResult::Verified);
     Ok(CorrectVerifyReport {
         file: file.to_string(),
         sidecar: sidecar_path,
         status: if verified { "verified" } else { "needs_repair" }.to_string(),
         verified,
+        health: Some(health),
     })
 }
 

@@ -84,8 +84,8 @@ pub use error::Error;
 pub use error_correction::{
     aerocorrect_sidecar_path_for, correct_generate, correct_repair, correct_repair_anchored,
     correct_verify, AeroCorrectSegment, AeroCorrectSidecar, CorrectGenerateReport,
-    CorrectRepairReport, CorrectVerifyReport, AEROCORRECT_EXTENSION, AEROCORRECT_MAGIC,
-    AEROCORRECT_VERSION,
+    CorrectRepairReport, CorrectVerifyReport, ShardHealth, AEROCORRECT_EXTENSION,
+    AEROCORRECT_MAGIC, AEROCORRECT_VERSION,
 };
 // AeroSync windowed-sidecar error-correction API: windowed `.aerocorrect` generation
 // (from a path or from bytes, with cap + minimum-benefit gate) and verify/repair against

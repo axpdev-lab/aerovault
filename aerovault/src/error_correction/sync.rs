@@ -16,6 +16,7 @@ use super::sidecar::{
 };
 use super::{
     compute_error_correction_shards_grid, error_correction_grid, reconstruct_from_error_correction,
+    scan_error_correction_health, ShardHealth,
 };
 
 /// Default per-file cap for sync error correction. Windowed streaming bounds the
@@ -580,6 +581,62 @@ pub fn verify_standalone_file_streamed(
     }
 }
 
+/// Read-only scan of a standalone file against its `.aerocorrect` sidecar that
+/// returns BOTH the verified verdict and a per-shard health readout (#9), in a
+/// single streamed pass (bounded memory: one window plus its parity). The file
+/// is never mutated. The hot sync path keeps using the lighter
+/// `verify_standalone_file_streamed` (hash-only); this is the explicit
+/// `correct verify` health readout.
+pub fn scan_standalone_file_streamed(
+    rel_path: &str,
+    path: &Path,
+    sidecar_path: &Path,
+) -> Result<(StandaloneVerifyResult, ShardHealth), String> {
+    let mut reader = AeroCorrectSidecarReader::open(sidecar_path)?;
+    let expected = reader.content_sha256;
+    reader.verify_binding(&expected).map_err(|e| {
+        format!("Standalone EC sidecar for {rel_path} is internally inconsistent: {e}")
+    })?;
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if reader.total_len != file_size {
+        return Err(format!(
+            "Standalone EC sidecar total length {} != file length {file_size} for {rel_path}",
+            reader.total_len
+        ));
+    }
+    validate_window_tiling_iter(
+        reader
+            .segments()
+            .iter()
+            .map(|s| (s.window_offset, s.window_len)),
+        file_size,
+    )
+    .map_err(|e| format!("Standalone EC sidecar for {rel_path}: {e}"))?;
+
+    let mut src = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut health = ShardHealth::default();
+    for idx in 0..reader.segments().len() {
+        let window_len = usize::try_from(reader.segments()[idx].window_len)
+            .map_err(|_| format!("Standalone EC sidecar window {idx} length exceeds usize"))?;
+        let avec = reader.read_segment_avec(idx)?;
+        let mut buf = vec![0u8; window_len];
+        src.read_exact(&mut buf)
+            .map_err(|e| format!("read {} window {idx}: {e}", path.display()))?;
+        hasher.update(&buf);
+        let blocks = vec![buf];
+        scan_error_correction_health(&blocks, &avec, &mut health)?;
+    }
+    let result = if finalize_sha256(hasher) == expected {
+        StandaloneVerifyResult::Verified
+    } else {
+        StandaloneVerifyResult::NeedsRepair
+    };
+    Ok((result, health))
+}
+
 /// Repair a standalone file from its own `.aerocorrect` sidecar (atomic, all-or-nothing).
 /// The sidecar's stored `content_sha256` is the expected good hash; parity is
 /// read window-by-window by `verify_repair_sync_file_streamed`.
@@ -704,6 +761,45 @@ mod tests {
             SyncEcRepairResult::Verified => panic!("damaged data should need repair"),
         }
         assert_eq!(damaged, data);
+    }
+
+    #[test]
+    fn scan_reports_shard_health_on_corruption() {
+        // #9: the read-only scan returns a per-shard health readout alongside the
+        // verified verdict, for both an intact and a lightly-damaged file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("data.bin");
+        let data = sample_data(200 * 1024 + 7);
+        std::fs::write(&file, &data).expect("write file");
+        let file_str = file.to_str().unwrap();
+        crate::error_correction::correct_generate(file_str, 20, None).expect("generate sidecar");
+        let sidecar = crate::error_correction::aerocorrect_sidecar_path_for(file_str);
+        let sidecar_path = std::path::Path::new(&sidecar);
+
+        // Intact: verified, zero damage, sane non-zero totals.
+        let (res, health) =
+            scan_standalone_file_streamed("data.bin", &file, sidecar_path).expect("scan intact");
+        assert_eq!(res, StandaloneVerifyResult::Verified);
+        assert_eq!(health.damaged_data_shards, 0);
+        assert_eq!(health.damaged_parity_shards, 0);
+        assert_eq!(health.unrecoverable_groups, 0);
+        assert!(health.total_data_shards > 0);
+        assert!(health.total_parity_shards > 0);
+
+        // One flipped byte: needs repair, at least one damaged data shard, still
+        // within recovery (no unrecoverable group), totals unchanged.
+        let mut damaged = data.clone();
+        damaged[123_456] ^= 0xA5;
+        std::fs::write(&file, &damaged).expect("write damaged");
+        let (res2, health2) =
+            scan_standalone_file_streamed("data.bin", &file, sidecar_path).expect("scan damaged");
+        assert_eq!(res2, StandaloneVerifyResult::NeedsRepair);
+        assert!(health2.damaged_data_shards >= 1);
+        assert_eq!(
+            health2.unrecoverable_groups, 0,
+            "single-byte damage must stay recoverable"
+        );
+        assert_eq!(health2.total_data_shards, health.total_data_shards);
     }
 
     #[test]
