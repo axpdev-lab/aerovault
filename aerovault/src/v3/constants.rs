@@ -35,6 +35,19 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 /// The only wrapper-header layout this build understands.
 pub const SUPPORTED_WRAPPER_HEADER_VERSION: u16 = 1;
 
+/// Incompressible-skip probe (#10-B): bytes of the chunk prefix that are
+/// trial-compressed at a fast level to decide whether the full, possibly
+/// expensive, zstd pass is worth running.
+pub const INCOMPRESSIBLE_PROBE_SAMPLE: usize = 64 * 1024;
+/// zstd level used for the cheap probe (fast, just enough signal).
+pub const INCOMPRESSIBLE_PROBE_LEVEL: i32 = 3;
+/// A chunk is treated as incompressible when the probe leaves the sample at or
+/// above this percentage of its original size (i.e. it shrank by less than
+/// 3 %): the chunk is then stored raw (still encrypted) and the full pass is
+/// skipped. Media/already-compressed data lands here; text/code shrinks well
+/// past it and takes the normal compression path.
+pub const INCOMPRESSIBLE_RATIO_PCT: u64 = 97;
+
 /// CDC minimum chunk size (256 KiB).
 pub const CDC_MIN: usize = 256 * 1024;
 /// CDC average (target) chunk size (1 MiB). Must be a power of two.

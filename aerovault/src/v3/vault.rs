@@ -22,8 +22,9 @@ use zeroize::{Zeroize, Zeroizing};
 use super::block::build_file_bytes;
 use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds};
 use super::constants::{
-    CDC_MAX, DATA_OFFSET, DEFAULT_ZSTD_LEVEL, HEADER_SIZE, HKDF_CHUNK_ID, MAC_SIZE, MAGIC,
-    MAX_BLOCK_SIZE, MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE, MAX_PLAINTEXT_BLOCK_SIZE,
+    CDC_MAX, DATA_OFFSET, DEFAULT_ZSTD_LEVEL, HEADER_SIZE, HKDF_CHUNK_ID,
+    INCOMPRESSIBLE_PROBE_LEVEL, INCOMPRESSIBLE_PROBE_SAMPLE, INCOMPRESSIBLE_RATIO_PCT, MAC_SIZE,
+    MAGIC, MAX_BLOCK_SIZE, MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE, MAX_PLAINTEXT_BLOCK_SIZE,
     MIN_PASSWORD_LEN, PACK_SMALL_FILE_THRESHOLD, PACK_TARGET, SUPPORTED_WRAPPER_HEADER_VERSION,
     VERSION,
 };
@@ -761,8 +762,27 @@ fn ensure_parent_directories(manifest: &mut VaultManifestV3, path: &str) -> Resu
     Ok(())
 }
 
+/// Cheap incompressibility probe (#10-B): trial-compress only the chunk prefix
+/// at a fast level and report whether it failed to shrink past the threshold.
+/// `true` => store the chunk raw and skip the full, possibly expensive, pass.
+/// A probe error is non-fatal: fall back to the normal compression path.
+fn probe_incompressible(chunk: &[u8]) -> bool {
+    if chunk.is_empty() {
+        return false;
+    }
+    let sample = &chunk[..chunk.len().min(INCOMPRESSIBLE_PROBE_SAMPLE)];
+    match zstd::stream::encode_all(sample, INCOMPRESSIBLE_PROBE_LEVEL) {
+        // Incompressible when the probe output is >= RATIO% of the sample.
+        Ok(probed) => probed.len() as u64 * 100 >= sample.len() as u64 * INCOMPRESSIBLE_RATIO_PCT,
+        Err(_) => false,
+    }
+}
+
 /// Compress + encrypt + dedup one already-delimited plaintext chunk; returns the
-/// chunk id. Shared by the per-file and pack paths. (Telemetry dropped.)
+/// chunk id. Shared by the per-file and pack paths. Incompressible chunks are
+/// stored raw (still encrypted) so high zstd levels don't burn CPU re-packing
+/// already-compressed data; the manifest's `stored_raw` flag drives decode.
+/// (Telemetry dropped.)
 fn ingest_chunk(
     vault: &mut OpenVaultV3,
     chunk: &[u8],
@@ -771,22 +791,39 @@ fn ingest_chunk(
 ) -> Result<String, String> {
     let chunk_id = keyed_chunk_id(chunk_key, chunk);
     if !vault.manifest.chunks.contains_key(&chunk_id) {
-        let compressed = zstd::stream::encode_all(chunk, level)
-            .map_err(|e| format!("zstd compress failed: {e}"))?;
+        // Decide the stored representation: skip the full compress when the
+        // cheap probe says incompressible, and also fall back to raw if the
+        // full pass somehow failed to shrink the chunk (never store a block
+        // larger than the plaintext for zero gain).
+        let mut stored_raw = probe_incompressible(chunk);
+        let mut compressed = if stored_raw {
+            Vec::new()
+        } else {
+            let out = zstd::stream::encode_all(chunk, level)
+                .map_err(|e| format!("zstd compress failed: {e}"))?;
+            if out.len() >= chunk.len() {
+                stored_raw = true;
+                Vec::new()
+            } else {
+                out
+            }
+        };
+        let payload: &[u8] = if stored_raw { chunk } else { &compressed };
         let block_index = next_block_index(&vault.manifest);
         let aad = block_aad(block_index, &chunk_id);
-        let encrypted = encrypt_with_aad(&vault.master_key, &compressed, &aad)?;
+        let encrypted = encrypt_with_aad(&vault.master_key, payload, &aad)?;
+        let (pt, cz, enc) = (
+            chunk.len() as u64,
+            payload.len() as u64,
+            encrypted.len() as u64,
+        );
+        compressed.zeroize();
         let cipher_hash = blake3::hash(&encrypted).to_hex().to_string();
         let data_offset = vault.data.len() as u64;
         vault
             .data
             .extend_from_slice(&(encrypted.len() as u64).to_le_bytes());
         vault.data.extend_from_slice(&encrypted);
-        let (pt, cz, enc) = (
-            chunk.len() as u64,
-            compressed.len() as u64,
-            encrypted.len() as u64,
-        );
         vault.manifest.chunks.insert(
             chunk_id.clone(),
             ChunkRecordV3 {
@@ -797,6 +834,7 @@ fn ingest_chunk(
                 plaintext_len: pt,
                 compressed_len: cz,
                 cipher_hash,
+                stored_raw,
             },
         );
         vault.emit(|s| s.on_chunk(true, pt, cz, enc));
@@ -1403,19 +1441,25 @@ fn extract_file_entry(
             return Err(format!("Cipher block hash mismatch for chunk {chunk_id}"));
         }
         let aad = block_aad(record.block_index, chunk_id);
-        let mut compressed = decrypt_with_aad(&vault.master_key, encrypted, &aad)?;
-        // Bound the decompressor output to `plaintext_len + 1`: with the cap
-        // above this is at most one chunk, so a zstd bomb cannot materialise
-        // more than that before the length mismatch is detected.
-        let mut decoder = zstd::stream::read::Decoder::new(&compressed[..])
-            .map_err(|e| format!("zstd decompress init failed: {e}"))?;
-        let mut plaintext = Vec::with_capacity(record.plaintext_len as usize);
-        decoder
-            .by_ref()
-            .take(record.plaintext_len + 1)
-            .read_to_end(&mut plaintext)
-            .map_err(|e| format!("zstd decompress failed: {e}"))?;
-        compressed.zeroize();
+        let mut decrypted = decrypt_with_aad(&vault.master_key, encrypted, &aad)?;
+        // A raw-stored (incompressible, #10-B) block is the plaintext itself;
+        // a normal block is zstd and is decoded with a `plaintext_len + 1`
+        // ceiling so a zstd bomb cannot materialise more than one chunk before
+        // the length mismatch below trips.
+        let mut plaintext = if record.stored_raw {
+            std::mem::take(&mut decrypted)
+        } else {
+            let mut decoder = zstd::stream::read::Decoder::new(&decrypted[..])
+                .map_err(|e| format!("zstd decompress init failed: {e}"))?;
+            let mut out = Vec::with_capacity(record.plaintext_len as usize);
+            decoder
+                .by_ref()
+                .take(record.plaintext_len + 1)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("zstd decompress failed: {e}"))?;
+            decrypted.zeroize();
+            out
+        };
         if plaintext.len() as u64 != record.plaintext_len {
             plaintext.zeroize();
             return Err(format!("Plaintext length mismatch for chunk {chunk_id}"));
@@ -2195,6 +2239,88 @@ mod tests {
             vec![0x5au8; 4096]
         );
         assert_eq!(std::fs::read(out.join("big.bin")).unwrap(), payload);
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn probe_classifies_compressible_and_random() {
+        // Highly repetitive text shrinks well past the threshold.
+        let text = b"the quick brown fox jumps over the lazy dog. ".repeat(4096);
+        assert!(!probe_incompressible(&text));
+
+        // High-entropy bytes do not shrink: stored raw.
+        let mut noise = vec![0u8; 256 * 1024];
+        let mut x = 0x243f6a8885a308d3u64;
+        for b in noise.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        assert!(probe_incompressible(&noise));
+
+        // Empty input is never "incompressible".
+        assert!(!probe_incompressible(&[]));
+    }
+
+    #[test]
+    fn incompressible_chunks_store_raw_and_round_trip() {
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        let src = scratch_dir();
+
+        // Compressible file (>CDC threshold so it takes the per-file path).
+        let text = src.join("text.txt");
+        let text_payload = b"AeroVault incompressible-skip round trip. ".repeat(12_000);
+        std::fs::write(&text, &text_payload).unwrap();
+
+        // Incompressible file: high-entropy, also above the threshold.
+        let noise = src.join("noise.bin");
+        let mut noise_payload = vec![0u8; PACK_SMALL_FILE_THRESHOLD + 500_000];
+        let mut x = 0xdeadbeefcafef00du64;
+        for b in noise_payload.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        std::fs::write(&noise, &noise_payload).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[
+                (text.clone(), "text.txt".to_string()),
+                (noise.clone(), "noise.bin".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Both representations must be present: the noise chunks are stored raw,
+        // the text chunks are compressed.
+        let any_raw = vault.manifest.chunks.values().any(|c| c.stored_raw);
+        let any_compressed = vault.manifest.chunks.values().any(|c| !c.stored_raw);
+        assert!(
+            any_raw,
+            "incompressible file should store at least one raw chunk"
+        );
+        assert!(
+            any_compressed,
+            "compressible file should store at least one zstd chunk"
+        );
+        // A raw chunk never stores more than its plaintext.
+        for c in vault.manifest.chunks.values().filter(|c| c.stored_raw) {
+            assert_eq!(c.compressed_len, c.plaintext_len);
+        }
+
+        // Decode honours the flag: both files come back byte-identical.
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("text.txt")).unwrap(), text_payload);
+        assert_eq!(std::fs::read(out.join("noise.bin")).unwrap(), noise_payload);
 
         std::fs::remove_file(&vp).ok();
         std::fs::remove_dir_all(&src).ok();

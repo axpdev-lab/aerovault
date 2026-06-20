@@ -58,6 +58,13 @@ pub struct ChunkRecordV3 {
     pub plaintext_len: u64,
     pub compressed_len: u64,
     pub cipher_hash: String,
+    /// `true` when the block stores the raw plaintext (still encrypted) because
+    /// the chunk was incompressible: the zstd pass was skipped at ingest and
+    /// must be skipped on decode. Absent (false) in pre-T3 manifests and for
+    /// every compressible chunk, so it costs no bytes there and the on-disk
+    /// major stays 3.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stored_raw: bool,
 }
 
 /// The full manifest, encrypted as one AEAD blob under `MANIFEST_AAD`.
@@ -245,6 +252,7 @@ mod tests {
                 plaintext_len: 1,
                 compressed_len: 1,
                 cipher_hash: "x".to_string(),
+                stored_raw: false,
             },
         );
         assert_eq!(next_block_index(&m), 6);
