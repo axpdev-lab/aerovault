@@ -6,11 +6,11 @@
 
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use super::constants::{
     DATA_OFFSET, ERROR_CORRECTION_ALGORITHM_ID, ERROR_CORRECTION_ALGORITHM_VERSION,
-    ERROR_CORRECTION_EXTENSION_ID, ERROR_CORRECTION_META_EXTENSION_ID, HEADER_SIZE, MAC_SIZE,
+    ERROR_CORRECTION_EXTENSION_ID, ERROR_CORRECTION_META_EXTENSION_ID, MAC_SIZE,
 };
 use super::format::VaultHeaderV3;
 use super::manifest::{
@@ -53,7 +53,7 @@ pub fn read_section<R: Read + Seek>(
 /// rev. 3 containers carry no extensions, so the output is
 /// `header | data | manifest | "[]" | (empty)`.
 pub fn build_file_bytes(
-    mut header: VaultHeaderV3,
+    header: VaultHeaderV3,
     mac_key: &[u8; KEY_SIZE],
     master_key: &[u8; KEY_SIZE],
     manifest: &VaultManifestV3,
@@ -61,6 +61,43 @@ pub fn build_file_bytes(
     extension_payloads: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    write_container(
+        &mut out,
+        header,
+        mac_key,
+        master_key,
+        manifest,
+        extensions,
+        extension_payloads,
+        data,
+    )?;
+    Ok(out)
+}
+
+/// Streaming twin of [`build_file_bytes`]: assemble and write the full container
+/// straight to `writer` in section order WITHOUT first concatenating it into a
+/// second whole-file `Vec`. The output bytes are identical to `build_file_bytes`
+/// (the seal's byte-compat is unchanged); the only difference is that `data` (the
+/// whole data section, which already lives in RAM on `OpenVaultV3`) is written
+/// directly instead of being copied into an output buffer first. This removes the
+/// ~1x-data-section duplicate that dominated `save_open_vault`'s peak memory
+/// (T5 sub-task #2: streaming seal). Bounded auxiliary buffers only (encrypted
+/// manifest + extension payloads, both metadata-scale).
+// Mirrors `build_file_bytes`'s parameter set (already at the 7-arg lint limit)
+// plus the output `writer`; bundling them into a struct would only move the
+// churn to every caller for no clarity gain.
+#[allow(clippy::too_many_arguments)]
+pub fn write_container<W: Write>(
+    writer: &mut W,
+    mut header: VaultHeaderV3,
+    mac_key: &[u8; KEY_SIZE],
+    master_key: &[u8; KEY_SIZE],
+    manifest: &VaultManifestV3,
+    extensions: &[ExtensionEntryV3],
+    extension_payloads: &[u8],
+    data: &[u8],
+) -> Result<(), String> {
     // The manifest blob is encrypted on the standard lane and stored as plaintext
     // JSON on the `.aerozip` lane (#7). Either way it is the blob the header
     // offsets address and Error Correction protects below; the variable name is
@@ -120,25 +157,23 @@ pub fn build_file_bytes(
     header.header_mac = [0u8; MAC_SIZE];
     header.header_mac = header.compute_mac(mac_key)?;
 
-    let mut out = Vec::with_capacity(
-        HEADER_SIZE
-            + data.len()
-            + encrypted_manifest.len()
-            + extension_dir.len()
-            + extension_payloads.len(),
-    );
-    out.extend_from_slice(&header.to_bytes());
-    out.extend_from_slice(data);
-    out.extend_from_slice(&encrypted_manifest);
-    out.extend_from_slice(&extension_dir);
-    out.extend_from_slice(&extension_payloads);
-    Ok(out)
+    let write = |w: &mut W, bytes: &[u8]| -> Result<(), String> {
+        w.write_all(bytes)
+            .map_err(|e| format!("Write vault container: {e}"))
+    };
+    write(writer, &header.to_bytes())?;
+    write(writer, data)?;
+    write(writer, &encrypted_manifest)?;
+    write(writer, &extension_dir)?;
+    write(writer, &extension_payloads)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aerocrypt::{random_array, SALT_SIZE, WRAPPED_KEY_SIZE};
+    use crate::v3::constants::HEADER_SIZE;
     use crate::v3::format::{read_u64, VaultHeaderV3};
     use crate::v3::manifest::empty_manifest;
     use std::io::Cursor;

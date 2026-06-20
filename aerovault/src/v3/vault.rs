@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use zeroize::{Zeroize, Zeroizing};
 
-use super::block::build_file_bytes;
-use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds};
+use super::block::{build_file_bytes, write_container};
+use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds, StreamingChunker};
 use super::constants::{
     CDC_MAX, CRYPT_ALGORITHM_ENCRYPTED, CRYPT_ALGORITHM_NONE, DATA_OFFSET, DEFAULT_ZSTD_LEVEL,
     FLAG_PLAINTEXT_CONTENT, HEADER_SIZE, HKDF_CHUNK_ID, INCOMPRESSIBLE_PROBE_LEVEL,
@@ -924,20 +924,30 @@ fn append_file_at(vault: &mut OpenVaultV3, source: &Path, entry_path: &str) -> R
         }
     }
 
-    let mut plaintext =
-        std::fs::read(source).map_err(|e| format!("Read {}: {e}", source.display()))?;
-    let size = plaintext.len() as u64;
     let chunk_key = hkdf_expand::<KEY_SIZE>(&vault.master_key, HKDF_CHUNK_ID)?;
     let level = manifest_zstd_level(&vault.manifest);
     let bounds = manifest_cdc_bounds(&vault.manifest)?;
     let mut entry_chunks = Vec::new();
 
-    let ranges = chunk_ranges_with(&plaintext, &bounds);
-    for (start, end) in ranges {
-        let chunk_id = ingest_chunk(vault, &plaintext[start..end], &chunk_key, level)?;
+    // Stream the source through the bounded-buffer chunker so peak memory is one
+    // CDC window (`bounds.max` + a refill), not the whole file. The streamed
+    // boundaries are byte-identical to `chunk_ranges_with` over the same bytes
+    // (pinned by `streaming_chunker_matches_whole_buffer`), so chunk ids and the
+    // on-disk container are unchanged. `size` is accumulated from the streamed
+    // chunks, so it equals the bytes actually ingested (as `plaintext.len()` did).
+    let file =
+        std::fs::File::open(source).map_err(|e| format!("Read {}: {e}", source.display()))?;
+    let mut chunker = StreamingChunker::new(file, bounds);
+    let mut size = 0u64;
+    while let Some(mut chunk) = chunker
+        .next_chunk()
+        .map_err(|e| format!("Read {}: {e}", source.display()))?
+    {
+        size += chunk.len() as u64;
+        let chunk_id = ingest_chunk(vault, &chunk, &chunk_key, level)?;
+        chunk.zeroize();
         entry_chunks.push(chunk_id);
     }
-    plaintext.zeroize();
 
     vault.manifest.entries.push(ManifestEntryV3 {
         path: entry_path,
@@ -1458,102 +1468,162 @@ fn extract_file_entry(
     // compressed-or-raw payload directly. Computed once for the whole entry.
     let plaintext_lane = manifest_is_plaintext(&vault.manifest);
 
-    let mut out = Vec::with_capacity(end.min(32 * 1024 * 1024));
-    for chunk_id in &entry.chunks {
-        if out.len() >= end {
-            // Everything this entry slices is already decoded; ignore the rest
-            // (a hostile pack may list extra/duplicate chunks past this point).
-            break;
+    // Stream the entry to disk one block at a time: decode each chunk, write the
+    // portion that falls inside the requested slice [offset, end) straight to a
+    // temp file, and keep only the current decoded block in RAM. Peak memory is
+    // one block (bounded by `max_block_plaintext`), not the whole entry. The temp
+    // is atomically promoted only after the full slice has been written, so a
+    // failure mid-decode leaves no partial output and no plaintext temp artifact.
+    let parent = output_parent_dir(output_path);
+    std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".aerovault-v3-")
+        .tempfile_in(parent)
+        .map_err(|e| format!("Create temp file: {e}"))?;
+
+    // Cumulative decoded plaintext length so far == the old `out.len()`; used to
+    // place each block against the requested slice and to detect a short entry.
+    let mut decoded_len = 0usize;
+    {
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(tmp.as_file_mut());
+        for chunk_id in &entry.chunks {
+            if decoded_len >= end {
+                // Everything this entry slices is already written; ignore the
+                // rest (a hostile pack may list extra/duplicate chunks).
+                break;
+            }
+            let record = vault
+                .manifest
+                .chunks
+                .get(chunk_id)
+                .ok_or_else(|| format!("Missing chunk record: {chunk_id}"))?;
+            let len_start = record.data_offset as usize;
+            let len_end = len_start
+                .checked_add(8)
+                .ok_or_else(|| "Chunk length offset overflow".to_string())?;
+            if len_end > vault.data.len() {
+                return Err("Chunk length is outside data section".to_string());
+            }
+            let block_len = u64::from_le_bytes(
+                vault.data[len_start..len_end]
+                    .try_into()
+                    .expect("slice length"),
+            );
+            if block_len != record.block_len || block_len > MAX_BLOCK_SIZE {
+                return Err("Chunk length metadata mismatch".to_string());
+            }
+            // Reject an over-declared plaintext length before decompressing so a
+            // single block cannot expand to gigabytes (CLAUDE-AV-005).
+            if record.plaintext_len > max_block_plaintext {
+                return Err(format!(
+                    "Plaintext block too large for chunk {chunk_id}: {} bytes (max {max_block_plaintext})",
+                    record.plaintext_len
+                ));
+            }
+            let block_start = len_end;
+            let block_end = block_start
+                .checked_add(block_len as usize)
+                .ok_or_else(|| "Chunk block offset overflow".to_string())?;
+            if block_end > vault.data.len() {
+                return Err("Chunk block is outside data section".to_string());
+            }
+            let encrypted = &vault.data[block_start..block_end];
+            let actual_hash = blake3::hash(encrypted).to_hex().to_string();
+            if actual_hash != record.cipher_hash {
+                return Err(format!("Cipher block hash mismatch for chunk {chunk_id}"));
+            }
+            let aad = block_aad(record.block_index, chunk_id);
+            // `Zeroizing` wipes the decrypted bytes on every exit path, including
+            // the zstd-init / decode / write-error early returns below (the old
+            // manual `.zeroize()` calls missed those error paths).
+            let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(if plaintext_lane {
+                encrypted.to_vec()
+            } else {
+                decrypt_with_aad(&vault.master_key, encrypted, &aad)?
+            });
+            // A raw-stored (incompressible, #10-B) block is the plaintext itself;
+            // a normal block is zstd and is decoded with a `plaintext_len + 1`
+            // ceiling so a zstd bomb cannot materialise more than one chunk before
+            // the length mismatch below trips.
+            let plaintext: Zeroizing<Vec<u8>> = if record.stored_raw {
+                decrypted
+            } else {
+                let mut decoder = zstd::stream::read::Decoder::new(&decrypted[..])
+                    .map_err(|e| format!("zstd decompress init failed: {e}"))?;
+                let mut decoded: Zeroizing<Vec<u8>> =
+                    Zeroizing::new(Vec::with_capacity(record.plaintext_len as usize));
+                decoder
+                    .by_ref()
+                    .take(record.plaintext_len + 1)
+                    .read_to_end(&mut decoded)
+                    .map_err(|e| format!("zstd decompress failed: {e}"))?;
+                decoded
+            };
+            if plaintext.len() as u64 != record.plaintext_len {
+                return Err(format!("Plaintext length mismatch for chunk {chunk_id}"));
+            }
+            // Write only the slice of this block that intersects [offset, end);
+            // the windowed equivalent of the old `out[offset..end]`.
+            let block_pos = decoded_len;
+            let next_pos = block_pos + plaintext.len();
+            let w_start = offset.max(block_pos);
+            let w_end = end.min(next_pos);
+            if w_start < w_end {
+                writer
+                    .write_all(&plaintext[w_start - block_pos..w_end - block_pos])
+                    .map_err(|e| format!("Write extracted file: {e}"))?;
+            }
+            decoded_len = next_pos;
         }
-        let record = vault
-            .manifest
-            .chunks
-            .get(chunk_id)
-            .ok_or_else(|| format!("Missing chunk record: {chunk_id}"))?;
-        let len_start = record.data_offset as usize;
-        let len_end = len_start
-            .checked_add(8)
-            .ok_or_else(|| "Chunk length offset overflow".to_string())?;
-        if len_end > vault.data.len() {
-            return Err("Chunk length is outside data section".to_string());
-        }
-        let block_len = u64::from_le_bytes(
-            vault.data[len_start..len_end]
-                .try_into()
-                .expect("slice length"),
-        );
-        if block_len != record.block_len || block_len > MAX_BLOCK_SIZE {
-            return Err("Chunk length metadata mismatch".to_string());
-        }
-        // Reject an over-declared plaintext length before decompressing so a
-        // single block cannot expand to gigabytes (CLAUDE-AV-005).
-        if record.plaintext_len > max_block_plaintext {
-            return Err(format!(
-                "Plaintext block too large for chunk {chunk_id}: {} bytes (max {max_block_plaintext})",
-                record.plaintext_len
-            ));
-        }
-        let block_start = len_end;
-        let block_end = block_start
-            .checked_add(block_len as usize)
-            .ok_or_else(|| "Chunk block offset overflow".to_string())?;
-        if block_end > vault.data.len() {
-            return Err("Chunk block is outside data section".to_string());
-        }
-        let encrypted = &vault.data[block_start..block_end];
-        let actual_hash = blake3::hash(encrypted).to_hex().to_string();
-        if actual_hash != record.cipher_hash {
-            return Err(format!("Cipher block hash mismatch for chunk {chunk_id}"));
-        }
-        let aad = block_aad(record.block_index, chunk_id);
-        let mut decrypted = if plaintext_lane {
-            encrypted.to_vec()
-        } else {
-            decrypt_with_aad(&vault.master_key, encrypted, &aad)?
-        };
-        // A raw-stored (incompressible, #10-B) block is the plaintext itself;
-        // a normal block is zstd and is decoded with a `plaintext_len + 1`
-        // ceiling so a zstd bomb cannot materialise more than one chunk before
-        // the length mismatch below trips.
-        let mut plaintext = if record.stored_raw {
-            std::mem::take(&mut decrypted)
-        } else {
-            let mut decoder = zstd::stream::read::Decoder::new(&decrypted[..])
-                .map_err(|e| format!("zstd decompress init failed: {e}"))?;
-            let mut out = Vec::with_capacity(record.plaintext_len as usize);
-            decoder
-                .by_ref()
-                .take(record.plaintext_len + 1)
-                .read_to_end(&mut out)
-                .map_err(|e| format!("zstd decompress failed: {e}"))?;
-            decrypted.zeroize();
-            out
-        };
-        if plaintext.len() as u64 != record.plaintext_len {
-            plaintext.zeroize();
-            return Err(format!("Plaintext length mismatch for chunk {chunk_id}"));
-        }
-        out.extend_from_slice(&plaintext);
-        plaintext.zeroize();
+        writer
+            .flush()
+            .map_err(|e| format!("Flush extracted file: {e}"))?;
     }
-    if end > out.len() {
+    // The decoded stream must reach the end of the requested slice (matches the
+    // old `end > out.len()` guard).
+    if decoded_len < end {
         return Err(format!(
-            "Entry slice [{offset}..{end}] exceeds decoded data ({})",
-            out.len()
+            "Entry slice [{offset}..{end}] exceeds decoded data ({decoded_len})"
         ));
     }
-    let mut sliced = out[offset..end].to_vec();
-    out.zeroize();
-    atomic_write(output_path, &sliced)?;
-    sliced.zeroize();
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|e| format!("Sync temp file: {e}"))?;
+    tmp.persist(output_path)
+        .map_err(|e| format!("Persist vault: {}", e.error))?;
+    fsync_parent_dir(parent);
     Ok(output_path.to_path_buf())
 }
 
-pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = target
+/// Resolve the directory an output/temp file lives in, mapping a parent-less or
+/// empty parent to the current directory. Shared by `atomic_write` and the
+/// streaming `extract_file_entry` so both place their temp beside the target.
+pub(super) fn output_parent_dir(target: &Path) -> &Path {
+    target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Best-effort fsync of a directory so a freshly persisted rename is durable on
+/// crash (Unix). A no-op on other platforms. Single definition so the durability
+/// discipline cannot drift between the write paths that rely on it.
+pub(super) fn fsync_parent_dir(parent: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+}
+
+pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = output_parent_dir(target);
     std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".aerovault-v3-")
@@ -1567,14 +1637,7 @@ pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("Sync temp file: {e}"))?;
     tmp.persist(target)
         .map_err(|e| format!("Persist vault: {}", e.error))?;
-    #[cfg(unix)]
-    {
-        if let Some(parent) = target.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-    }
+    fsync_parent_dir(parent);
     Ok(())
 }
 
@@ -2043,16 +2106,40 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
         vault.emit(|s| s.set_error_correction(shards, protected, overhead));
     }
 
-    let bytes = build_file_bytes(
-        vault.header.clone(),
-        &vault.mac_key,
-        &vault.master_key,
-        &vault.manifest,
-        &extensions,
-        &ext_payloads,
-        &vault.data,
-    )?;
-    atomic_write(&vault.path, &bytes)?;
+    // Stream the container straight to the temp file: the data section (already
+    // in RAM on `OpenVaultV3.data`) is written directly rather than copied into a
+    // second whole-file buffer, so the seal no longer doubles peak memory
+    // (T5 sub-task #2). Same atomic temp + sync + persist + dir-fsync discipline
+    // as `atomic_write`, via the shared helpers.
+    {
+        use std::io::Write;
+        let parent = output_parent_dir(&vault.path);
+        std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".aerovault-v3-")
+            .tempfile_in(parent)
+            .map_err(|e| format!("Create temp file: {e}"))?;
+        {
+            let mut w = std::io::BufWriter::new(tmp.as_file_mut());
+            write_container(
+                &mut w,
+                vault.header.clone(),
+                &vault.mac_key,
+                &vault.master_key,
+                &vault.manifest,
+                &extensions,
+                &ext_payloads,
+                &vault.data,
+            )?;
+            w.flush().map_err(|e| format!("Flush temp file: {e}"))?;
+        }
+        tmp.as_file_mut()
+            .sync_all()
+            .map_err(|e| format!("Sync temp file: {e}"))?;
+        tmp.persist(&vault.path)
+            .map_err(|e| format!("Persist vault: {}", e.error))?;
+        fsync_parent_dir(parent);
+    }
 
     // Refresh the staleness baseline so a second save in the same session does
     // not trip the generation guard against the bytes we just wrote.
@@ -2098,8 +2185,7 @@ fn extract_entry(
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."));
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Create output dir: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("Create output dir: {e}"))?;
                 extract_file_entry(vault, entry, dest_path, parent)
             }
         }
@@ -2386,6 +2472,149 @@ mod tests {
             vec![0x5au8; 4096]
         );
         assert_eq!(std::fs::read(out.join("big.bin")).unwrap(), payload);
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn streaming_multi_megabyte_round_trip_is_byte_identical() {
+        // T5 headline: a multi-MB file is ingested through the bounded-buffer
+        // StreamingChunker (many CDC windows + several reader refills) and
+        // re-extracted block-by-block, and must come back byte-for-byte. This
+        // exercises the streaming add + streaming extract paths end to end,
+        // across both the incompressible (stored-raw) and the zstd lanes.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+
+        let src = scratch_dir();
+
+        // 12 MiB pseudo-random => incompressible (stored_raw) and split into
+        // several CDC chunks (min 256 KiB / max 4 MiB => at least 3 chunks).
+        let mut random = vec![0u8; 12 * 1024 * 1024 + 7];
+        let mut x = 0xd1b54a32d192ed03u64;
+        for b in random.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        let rnd_path = src.join("random.bin");
+        std::fs::write(&rnd_path, &random).unwrap();
+
+        // 12 MiB highly compressible => the zstd lane, decoded windowed on extract.
+        let pattern = b"AeroVault v3 streaming round-trip payload block. ";
+        let mut text = Vec::with_capacity(12 * 1024 * 1024);
+        while text.len() < 12 * 1024 * 1024 {
+            text.extend_from_slice(pattern);
+        }
+        let txt_path = src.join("text.bin");
+        std::fs::write(&txt_path, &text).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[
+                (rnd_path.clone(), "random.bin".to_string()),
+                (txt_path.clone(), "text.bin".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Both files must have been split into multiple CDC chunks, i.e. the
+        // streaming chunker actually crossed window boundaries (not one big read).
+        let rnd_entry = vault
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path == "random.bin")
+            .unwrap();
+        assert!(
+            rnd_entry.chunks.len() >= 3,
+            "12 MiB random file should split into multiple CDC chunks, got {}",
+            rnd_entry.chunks.len()
+        );
+
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("random.bin")).unwrap(),
+            random,
+            "incompressible multi-chunk file must round-trip byte-identically"
+        );
+        assert_eq!(
+            std::fs::read(out.join("text.bin")).unwrap(),
+            text,
+            "compressible multi-chunk file must round-trip byte-identically"
+        );
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn streaming_packed_small_files_cross_chunk_round_trip() {
+        // Exercises the windowed streaming extract with offset > 0 AND a file
+        // straddling a CDC chunk boundary: many sub-threshold files are batched
+        // into one pack, the pack is chunked (>= 2 chunks), and each member's
+        // [pack_offset, pack_offset+size) slice is reassembled block-by-block.
+        // This is the most error-prone new arithmetic (w_start/w_end clamp) and
+        // the old offset==0 round-trip tests do not cover it.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+
+        let src = scratch_dir();
+        // 48 distinct ~100 KiB files => ~4.8 MiB packed, which the CDC (avg 1 MiB,
+        // max 4 MiB) splits into several chunks, so members straddle boundaries.
+        // Each file gets unique pseudo-random content (no dedup collapse, so the
+        // per-file byte comparison is meaningful).
+        let mut files: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
+        for i in 0..48u64 {
+            let len = 100 * 1024 + (i as usize); // vary length so boundaries shift
+            let mut data = vec![0u8; len];
+            let mut x = 0xa5a5_0000_0000_0001u64.wrapping_add(i.wrapping_mul(0x9e3779b97f4a7c15));
+            for b in data.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = (x & 0xff) as u8;
+            }
+            let name = format!("packed/file_{i:03}.bin");
+            let path = src.join(format!("file_{i:03}.bin"));
+            std::fs::write(&path, &data).unwrap();
+            files.push((path, name, data));
+        }
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        let sources: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|(p, n, _)| (p.clone(), n.clone()))
+            .collect();
+        VaultV3::add_files(&mut vault, &sources).unwrap();
+
+        // The pack must have split into multiple chunks AND at least one member
+        // must span >1 chunk (i.e. a real cross-boundary windowed extract).
+        assert!(
+            vault.manifest.chunks.len() >= 2,
+            "packed set should chunk into >= 2 blocks, got {}",
+            vault.manifest.chunks.len()
+        );
+        assert!(
+            vault.manifest.entries.iter().any(|e| e.chunks.len() >= 2),
+            "at least one packed file must straddle a chunk boundary"
+        );
+
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        for (_, name, data) in &files {
+            assert_eq!(
+                &std::fs::read(out.join(name)).unwrap(),
+                data,
+                "packed cross-chunk file {name} must round-trip byte-identically"
+            );
+        }
 
         std::fs::remove_file(&vp).ok();
         std::fs::remove_dir_all(&src).ok();
@@ -2937,7 +3166,11 @@ mod tests {
         std::fs::write(&secret, secret_bytes).unwrap();
 
         let mut vault = VaultV3::open(&vp, PW).unwrap();
-        VaultV3::add_files(&mut vault, &[(secret.clone(), "sub/secret.txt".to_string())]).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[(secret.clone(), "sub/secret.txt".to_string())],
+        )
+        .unwrap();
 
         let dest = scratch_dir();
         let victim = scratch_dir();
@@ -3019,7 +3252,11 @@ mod tests {
         let secret = src.join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET PLAINTEXT THAT MUST STAY CONTAINED").unwrap();
         let mut vault = VaultV3::open(&vp, PW).unwrap();
-        VaultV3::add_files(&mut vault, &[(secret.clone(), "sub/secret.txt".to_string())]).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[(secret.clone(), "sub/secret.txt".to_string())],
+        )
+        .unwrap();
 
         let dest = scratch_dir(); // exists & is a dir -> output_root = dest/sub
         let victim = scratch_dir();
