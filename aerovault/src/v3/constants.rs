@@ -30,6 +30,27 @@ pub const MAX_PLAINTEXT_BLOCK_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Data section starts immediately after the fixed header.
 pub const DATA_OFFSET: u64 = HEADER_SIZE as u64;
+
+/// Header `flags` bit (byte 11) marking the unencrypted `.aerozip` plaintext
+/// lane (#7): content blocks AND the manifest are stored in the clear (still
+/// compressed + Error-Correction-protected), there is no password, and the
+/// header HMAC is keyed by the fixed PUBLIC integrity key below. This lane is
+/// integrity + recovery, NOT confidentiality — the data is readable by anyone.
+/// Absent (0) on every encrypted `.aerovault`, so those containers are
+/// byte-identical and old readers fail closed on an unknown crypt id.
+pub const FLAG_PLAINTEXT_CONTENT: u8 = 0x01;
+
+/// `crypt` wrapper algorithm id recorded for the encrypted lane.
+pub const CRYPT_ALGORITHM_ENCRYPTED: &str = "aes-256-gcm-siv";
+/// `crypt` wrapper algorithm id recorded for the plaintext (`.aerozip`) lane.
+pub const CRYPT_ALGORITHM_NONE: &str = "none";
+
+/// Public, fixed input keying material for the plaintext lane's header HMAC.
+/// Public by design: it authenticates the header against bit-rot / accidental
+/// tampering; it provides NO confidentiality (the lane has none).
+pub const AEROZIP_MAC_IKM: &[u8] = b"AeroVault v3 aerozip public container";
+/// HKDF-SHA256 label deriving the plaintext-lane header-integrity MAC key.
+pub const HKDF_AEROZIP_MAC: &[u8] = b"AeroVault v3 aerozip header integrity key";
 /// Default zstd compression level (`balanced` profile).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 /// The only wrapper-header layout this build understands.

@@ -22,33 +22,53 @@ use zeroize::{Zeroize, Zeroizing};
 use super::block::build_file_bytes;
 use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds};
 use super::constants::{
-    CDC_MAX, DATA_OFFSET, DEFAULT_ZSTD_LEVEL, HEADER_SIZE, HKDF_CHUNK_ID,
-    INCOMPRESSIBLE_PROBE_LEVEL, INCOMPRESSIBLE_PROBE_SAMPLE, INCOMPRESSIBLE_RATIO_PCT, MAC_SIZE,
-    MAGIC, MAX_BLOCK_SIZE, MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE, MAX_PLAINTEXT_BLOCK_SIZE,
-    MIN_PASSWORD_LEN, PACK_SMALL_FILE_THRESHOLD, PACK_TARGET, SUPPORTED_WRAPPER_HEADER_VERSION,
-    VERSION,
+    CDC_MAX, CRYPT_ALGORITHM_ENCRYPTED, CRYPT_ALGORITHM_NONE, DATA_OFFSET, DEFAULT_ZSTD_LEVEL,
+    FLAG_PLAINTEXT_CONTENT, HEADER_SIZE, HKDF_CHUNK_ID, INCOMPRESSIBLE_PROBE_LEVEL,
+    INCOMPRESSIBLE_PROBE_SAMPLE, INCOMPRESSIBLE_RATIO_PCT, MAC_SIZE, MAGIC, MAX_BLOCK_SIZE,
+    MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE, MAX_PLAINTEXT_BLOCK_SIZE, MIN_PASSWORD_LEN,
+    PACK_SMALL_FILE_THRESHOLD, PACK_TARGET, SUPPORTED_WRAPPER_HEADER_VERSION, VERSION,
 };
-use super::format::{derive_keks, VaultHeaderV3};
+use super::format::{aerozip_mac_key, derive_keks, VaultHeaderV3};
 use super::manifest::{
-    block_aad, decrypt_manifest, empty_manifest, manifest_cdc_bounds, manifest_zstd_level,
-    next_block_index, now_iso, AlgorithmSpec, ChunkRecordV3, ExtensionEntryV3, ManifestEntryV3,
+    block_aad, decrypt_manifest, empty_manifest, empty_manifest_plaintext, manifest_cdc_bounds,
+    manifest_is_plaintext, manifest_zstd_level, next_block_index, now_iso,
+    parse_manifest_plaintext, AlgorithmSpec, ChunkRecordV3, ExtensionEntryV3, ManifestEntryV3,
     VaultManifestV3, WrapperManifest,
 };
 use crate::aerocrypt::{
     decrypt_with_aad, derive_base_kek, encrypt_with_aad, hkdf_expand, random_array, unwrap_key,
-    wrap_key, KEY_SIZE, SALT_SIZE,
+    wrap_key, KEY_SIZE, SALT_SIZE, WRAPPED_KEY_SIZE,
 };
+
+/// Which cryptographic lane a container uses.
+///
+/// The encrypted lane is the standard password-protected `.aerovault`. The
+/// plaintext lane is the unencrypted `.aerozip` archive (#7): the same
+/// pack/chunk/compress/Error-Correction pipeline minus the encrypt stage —
+/// content blocks and the manifest are stored in the clear, there is no
+/// password, and the header carries an integrity-only public MAC. It is
+/// integrity + recovery, NOT confidentiality; the data is readable by anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultLane {
+    /// Password-protected, AES-256-GCM-SIV content + encrypted manifest.
+    Encrypted,
+    /// Unencrypted `.aerozip`: compressed + EC, no encryption, no password.
+    Plaintext,
+}
 
 /// Options for creating an AEROVAULT3 container. Without an Error-Correction
 /// placement this produces a plain rev. 3 container; setting one (see
 /// [`VaultV3::create_with_error_correction`]) opts into rev. 4.
 pub struct CreateOptionsV3 {
-    /// Destination path for the `.aerovault` container.
+    /// Destination path for the `.aerovault` / `.aerozip` container.
     pub path: PathBuf,
-    /// Master password (>= [`MIN_PASSWORD_LEN`] characters).
+    /// Master password (>= [`MIN_PASSWORD_LEN`] characters). Ignored — and may be
+    /// empty — when `lane` is [`VaultLane::Plaintext`].
     pub password: String,
     /// zstd compression level recorded on the `compression` wrapper.
     pub zstd_level: i32,
+    /// Cryptographic lane. [`VaultLane::Encrypted`] by default.
+    pub lane: VaultLane,
     /// rev. 4 Error-Correction placement. `None` keeps the container plain rev. 3.
     pub(super) error_correction: Option<super::ec::RecoveryPlacement>,
     /// QR-style EC overhead percentage; only meaningful when
@@ -57,12 +77,28 @@ pub struct CreateOptionsV3 {
 }
 
 impl CreateOptionsV3 {
-    /// New options with the default ([`DEFAULT_ZSTD_LEVEL`]) compression level.
+    /// New encrypted-lane options with the default ([`DEFAULT_ZSTD_LEVEL`])
+    /// compression level.
     pub fn new(path: impl Into<PathBuf>, password: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             password: password.into(),
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            lane: VaultLane::Encrypted,
+            error_correction: None,
+            error_correction_pct: crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
+        }
+    }
+
+    /// New plaintext-lane (`.aerozip`) options: no password, content + manifest
+    /// stored unencrypted. Compression and (optional) Error Correction still
+    /// apply. See [`VaultLane::Plaintext`] for the security caveat.
+    pub fn new_plaintext(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            password: String::new(),
+            zstd_level: DEFAULT_ZSTD_LEVEL,
+            lane: VaultLane::Plaintext,
             error_correction: None,
             error_correction_pct: crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
         }
@@ -225,6 +261,7 @@ impl VaultV3 {
             &opts.path,
             &opts.password,
             opts.zstd_level,
+            opts.lane,
             opts.error_correction,
             opts.error_correction_pct,
         )
@@ -248,6 +285,7 @@ impl VaultV3 {
             &opts.path,
             &opts.password,
             opts.zstd_level,
+            opts.lane,
             Some(placement),
             pct,
         )
@@ -330,9 +368,20 @@ impl VaultV3 {
         &buf[..10] == MAGIC && buf[10] == VERSION
     }
 
-    /// Open and unlock a container with `password`.
+    /// Open and unlock a container with `password`. A plaintext (`.aerozip`)
+    /// container is opened regardless of `password` (it has none); pass `""`.
     pub fn open(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
         open_vault(path, password)
+    }
+
+    /// Open a plaintext (`.aerozip`) container — convenience for `open(path, "")`.
+    /// Errors if the container is an encrypted `.aerovault`.
+    pub fn open_plaintext(path: impl Into<PathBuf>) -> Result<OpenVaultV3, String> {
+        let vault = open_vault(path, "")?;
+        if vault.header.flags & FLAG_PLAINTEXT_CONTENT == 0 {
+            return Err("Not a plaintext .aerozip archive (it is encrypted)".to_string());
+        }
+        Ok(vault)
     }
 
     /// Read header-only info without a password.
@@ -811,7 +860,15 @@ fn ingest_chunk(
         let payload: &[u8] = if stored_raw { chunk } else { &compressed };
         let block_index = next_block_index(&vault.manifest);
         let aad = block_aad(block_index, &chunk_id);
-        let encrypted = encrypt_with_aad(&vault.master_key, payload, &aad)?;
+        // Plaintext (`.aerozip`) lane: store the compressed-or-raw payload
+        // directly, skipping AES-256-GCM-SIV. `cipher_hash` is taken over the
+        // stored bytes either way (ciphertext on the encrypted lane, the payload
+        // here), so the decode-side integrity check is unchanged.
+        let encrypted = if manifest_is_plaintext(&vault.manifest) {
+            payload.to_vec()
+        } else {
+            encrypt_with_aad(&vault.master_key, payload, &aad)?
+        };
         let (pt, cz, enc) = (
             chunk.len() as u64,
             payload.len() as u64,
@@ -1242,6 +1299,9 @@ fn copy_entry_in_manifest(vault: &mut OpenVaultV3, from: &str, to: &str) -> Resu
 }
 
 fn change_password_in_place(vault: &mut OpenVaultV3, new_password: &str) -> Result<(), String> {
+    if vault.header.flags & FLAG_PLAINTEXT_CONTENT != 0 {
+        return Err("A plaintext .aerozip archive has no password to change".to_string());
+    }
     if new_password.len() < MIN_PASSWORD_LEN {
         return Err("Password must be at least 8 characters".to_string());
     }
@@ -1393,6 +1453,11 @@ fn extract_file_entry(
         .unwrap_or(CDC_MAX as u64)
         .min(MAX_PLAINTEXT_BLOCK_SIZE);
 
+    // Plaintext (`.aerozip`) lane: blocks are stored unencrypted, so the decode
+    // skips AES-256-GCM-SIV and treats the on-disk block bytes as the
+    // compressed-or-raw payload directly. Computed once for the whole entry.
+    let plaintext_lane = manifest_is_plaintext(&vault.manifest);
+
     let mut out = Vec::with_capacity(end.min(32 * 1024 * 1024));
     for chunk_id in &entry.chunks {
         if out.len() >= end {
@@ -1441,7 +1506,11 @@ fn extract_file_entry(
             return Err(format!("Cipher block hash mismatch for chunk {chunk_id}"));
         }
         let aad = block_aad(record.block_index, chunk_id);
-        let mut decrypted = decrypt_with_aad(&vault.master_key, encrypted, &aad)?;
+        let mut decrypted = if plaintext_lane {
+            encrypted.to_vec()
+        } else {
+            decrypt_with_aad(&vault.master_key, encrypted, &aad)?
+        };
         // A raw-stored (incompressible, #10-B) block is the plaintext itself;
         // a normal block is zstd and is decoded with a `plaintext_len + 1`
         // ceiling so a zstd bomb cannot materialise more than one chunk before
@@ -1546,7 +1615,19 @@ fn validate_supported_wrappers(w: &WrapperManifest) -> Result<(), String> {
     check_wrapper("chunking", &w.chunking, "gear-cdc", 1)?;
     check_wrapper("chunk_id", &w.chunk_id, "blake3-keyed-128", 1)?;
     check_wrapper("compression", &w.compression, "zstd", 1)?;
-    check_wrapper("crypt", &w.crypt, "aes-256-gcm-siv", 1)?;
+    // crypt: the encrypted lane records `aes-256-gcm-siv`, the plaintext
+    // (`.aerozip`) lane records `none`. Both are version 1.
+    match w.crypt.algorithm_id.as_str() {
+        CRYPT_ALGORITHM_ENCRYPTED | CRYPT_ALGORITHM_NONE => {
+            if w.crypt.algorithm_version != 1 {
+                return Err(format!(
+                    "Unsupported crypt wrapper version: {}",
+                    w.crypt.algorithm_version
+                ));
+            }
+        }
+        other => return Err(format!("Unsupported crypt wrapper: {other}")),
+    }
     check_wrapper("cipher_hash", &w.cipher_hash, "blake3-256", 1)?;
     Ok(())
 }
@@ -1579,27 +1660,52 @@ fn create_empty_vault(
     path: &Path,
     password: &str,
     level: i32,
+    lane: VaultLane,
     error_correction: Option<super::ec::RecoveryPlacement>,
     error_correction_pct: u32,
 ) -> Result<(), String> {
-    if password.len() < MIN_PASSWORD_LEN {
-        return Err("Password must be at least 8 characters".to_string());
-    }
+    // The plaintext (`.aerozip`) lane has no password: zero salt + zero wrapped
+    // keys in the header, a public deterministic chunk-id key (all-zero master),
+    // and the header HMAC keyed by the fixed PUBLIC integrity key. The encrypted
+    // lane derives everything from the password exactly as before.
+    let plaintext = lane == VaultLane::Plaintext;
 
-    let salt = random_array::<SALT_SIZE>();
-    let mut base_kek = derive_base_kek(password, &salt)?;
-    let (kek_master, kek_mac) = derive_keks(&base_kek)?;
-    let kek_master = Zeroizing::new(kek_master);
-    let kek_mac = Zeroizing::new(kek_mac);
-    base_kek.zeroize();
-
-    let mut master_key = random_array::<KEY_SIZE>();
-    let mut mac_key = random_array::<KEY_SIZE>();
-    let wrapped_master_key = wrap_key(&kek_master, &master_key)?;
-    let wrapped_mac_key = wrap_key(&kek_mac, &mac_key)?;
+    let (salt, wrapped_master_key, wrapped_mac_key, mut master_key, mut mac_key, flags) =
+        if plaintext {
+            (
+                [0u8; SALT_SIZE],
+                [0u8; WRAPPED_KEY_SIZE],
+                [0u8; WRAPPED_KEY_SIZE],
+                [0u8; KEY_SIZE],
+                aerozip_mac_key()?,
+                FLAG_PLAINTEXT_CONTENT,
+            )
+        } else {
+            if password.len() < MIN_PASSWORD_LEN {
+                return Err("Password must be at least 8 characters".to_string());
+            }
+            let salt = random_array::<SALT_SIZE>();
+            let mut base_kek = derive_base_kek(password, &salt)?;
+            let (kek_master, kek_mac) = derive_keks(&base_kek)?;
+            let kek_master = Zeroizing::new(kek_master);
+            let kek_mac = Zeroizing::new(kek_mac);
+            base_kek.zeroize();
+            let master_key = random_array::<KEY_SIZE>();
+            let mac_key = random_array::<KEY_SIZE>();
+            let wrapped_master_key = wrap_key(&kek_master, &master_key)?;
+            let wrapped_mac_key = wrap_key(&kek_mac, &mac_key)?;
+            (
+                salt,
+                wrapped_master_key,
+                wrapped_mac_key,
+                master_key,
+                mac_key,
+                0u8,
+            )
+        };
 
     let header = VaultHeaderV3 {
-        flags: 0,
+        flags,
         salt,
         wrapped_master_key,
         wrapped_mac_key,
@@ -1615,7 +1721,11 @@ fn create_empty_vault(
         header_mac: [0u8; MAC_SIZE],
     };
 
-    let mut manifest = empty_manifest(level);
+    let mut manifest = if plaintext {
+        empty_manifest_plaintext(level)
+    } else {
+        empty_manifest(level)
+    };
     // Record the QR-style overhead level so every later seal / export uses the
     // same grid (#276). Only meaningful when Error Correction is enabled.
     if error_correction.is_some() {
@@ -1675,12 +1785,33 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
     file.read_exact(&mut header_bytes)
         .map_err(|e| format!("Read header: {e}"))?;
 
+    // Plaintext (`.aerozip`) lane: when the header parses and carries
+    // FLAG_PLAINTEXT_CONTENT, there is no password — verify the header MAC under
+    // the fixed PUBLIC integrity key and use an all-zero (public) master key for
+    // the deterministic chunk-id derivation. The manifest is read as plaintext
+    // below. EC header recovery stays on the encrypted path (the plaintext
+    // header is still EC-protected by region; recovery for it is a follow-up).
+    let plaintext_header = VaultHeaderV3::from_bytes(&header_bytes)
+        .ok()
+        .is_some_and(|h| h.flags & FLAG_PLAINTEXT_CONTENT != 0);
+
     // HEADER parity (rev. 4): the on-disk header is the happy path. If it fails
     // to parse or its MAC does not verify (bit-rot / bad sector), fall back to
     // rebuilding it from the detached sidecar's header parity. A missing sidecar
     // / no header parity / a rebuild that still does not unlock keeps the
     // original error. The MAC verify inside `open_header_bytes` is the proof.
-    let (header, mac_key, master_key, header_repaired_on_open) =
+    let (header, mac_key, master_key, header_repaired_on_open) = if plaintext_header {
+        let header = VaultHeaderV3::from_bytes(&header_bytes)?;
+        let mac_key = aerozip_mac_key()?;
+        header.verify_mac(&mac_key)?;
+        if header.wrapper_header_version != SUPPORTED_WRAPPER_HEADER_VERSION {
+            return Err(format!(
+                "Unsupported AeroVault v3 wrapper-header version: {} (expected {})",
+                header.wrapper_header_version, SUPPORTED_WRAPPER_HEADER_VERSION
+            ));
+        }
+        (header, mac_key, [0u8; KEY_SIZE], false)
+    } else {
         match open_header_bytes(&header_bytes, password) {
             Ok((h, mac, master)) => (h, mac, master, false),
             Err(orig) => {
@@ -1689,7 +1820,8 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
                     None => return Err(orig),
                 }
             }
-        };
+        }
+    };
 
     validate_ranges(&header, file_len)?;
 
@@ -1732,24 +1864,32 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
     // the detached sidecar's manifest parity (the only copy a pure-detached
     // vault keeps). A successful AEAD decrypt on the rebuilt bytes is the
     // correctness proof; otherwise keep the original error.
-    let (manifest, manifest_repaired_on_open) =
-        match decrypt_manifest(&master_key, &encrypted_manifest) {
-            Ok(m) => (m, false),
-            Err(orig) => {
-                let embedded =
-                    super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
-                let rebuilt = match embedded {
-                    Some(r) if r != encrypted_manifest => Some(r),
-                    _ => super::ec::reconstruct_manifest_from_sidecar(&path, &encrypted_manifest)?,
-                };
-                match rebuilt {
-                    Some(r) if r != encrypted_manifest => {
-                        (decrypt_manifest(&master_key, &r)?, true)
-                    }
-                    _ => return Err(orig),
-                }
+    // Decode the stored manifest blob: AEAD-decrypt on the encrypted lane, parse
+    // plaintext JSON on the `.aerozip` lane. Either way, on a parse/decrypt
+    // failure rebuild the blob from Error-Correction parity (embedded metadata
+    // extension first, then the detached sidecar) and retry — the manifest is
+    // EC-protected by region regardless of whether it is encrypted.
+    let decode_manifest = |blob: &[u8]| -> Result<VaultManifestV3, String> {
+        if plaintext_header {
+            parse_manifest_plaintext(blob)
+        } else {
+            decrypt_manifest(&master_key, blob)
+        }
+    };
+    let (manifest, manifest_repaired_on_open) = match decode_manifest(&encrypted_manifest) {
+        Ok(m) => (m, false),
+        Err(orig) => {
+            let embedded = super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
+            let rebuilt = match embedded {
+                Some(r) if r != encrypted_manifest => Some(r),
+                _ => super::ec::reconstruct_manifest_from_sidecar(&path, &encrypted_manifest)?,
+            };
+            match rebuilt {
+                Some(r) if r != encrypted_manifest => (decode_manifest(&r)?, true),
+                _ => return Err(orig),
             }
-        };
+        }
+    };
     if manifest.format != VERSION {
         return Err(format!(
             "Unsupported AeroVault manifest version: {}",
@@ -1757,6 +1897,13 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
         ));
     }
     validate_supported_wrappers(&manifest.wrappers)?;
+    // The header flag and the manifest `crypt` wrapper are two views of the same
+    // lane; reject a container whose header claims one lane and manifest the
+    // other (a forged/corrupt mismatch would otherwise decode under the wrong
+    // key path).
+    if plaintext_header != manifest_is_plaintext(&manifest) {
+        return Err("AeroVault v3 header/manifest encryption-lane mismatch".to_string());
+    }
     validate_manifest_paths(&manifest)?;
 
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
@@ -2325,6 +2472,134 @@ mod tests {
         std::fs::remove_file(&vp).ok();
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn plaintext_lane_round_trip_and_unencrypted_storage() {
+        // `.aerozip` (#7): no password, content + manifest stored unencrypted,
+        // still compressed (+ EC available). create_empty_vault + add + extract.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        assert!(VaultV3::is_vault_v3(&vp));
+
+        let src = scratch_dir();
+        // A small (packed) file and a large compressible file (per-file CDC path).
+        let small = src.join("note.txt");
+        std::fs::write(&small, b"plaintext archive note").unwrap();
+        let big = src.join("big.txt");
+        let big_payload = b"AeroZip plaintext compressible body. ".repeat(20_000);
+        std::fs::write(&big, &big_payload).unwrap();
+
+        // Opens without any password (auto-detected via the header flag).
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        assert!(vault.header.flags & FLAG_PLAINTEXT_CONTENT != 0);
+        assert!(manifest_is_plaintext(&vault.manifest));
+        VaultV3::add_files(
+            &mut vault,
+            &[
+                (small.clone(), "note.txt".to_string()),
+                (big.clone(), "big.txt".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(vault);
+
+        // Reopen and extract byte-identical.
+        let vault = VaultV3::open_plaintext(&vp).unwrap();
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("note.txt")).unwrap(),
+            b"plaintext archive note"
+        );
+        assert_eq!(std::fs::read(out.join("big.txt")).unwrap(), big_payload);
+
+        // The data section is genuinely unencrypted: the compressed body of the
+        // large file zstd-decodes straight off disk WITHOUT any key. We find the
+        // big file's first stored block and decompress it.
+        let raw = std::fs::read(&vp).unwrap();
+        let big_entry = vault
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path == "big.txt")
+            .unwrap();
+        let first_id = big_entry.chunks.first().unwrap();
+        let rec = vault.manifest.chunks.get(first_id).unwrap();
+        // `data_offset` is relative to the data section, which starts at
+        // DATA_OFFSET in the file; +8 skips the block length prefix.
+        let start = DATA_OFFSET as usize + rec.data_offset as usize + 8;
+        let block = &raw[start..start + rec.block_len as usize];
+        let decoded = zstd::stream::decode_all(block).unwrap();
+        assert!(
+            big_payload.starts_with(&decoded),
+            "plaintext-lane block must zstd-decode off disk with no key"
+        );
+
+        // A plaintext archive has no password to change.
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        assert!(VaultV3::change_password(&mut vault, "irrelevant-pw-123").is_err());
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn plaintext_lane_stored_raw_composition() {
+        // stored_raw (#10-B) composes with the plaintext lane: an incompressible
+        // chunk is stored BOTH raw AND unencrypted, and still round-trips.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let src = scratch_dir();
+        let noise = src.join("noise.bin");
+        let mut noise_payload = vec![0u8; PACK_SMALL_FILE_THRESHOLD + 400_000];
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for b in noise_payload.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        std::fs::write(&noise, &noise_payload).unwrap();
+
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        VaultV3::add_files(&mut vault, &[(noise.clone(), "noise.bin".to_string())]).unwrap();
+        assert!(
+            vault.manifest.chunks.values().any(|c| c.stored_raw),
+            "incompressible input should store raw chunks"
+        );
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("noise.bin")).unwrap(), noise_payload);
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "test-vectors")]
+    fn plaintext_empty_archive_is_deterministic() {
+        // The plaintext lane has zero randomness (no salt, no random keys, fixed
+        // public MAC key) and, under `test-vectors`, a fixed timestamp — so an
+        // empty `.aerozip` is byte-deterministic. Freeze its digest to catch any
+        // accidental layout drift in the plaintext header/manifest path.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let bytes = std::fs::read(&vp).unwrap();
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        let vp2 = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp2)).unwrap();
+        assert_eq!(
+            digest,
+            blake3::hash(&std::fs::read(&vp2).unwrap())
+                .to_hex()
+                .to_string(),
+            "empty plaintext archive must be byte-deterministic"
+        );
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&vp2).ok();
     }
 
     #[derive(Default)]

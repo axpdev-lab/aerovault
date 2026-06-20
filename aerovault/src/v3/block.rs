@@ -13,7 +13,10 @@ use super::constants::{
     ERROR_CORRECTION_EXTENSION_ID, ERROR_CORRECTION_META_EXTENSION_ID, HEADER_SIZE, MAC_SIZE,
 };
 use super::format::VaultHeaderV3;
-use super::manifest::{encrypt_manifest, ExtensionEntryV3, VaultManifestV3};
+use super::manifest::{
+    encrypt_manifest, manifest_is_plaintext, serialize_manifest_plaintext, ExtensionEntryV3,
+    VaultManifestV3,
+};
 use crate::aerocrypt::KEY_SIZE;
 use crate::error_correction::{
     compute_error_correction_shards_grid, manifest_error_correction_grid,
@@ -58,7 +61,16 @@ pub fn build_file_bytes(
     extension_payloads: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let encrypted_manifest = encrypt_manifest(master_key, manifest)?;
+    // The manifest blob is encrypted on the standard lane and stored as plaintext
+    // JSON on the `.aerozip` lane (#7). Either way it is the blob the header
+    // offsets address and Error Correction protects below; the variable name is
+    // historical. `manifest_is_plaintext` (the `crypt` wrapper) is the single
+    // source of truth, so this matches the header's FLAG_PLAINTEXT_CONTENT.
+    let encrypted_manifest = if manifest_is_plaintext(manifest) {
+        serialize_manifest_plaintext(manifest)?
+    } else {
+        encrypt_manifest(master_key, manifest)?
+    };
 
     // GAP-4 (rev. 4): when Error Correction is enabled (the data-block parity
     // extension is present), also protect the locator. The per-block cipher_hash
