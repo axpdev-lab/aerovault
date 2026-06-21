@@ -10,7 +10,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha512;
 
 use super::constants::{
-    AEROZIP_MAC_IKM, HEADER_MAC_OFFSET, HEADER_SIZE, HKDF_AEROZIP_MAC, HKDF_MAC, HKDF_MASTER,
+    AEROVZ_MAC_IKM, HEADER_MAC_OFFSET, HEADER_SIZE, HKDF_AEROVZ_MAC, HKDF_MAC, HKDF_MASTER,
     MAC_SIZE, MAGIC, VERSION,
 };
 use crate::aerocrypt::{hkdf_expand, KEY_SIZE, SALT_SIZE, WRAPPED_KEY_SIZE};
@@ -134,12 +134,12 @@ impl VaultHeaderV3 {
     }
 }
 
-/// The fixed PUBLIC header-integrity MAC key for the plaintext (`.aerozip`)
+/// The fixed PUBLIC header-integrity MAC key for the plaintext (`.aerovz`)
 /// lane. There is no password, so the header HMAC is keyed by this deterministic
 /// public key: it makes the header tamper-evident (and lets the standard
 /// `verify_mac` path run unchanged) without implying any confidentiality.
-pub fn aerozip_mac_key() -> Result<[u8; KEY_SIZE], String> {
-    hkdf_expand::<KEY_SIZE>(AEROZIP_MAC_IKM, HKDF_AEROZIP_MAC)
+pub fn aerovz_mac_key() -> Result<[u8; KEY_SIZE], String> {
+    hkdf_expand::<KEY_SIZE>(AEROVZ_MAC_IKM, HKDF_AEROVZ_MAC)
 }
 
 /// Derive `(master KEK, MAC KEK)` from the Argon2id base KEK via HKDF-SHA256.

@@ -99,7 +99,7 @@ pub fn write_container<W: Write>(
     data: &[u8],
 ) -> Result<(), String> {
     // The manifest blob is encrypted on the standard lane and stored as plaintext
-    // JSON on the `.aerozip` lane (#7). Either way it is the blob the header
+    // JSON on the `.aerovz` lane (#7). Either way it is the blob the header
     // offsets address and Error Correction protects below; the variable name is
     // historical. `manifest_is_plaintext` (the `crypt` wrapper) is the single
     // source of truth, so this matches the header's FLAG_PLAINTEXT_CONTENT.

@@ -1022,11 +1022,11 @@ mod tests {
 
     #[test]
     fn plaintext_lane_embedded_ec_scrub_repair_over_plaintext() {
-        // `.aerozip` (#7) + Error Correction: parity is computed over the
+        // `.aerovz` (#7) + Error Correction: parity is computed over the
         // PLAINTEXT (compressed, unencrypted) data region. Corrupt it, scrub must
         // detect, repair from the embedded extension restores byte-identical.
-        let vp = tmp("aerozip-embedded.aerozip");
-        let src = tmp("aerozip-embedded-src");
+        let vp = tmp("aerovz-embedded.aerovz");
+        let src = tmp("aerovz-embedded-src");
         std::fs::create_dir_all(&src).unwrap();
 
         VaultV3::create_with_error_correction(
@@ -1042,7 +1042,7 @@ mod tests {
         seed_tree(&mut vault, &src);
         drop(vault);
 
-        let good_out = tmp("aerozip-embedded-good");
+        let good_out = tmp("aerovz-embedded-good");
         VaultV3::extract_all(&VaultV3::open_plaintext(&vp).unwrap(), &good_out).unwrap();
 
         corrupt_data_section(&vp, 600);
@@ -1058,7 +1058,7 @@ mod tests {
 
         let vault = VaultV3::open_plaintext(&vp).unwrap();
         assert!(VaultV3::scrub(&vault).is_empty());
-        let after_out = tmp("aerozip-embedded-after");
+        let after_out = tmp("aerovz-embedded-after");
         VaultV3::extract_all(&vault, &after_out).unwrap();
         assert_eq!(
             std::fs::read(after_out.join("big.bin")).unwrap(),

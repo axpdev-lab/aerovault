@@ -113,7 +113,7 @@ pub fn default_wrappers(level: i32) -> WrapperManifest {
     default_wrappers_for_crypt(level, CRYPT_ALGORITHM_ENCRYPTED)
 }
 
-/// The default wrapper stack for the plaintext (`.aerozip`) lane: identical to
+/// The default wrapper stack for the plaintext (`.aerovz`) lane: identical to
 /// the encrypted stack except the `crypt` wrapper records `none` — content
 /// blocks and the manifest are stored unencrypted (#7).
 pub fn default_wrappers_plaintext(level: i32) -> WrapperManifest {
@@ -161,7 +161,7 @@ fn default_wrappers_for_crypt(level: i32, crypt_id: &str) -> WrapperManifest {
     }
 }
 
-/// `true` when this manifest describes the plaintext (`.aerozip`) lane: the
+/// `true` when this manifest describes the plaintext (`.aerovz`) lane: the
 /// single source of truth for whether content blocks and the manifest itself
 /// are stored unencrypted. Mirrored cheaply by [`FLAG_PLAINTEXT_CONTENT`] in the
 /// header so the open path can branch before it can read the manifest.
@@ -173,7 +173,7 @@ pub fn empty_manifest(level: i32) -> VaultManifestV3 {
     empty_manifest_with_wrappers(level, default_wrappers(level))
 }
 
-/// An empty manifest for the plaintext (`.aerozip`) lane.
+/// An empty manifest for the plaintext (`.aerovz`) lane.
 pub fn empty_manifest_plaintext(level: i32) -> VaultManifestV3 {
     empty_manifest_with_wrappers(level, default_wrappers_plaintext(level))
 }
@@ -233,14 +233,14 @@ pub fn decrypt_manifest(key: &[u8; KEY_SIZE], encrypted: &[u8]) -> Result<VaultM
     serde_json::from_slice(&json).map_err(|e| format!("Manifest parse: {e}"))
 }
 
-/// Serialize the manifest as plaintext JSON for the `.aerozip` lane (no AEAD).
+/// Serialize the manifest as plaintext JSON for the `.aerovz` lane (no AEAD).
 /// The stored bytes are the manifest blob the header offsets address and that
 /// Error Correction protects, exactly like the encrypted blob but unencrypted.
 pub fn serialize_manifest_plaintext(manifest: &VaultManifestV3) -> Result<Vec<u8>, String> {
     serde_json::to_vec(manifest).map_err(|e| format!("Manifest serialize: {e}"))
 }
 
-/// Parse a plaintext (`.aerozip`) manifest blob.
+/// Parse a plaintext (`.aerovz`) manifest blob.
 pub fn parse_manifest_plaintext(bytes: &[u8]) -> Result<VaultManifestV3, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("Manifest parse: {e}"))
 }
