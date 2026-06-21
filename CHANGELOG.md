@@ -2,6 +2,27 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.3] - 2026-06-21
+
+No on-disk format change for encrypted `.aerovault` containers or `.aerocorrect` sidecars: existing containers round-trip identically and the cross-impl goldens still pin byte-for-byte.
+
+### Added
+
+- **Streaming vault I/O (`#4`).** True streaming seal and extract: content is chunked, compressed, error-corrected, and written without materializing the whole payload in memory, so large vaults are bounded by chunk size rather than file size.
+- **Plaintext lane (`#7`), unencrypted.** A compressed + error-corrected container with no encryption and no password (header HMAC keyed by a fixed public integrity key): integrity and recovery, not confidentiality. Library-only in this release; not surfaced as a user-facing extension/name yet (the public name is still being decided).
+- **Progress callbacks (`#5`).** Optional progress reporting for `extract` and for error-correction `generate`/`verify`/`repair`.
+- **Per-shard health readout (`#9`).** Standalone error-correction `verify` reports per-shard health, not just a single pass/fail.
+
+### Changed
+
+- **Incompressible chunks are stored raw (`#10-B`).** A chunk that does not benefit from zstd is stored uncompressed, skipping a wasted compression pass on already-compressed data.
+- **CDC bounds decoupled from the zstd level.** Content-defined chunking bounds no longer scale with the compression level, so the chunk layout is stable across profiles.
+- **Plaintext lane renamed `aerozip` -> `aerovz`.** The earlier working name collided with a shipped product, so it was dropped before the lane was ever published. The change includes the HKDF domain-separation strings (`AEROVZ_MAC_IKM`, `HKDF_AEROVZ_MAC`, `aerovz_mac_key`); the derived public MAC key changes, but the lane shipped in no prior release so nothing depends on the old value.
+
+### Fixed
+
+- **Incompressibility probe now samples across the chunk.** The probe decided compressibility from a single window, so a chunk that was incompressible only in places (e.g. a 16 MiB chunk over mixed data) could waste several MB by storing a partially-compressible payload as raw. The probe now samples head/mid/tail before deciding, recovering the lost ratio. Encode-side only; decode is unchanged.
+
 ## [0.6.2] - 2026-06-18
 
 ### Security (audit 2026-06-18 remediation)
