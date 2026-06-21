@@ -13,6 +13,7 @@
 
 // SPDX-License-Identifier: GPL-3.0-only
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -24,9 +25,10 @@ use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds, StreamingChu
 use super::constants::{
     CDC_MAX, CRYPT_ALGORITHM_ENCRYPTED, CRYPT_ALGORITHM_NONE, DATA_OFFSET, DEFAULT_ZSTD_LEVEL,
     FLAG_PLAINTEXT_CONTENT, HEADER_SIZE, HKDF_CHUNK_ID, INCOMPRESSIBLE_PROBE_LEVEL,
-    INCOMPRESSIBLE_PROBE_SAMPLE, INCOMPRESSIBLE_RATIO_PCT, MAC_SIZE, MAGIC, MAX_BLOCK_SIZE,
-    MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE, MAX_PLAINTEXT_BLOCK_SIZE, MIN_PASSWORD_LEN,
-    PACK_SMALL_FILE_THRESHOLD, PACK_TARGET, SUPPORTED_WRAPPER_HEADER_VERSION, VERSION,
+    INCOMPRESSIBLE_PROBE_MAX_SAMPLE, INCOMPRESSIBLE_PROBE_SAMPLE, INCOMPRESSIBLE_RATIO_PCT,
+    MAC_SIZE, MAGIC, MAX_BLOCK_SIZE, MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE,
+    MAX_PLAINTEXT_BLOCK_SIZE, MIN_PASSWORD_LEN, PACK_SMALL_FILE_THRESHOLD, PACK_TARGET,
+    SUPPORTED_WRAPPER_HEADER_VERSION, VERSION,
 };
 use super::format::{aerozip_mac_key, derive_keks, VaultHeaderV3};
 use super::manifest::{
@@ -811,20 +813,42 @@ fn ensure_parent_directories(manifest: &mut VaultManifestV3, path: &str) -> Resu
     Ok(())
 }
 
-/// Cheap incompressibility probe (#10-B): trial-compress only the chunk prefix
-/// at a fast level and report whether it failed to shrink past the threshold.
+/// Cheap incompressibility probe (#10-B): trial-compress representative chunk
+/// samples at a fast level and report whether they failed to shrink past the threshold.
 /// `true` => store the chunk raw and skip the full, possibly expensive, pass.
 /// A probe error is non-fatal: fall back to the normal compression path.
 fn probe_incompressible(chunk: &[u8]) -> bool {
     if chunk.is_empty() {
         return false;
     }
-    let sample = &chunk[..chunk.len().min(INCOMPRESSIBLE_PROBE_SAMPLE)];
-    match zstd::stream::encode_all(sample, INCOMPRESSIBLE_PROBE_LEVEL) {
+    let sample = representative_probe_sample(chunk);
+    match zstd::stream::encode_all(sample.as_ref(), INCOMPRESSIBLE_PROBE_LEVEL) {
         // Incompressible when the probe output is >= RATIO% of the sample.
         Ok(probed) => probed.len() as u64 * 100 >= sample.len() as u64 * INCOMPRESSIBLE_RATIO_PCT,
         Err(_) => false,
     }
+}
+
+fn representative_probe_sample(chunk: &[u8]) -> Cow<'_, [u8]> {
+    if chunk.len() <= INCOMPRESSIBLE_PROBE_MAX_SAMPLE {
+        return Cow::Borrowed(chunk);
+    }
+
+    let window_len = INCOMPRESSIBLE_PROBE_SAMPLE.min(chunk.len());
+    let window_count = (INCOMPRESSIBLE_PROBE_MAX_SAMPLE / window_len).max(1);
+    let mut sample = Vec::with_capacity(window_count * window_len);
+    let max_start = chunk.len() - window_len;
+
+    for idx in 0..window_count {
+        let start = if window_count == 1 {
+            0
+        } else {
+            idx * max_start / (window_count - 1)
+        };
+        sample.extend_from_slice(&chunk[start..start + window_len]);
+    }
+
+    Cow::Owned(sample)
 }
 
 /// Compress + encrypt + dedup one already-delimited plaintext chunk; returns the
@@ -2640,6 +2664,38 @@ mod tests {
 
         // Empty input is never "incompressible".
         assert!(!probe_incompressible(&[]));
+    }
+
+    #[test]
+    fn probe_does_not_let_noisy_prefix_hide_large_compressible_chunk() {
+        let mut chunk = b"AeroVault representative probe body. ".repeat(80_000);
+        let mut x = 0x9e3779b97f4a7c15u64;
+        for b in chunk[..INCOMPRESSIBLE_PROBE_SAMPLE].iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+
+        assert!(chunk.len() > INCOMPRESSIBLE_PROBE_MAX_SAMPLE);
+        assert!(
+            !probe_incompressible(&chunk),
+            "a noisy prefix must not force a large compressible chunk to raw"
+        );
+    }
+
+    #[test]
+    fn probe_still_stores_large_high_entropy_chunks_raw() {
+        let mut noise = vec![0u8; INCOMPRESSIBLE_PROBE_MAX_SAMPLE * 2];
+        let mut x = 0x6a09e667f3bcc909u64;
+        for b in noise.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+
+        assert!(probe_incompressible(&noise));
     }
 
     #[test]

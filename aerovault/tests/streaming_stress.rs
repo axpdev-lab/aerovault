@@ -17,6 +17,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use aerovault::v3::{CreateOptionsV3, VaultV3};
 
@@ -69,6 +70,11 @@ unsafe impl GlobalAlloc for Tracking {
 
 #[global_allocator]
 static ALLOC: Tracking = Tracking;
+static STRESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn stress_test_guard() -> MutexGuard<'static, ()> {
+    STRESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Reset the peak watermark down to the currently-live bytes, so the next
 /// `peak_since()` reports only what the measured section allocated on top.
@@ -147,6 +153,8 @@ fn write_incompressible(path: &Path, len: usize, mut x: u64) {
 /// `out` buffer. Each pre-T5 path would have blown its bound.
 #[test]
 fn streaming_incompressible_seal_and_extract_not_doubled() {
+    let _guard = stress_test_guard();
+
     const FILE: usize = 64 * MIB;
     const PW: &str = "seal-password-123";
 
@@ -256,6 +264,8 @@ fn streaming_incompressible_seal_and_extract_not_doubled() {
 /// (streaming seal), not a T5 regression. Hence the compressible fixture.
 #[test]
 fn streaming_ingest_extract_is_memory_bounded() {
+    let _guard = stress_test_guard();
+
     // 96 MiB of zeros; pre-T5 ingest (`fs::read`) and extract (`out` Vec) would
     // each push peak past ~96 MiB. The streaming paths stay an order of
     // magnitude below. 32 MiB bound leaves wide margin on both sides.
@@ -359,6 +369,8 @@ fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
 /// 0xFF (also compressible), and incompressible random (stored-raw lane).
 #[test]
 fn streaming_extreme_size_and_pattern_matrix() {
+    let _guard = stress_test_guard();
+
     const PW: &str = "matrix-password-123";
     const MIN: usize = 256 * 1024;
     const MAX: usize = 4 * 1024 * 1024;
@@ -439,6 +451,8 @@ fn streaming_extreme_size_and_pattern_matrix() {
 /// streaming tail handling).
 #[test]
 fn streaming_exact_max_multiple_boundaries() {
+    let _guard = stress_test_guard();
+
     const PW: &str = "exact-password-123";
     const MAX: usize = 4 * 1024 * 1024;
     let dir = unique_dir("exact");

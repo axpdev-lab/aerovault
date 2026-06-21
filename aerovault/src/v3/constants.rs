@@ -56,10 +56,15 @@ pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 /// The only wrapper-header layout this build understands.
 pub const SUPPORTED_WRAPPER_HEADER_VERSION: u16 = 1;
 
-/// Incompressible-skip probe (#10-B): bytes of the chunk prefix that are
-/// trial-compressed at a fast level to decide whether the full, possibly
+/// Incompressible-skip probe (#10-B): size of each representative window that
+/// is trial-compressed at a fast level to decide whether the full, possibly
 /// expensive, zstd pass is worth running.
 pub const INCOMPRESSIBLE_PROBE_SAMPLE: usize = 64 * 1024;
+/// Maximum bytes sampled by the incompressibility probe. Chunks at or below
+/// this size are probed as a whole; larger chunks are sampled with windows
+/// spread across the chunk so a noisy prefix cannot force a compressible block
+/// to be stored raw.
+pub const INCOMPRESSIBLE_PROBE_MAX_SAMPLE: usize = 1024 * 1024;
 /// zstd level used for the cheap probe (fast, just enough signal).
 pub const INCOMPRESSIBLE_PROBE_LEVEL: i32 = 3;
 /// A chunk is treated as incompressible when the probe leaves the sample at or
