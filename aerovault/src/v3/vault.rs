@@ -69,6 +69,9 @@ pub struct CreateOptionsV3 {
     pub password: String,
     /// zstd compression level recorded on the `compression` wrapper.
     pub zstd_level: i32,
+    /// Optional explicit CDC bounds. When absent, the historical level-driven
+    /// defaults are used (`level >= 19` selects the archive profile).
+    pub cdc_bounds: Option<CdcBounds>,
     /// Cryptographic lane. [`VaultLane::Encrypted`] by default.
     pub lane: VaultLane,
     /// rev. 4 Error-Correction placement. `None` keeps the container plain rev. 3.
@@ -86,6 +89,7 @@ impl CreateOptionsV3 {
             path: path.into(),
             password: password.into(),
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            cdc_bounds: None,
             lane: VaultLane::Encrypted,
             error_correction: None,
             error_correction_pct: crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
@@ -100,6 +104,7 @@ impl CreateOptionsV3 {
             path: path.into(),
             password: String::new(),
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            cdc_bounds: None,
             lane: VaultLane::Plaintext,
             error_correction: None,
             error_correction_pct: crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
@@ -109,6 +114,13 @@ impl CreateOptionsV3 {
     /// Override the zstd compression level.
     pub fn with_zstd_level(mut self, level: i32) -> Self {
         self.zstd_level = level;
+        self
+    }
+
+    /// Override content-defined chunking bounds independently from the zstd
+    /// level, so high compression levels can keep fine-grained deduplication.
+    pub fn with_cdc_bounds(mut self, bounds: CdcBounds) -> Self {
+        self.cdc_bounds = Some(bounds);
         self
     }
 }
@@ -263,6 +275,7 @@ impl VaultV3 {
             &opts.path,
             &opts.password,
             opts.zstd_level,
+            opts.cdc_bounds,
             opts.lane,
             opts.error_correction,
             opts.error_correction_pct,
@@ -287,6 +300,7 @@ impl VaultV3 {
             &opts.path,
             &opts.password,
             opts.zstd_level,
+            opts.cdc_bounds,
             opts.lane,
             Some(placement),
             pct,
@@ -1747,6 +1761,7 @@ fn create_empty_vault(
     path: &Path,
     password: &str,
     level: i32,
+    cdc_bounds: Option<CdcBounds>,
     lane: VaultLane,
     error_correction: Option<super::ec::RecoveryPlacement>,
     error_correction_pct: u32,
@@ -1813,6 +1828,10 @@ fn create_empty_vault(
     } else {
         empty_manifest(level)
     };
+    if let Some(bounds) = cdc_bounds {
+        bounds.validate()?;
+        manifest.wrappers.chunking.bounds = Some(bounds);
+    }
     // Record the QR-style overhead level so every later seal / export uses the
     // same grid (#276). Only meaningful when Error Correction is enabled.
     if error_correction.is_some() {
@@ -2828,6 +2847,25 @@ mod tests {
         std::fs::remove_file(&vp).ok();
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn create_options_decouple_zstd_level_from_cdc_bounds() {
+        let vp = vault_path();
+        let opts = CreateOptionsV3::new_plaintext(&vp)
+            .with_zstd_level(19)
+            .with_cdc_bounds(CdcBounds::defaults());
+        VaultV3::create(&opts).unwrap();
+
+        let vault = VaultV3::open_plaintext(&vp).unwrap();
+        let bounds = manifest_cdc_bounds(&vault.manifest).unwrap();
+        let defaults = CdcBounds::defaults();
+        assert_eq!(manifest_zstd_level(&vault.manifest), 19);
+        assert_eq!(bounds.min, defaults.min);
+        assert_eq!(bounds.avg, defaults.avg);
+        assert_eq!(bounds.max, defaults.max);
+
+        std::fs::remove_file(&vp).ok();
     }
 
     #[test]
