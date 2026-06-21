@@ -9,7 +9,7 @@ No on-disk format change for encrypted `.aerovault` containers or `.aerocorrect`
 ### Added
 
 - **Streaming vault I/O (`#4`).** True streaming seal and extract: content is chunked, compressed, error-corrected, and written without materializing the whole payload in memory, so large vaults are bounded by chunk size rather than file size.
-- **Plaintext lane (`#7`), unencrypted.** A compressed + error-corrected container with no encryption and no password (header HMAC keyed by a fixed public integrity key): integrity and recovery, not confidentiality. Library-only in this release; not surfaced as a user-facing extension/name yet (the public name is still being decided).
+- **Plaintext lane (`#7`), unencrypted.** A compressed + error-corrected container with no encryption and no password (header HMAC keyed by a fixed public integrity key): integrity and recovery, not confidentiality. The public format name is **`.aerozip`** (see discussion #7); internally the lane carries a neutral codename. Library-only in this release (surfaced to users in a later release).
 - **Progress callbacks (`#5`).** Optional progress reporting for `extract` and for error-correction `generate`/`verify`/`repair`.
 - **Per-shard health readout (`#9`).** Standalone error-correction `verify` reports per-shard health, not just a single pass/fail.
 
@@ -17,7 +17,7 @@ No on-disk format change for encrypted `.aerovault` containers or `.aerocorrect`
 
 - **Incompressible chunks are stored raw (`#10-B`).** A chunk that does not benefit from zstd is stored uncompressed, skipping a wasted compression pass on already-compressed data.
 - **CDC bounds decoupled from the zstd level.** Content-defined chunking bounds no longer scale with the compression level, so the chunk layout is stable across profiles.
-- **Plaintext lane renamed `aerozip` -> `aerovz`.** The earlier working name collided with a shipped product, so it was dropped before the lane was ever published. The change includes the HKDF domain-separation strings (`AEROVZ_MAC_IKM`, `HKDF_AEROVZ_MAC`, `aerovz_mac_key`); the derived public MAC key changes, but the lane shipped in no prior release so nothing depends on the old value.
+- **Plaintext lane uses a neutral internal codename.** The public format name is `.aerozip` (discussion #7); the in-format HKDF domain-separation strings (`AEROVZ_MAC_IKM`, `HKDF_AEROVZ_MAC`, `aerovz_mac_key`) deliberately use a neutral codename (`aerovz`, for AeroVault-Z) so the wire format never carries a public name that might later change. The lane shipped in no prior release, so this is invisible to any existing container.
 
 ### Fixed
 
