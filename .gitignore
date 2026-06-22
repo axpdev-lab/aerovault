@@ -2,3 +2,7 @@
 Cargo.lock
 *.aerovault
 /CLAUDE.md
+
+# benchmark corpus (large, not part of the crate)
+/silesia.zip
+/silesia/

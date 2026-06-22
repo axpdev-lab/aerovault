@@ -13,41 +13,67 @@
 
 // SPDX-License-Identifier: GPL-3.0-only
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use zeroize::{Zeroize, Zeroizing};
 
-use super::block::build_file_bytes;
-use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds};
+use super::block::{build_file_bytes, write_container};
+use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds, StreamingChunker};
 use super::constants::{
-    CDC_MAX, DATA_OFFSET, DEFAULT_ZSTD_LEVEL, HEADER_SIZE, HKDF_CHUNK_ID, MAC_SIZE, MAGIC,
-    MAX_BLOCK_SIZE, MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE, MAX_PLAINTEXT_BLOCK_SIZE,
-    MIN_PASSWORD_LEN, PACK_SMALL_FILE_THRESHOLD, PACK_TARGET, SUPPORTED_WRAPPER_HEADER_VERSION,
-    VERSION,
+    CDC_MAX, CRYPT_ALGORITHM_ENCRYPTED, CRYPT_ALGORITHM_NONE, DATA_OFFSET, DEFAULT_ZSTD_LEVEL,
+    FLAG_PLAINTEXT_CONTENT, HEADER_SIZE, HKDF_CHUNK_ID, INCOMPRESSIBLE_PROBE_LEVEL,
+    INCOMPRESSIBLE_PROBE_MAX_SAMPLE, INCOMPRESSIBLE_PROBE_SAMPLE, INCOMPRESSIBLE_RATIO_PCT,
+    MAC_SIZE, MAGIC, MAX_BLOCK_SIZE, MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE,
+    MAX_PLAINTEXT_BLOCK_SIZE, MIN_PASSWORD_LEN, PACK_SMALL_FILE_THRESHOLD, PACK_TARGET,
+    SUPPORTED_WRAPPER_HEADER_VERSION, VERSION,
 };
-use super::format::{derive_keks, VaultHeaderV3};
+use super::format::{aerovz_mac_key, derive_keks, VaultHeaderV3};
 use super::manifest::{
-    block_aad, decrypt_manifest, empty_manifest, manifest_cdc_bounds, manifest_zstd_level,
-    next_block_index, now_iso, AlgorithmSpec, ChunkRecordV3, ExtensionEntryV3, ManifestEntryV3,
+    block_aad, decrypt_manifest, empty_manifest, empty_manifest_plaintext, manifest_cdc_bounds,
+    manifest_is_plaintext, manifest_zstd_level, next_block_index, now_iso,
+    parse_manifest_plaintext, AlgorithmSpec, ChunkRecordV3, ExtensionEntryV3, ManifestEntryV3,
     VaultManifestV3, WrapperManifest,
 };
 use crate::aerocrypt::{
     decrypt_with_aad, derive_base_kek, encrypt_with_aad, hkdf_expand, random_array, unwrap_key,
-    wrap_key, KEY_SIZE, SALT_SIZE,
+    wrap_key, KEY_SIZE, SALT_SIZE, WRAPPED_KEY_SIZE,
 };
+
+/// Which cryptographic lane a container uses.
+///
+/// The encrypted lane is the standard password-protected `.aerovault`. The
+/// plaintext lane is the unencrypted `.aerovz` archive (#7): the same
+/// pack/chunk/compress/Error-Correction pipeline minus the encrypt stage —
+/// content blocks and the manifest are stored in the clear, there is no
+/// password, and the header carries an integrity-only public MAC. It is
+/// integrity + recovery, NOT confidentiality; the data is readable by anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultLane {
+    /// Password-protected, AES-256-GCM-SIV content + encrypted manifest.
+    Encrypted,
+    /// Unencrypted `.aerovz`: compressed + EC, no encryption, no password.
+    Plaintext,
+}
 
 /// Options for creating an AEROVAULT3 container. Without an Error-Correction
 /// placement this produces a plain rev. 3 container; setting one (see
 /// [`VaultV3::create_with_error_correction`]) opts into rev. 4.
 pub struct CreateOptionsV3 {
-    /// Destination path for the `.aerovault` container.
+    /// Destination path for the `.aerovault` / `.aerovz` container.
     pub path: PathBuf,
-    /// Master password (>= [`MIN_PASSWORD_LEN`] characters).
+    /// Master password (>= [`MIN_PASSWORD_LEN`] characters). Ignored — and may be
+    /// empty — when `lane` is [`VaultLane::Plaintext`].
     pub password: String,
     /// zstd compression level recorded on the `compression` wrapper.
     pub zstd_level: i32,
+    /// Optional explicit CDC bounds. When absent, the historical level-driven
+    /// defaults are used (`level >= 19` selects the archive profile).
+    pub cdc_bounds: Option<CdcBounds>,
+    /// Cryptographic lane. [`VaultLane::Encrypted`] by default.
+    pub lane: VaultLane,
     /// rev. 4 Error-Correction placement. `None` keeps the container plain rev. 3.
     pub(super) error_correction: Option<super::ec::RecoveryPlacement>,
     /// QR-style EC overhead percentage; only meaningful when
@@ -56,12 +82,30 @@ pub struct CreateOptionsV3 {
 }
 
 impl CreateOptionsV3 {
-    /// New options with the default ([`DEFAULT_ZSTD_LEVEL`]) compression level.
+    /// New encrypted-lane options with the default ([`DEFAULT_ZSTD_LEVEL`])
+    /// compression level.
     pub fn new(path: impl Into<PathBuf>, password: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             password: password.into(),
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            cdc_bounds: None,
+            lane: VaultLane::Encrypted,
+            error_correction: None,
+            error_correction_pct: crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
+        }
+    }
+
+    /// New plaintext-lane (`.aerovz`) options: no password, content + manifest
+    /// stored unencrypted. Compression and (optional) Error Correction still
+    /// apply. See [`VaultLane::Plaintext`] for the security caveat.
+    pub fn new_plaintext(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            password: String::new(),
+            zstd_level: DEFAULT_ZSTD_LEVEL,
+            cdc_bounds: None,
+            lane: VaultLane::Plaintext,
             error_correction: None,
             error_correction_pct: crate::error_correction::ERROR_CORRECTION_DEFAULT_PCT,
         }
@@ -70,6 +114,13 @@ impl CreateOptionsV3 {
     /// Override the zstd compression level.
     pub fn with_zstd_level(mut self, level: i32) -> Self {
         self.zstd_level = level;
+        self
+    }
+
+    /// Override content-defined chunking bounds independently from the zstd
+    /// level, so high compression levels can keep fine-grained deduplication.
+    pub fn with_cdc_bounds(mut self, bounds: CdcBounds) -> Self {
+        self.cdc_bounds = Some(bounds);
         self
     }
 }
@@ -224,6 +275,8 @@ impl VaultV3 {
             &opts.path,
             &opts.password,
             opts.zstd_level,
+            opts.cdc_bounds,
+            opts.lane,
             opts.error_correction,
             opts.error_correction_pct,
         )
@@ -247,6 +300,8 @@ impl VaultV3 {
             &opts.path,
             &opts.password,
             opts.zstd_level,
+            opts.cdc_bounds,
+            opts.lane,
             Some(placement),
             pct,
         )
@@ -329,9 +384,20 @@ impl VaultV3 {
         &buf[..10] == MAGIC && buf[10] == VERSION
     }
 
-    /// Open and unlock a container with `password`.
+    /// Open and unlock a container with `password`. A plaintext (`.aerovz`)
+    /// container is opened regardless of `password` (it has none); pass `""`.
     pub fn open(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
         open_vault(path, password)
+    }
+
+    /// Open a plaintext (`.aerovz`) container — convenience for `open(path, "")`.
+    /// Errors if the container is an encrypted `.aerovault`.
+    pub fn open_plaintext(path: impl Into<PathBuf>) -> Result<OpenVaultV3, String> {
+        let vault = open_vault(path, "")?;
+        if vault.header.flags & FLAG_PLAINTEXT_CONTENT == 0 {
+            return Err("Not a plaintext .aerovz archive (it is encrypted)".to_string());
+        }
+        Ok(vault)
     }
 
     /// Read header-only info without a password.
@@ -509,6 +575,18 @@ impl VaultV3 {
     /// Extract the entire vault tree under `dest`, returning files written.
     pub fn extract_all(vault: &OpenVaultV3, dest: &Path) -> Result<u64, String> {
         extract_all_entries(vault, dest)
+    }
+
+    /// `extract_all` with a `(bytes_done, bytes_total)` progress callback invoked
+    /// after each file is written (#5: progress for extract, GUI + CLI). The
+    /// embedder turns this into a live bar; `extract_all` is the no-op-callback
+    /// shorthand.
+    pub fn extract_all_with_progress(
+        vault: &OpenVaultV3,
+        dest: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<u64, String> {
+        extract_all_entries_with_progress(vault, dest, progress)
     }
 }
 
@@ -749,8 +827,49 @@ fn ensure_parent_directories(manifest: &mut VaultManifestV3, path: &str) -> Resu
     Ok(())
 }
 
+/// Cheap incompressibility probe (#10-B): trial-compress representative chunk
+/// samples at a fast level and report whether they failed to shrink past the threshold.
+/// `true` => store the chunk raw and skip the full, possibly expensive, pass.
+/// A probe error is non-fatal: fall back to the normal compression path.
+fn probe_incompressible(chunk: &[u8]) -> bool {
+    if chunk.is_empty() {
+        return false;
+    }
+    let sample = representative_probe_sample(chunk);
+    match zstd::stream::encode_all(sample.as_ref(), INCOMPRESSIBLE_PROBE_LEVEL) {
+        // Incompressible when the probe output is >= RATIO% of the sample.
+        Ok(probed) => probed.len() as u64 * 100 >= sample.len() as u64 * INCOMPRESSIBLE_RATIO_PCT,
+        Err(_) => false,
+    }
+}
+
+fn representative_probe_sample(chunk: &[u8]) -> Cow<'_, [u8]> {
+    if chunk.len() <= INCOMPRESSIBLE_PROBE_MAX_SAMPLE {
+        return Cow::Borrowed(chunk);
+    }
+
+    let window_len = INCOMPRESSIBLE_PROBE_SAMPLE.min(chunk.len());
+    let window_count = (INCOMPRESSIBLE_PROBE_MAX_SAMPLE / window_len).max(1);
+    let mut sample = Vec::with_capacity(window_count * window_len);
+    let max_start = chunk.len() - window_len;
+
+    for idx in 0..window_count {
+        let start = if window_count == 1 {
+            0
+        } else {
+            idx * max_start / (window_count - 1)
+        };
+        sample.extend_from_slice(&chunk[start..start + window_len]);
+    }
+
+    Cow::Owned(sample)
+}
+
 /// Compress + encrypt + dedup one already-delimited plaintext chunk; returns the
-/// chunk id. Shared by the per-file and pack paths. (Telemetry dropped.)
+/// chunk id. Shared by the per-file and pack paths. Incompressible chunks are
+/// stored raw (still encrypted) so high zstd levels don't burn CPU re-packing
+/// already-compressed data; the manifest's `stored_raw` flag drives decode.
+/// (Telemetry dropped.)
 fn ingest_chunk(
     vault: &mut OpenVaultV3,
     chunk: &[u8],
@@ -759,22 +878,47 @@ fn ingest_chunk(
 ) -> Result<String, String> {
     let chunk_id = keyed_chunk_id(chunk_key, chunk);
     if !vault.manifest.chunks.contains_key(&chunk_id) {
-        let compressed = zstd::stream::encode_all(chunk, level)
-            .map_err(|e| format!("zstd compress failed: {e}"))?;
+        // Decide the stored representation: skip the full compress when the
+        // cheap probe says incompressible, and also fall back to raw if the
+        // full pass somehow failed to shrink the chunk (never store a block
+        // larger than the plaintext for zero gain).
+        let mut stored_raw = probe_incompressible(chunk);
+        let mut compressed = if stored_raw {
+            Vec::new()
+        } else {
+            let out = zstd::stream::encode_all(chunk, level)
+                .map_err(|e| format!("zstd compress failed: {e}"))?;
+            if out.len() >= chunk.len() {
+                stored_raw = true;
+                Vec::new()
+            } else {
+                out
+            }
+        };
+        let payload: &[u8] = if stored_raw { chunk } else { &compressed };
         let block_index = next_block_index(&vault.manifest);
         let aad = block_aad(block_index, &chunk_id);
-        let encrypted = encrypt_with_aad(&vault.master_key, &compressed, &aad)?;
+        // Plaintext (`.aerovz`) lane: store the compressed-or-raw payload
+        // directly, skipping AES-256-GCM-SIV. `cipher_hash` is taken over the
+        // stored bytes either way (ciphertext on the encrypted lane, the payload
+        // here), so the decode-side integrity check is unchanged.
+        let encrypted = if manifest_is_plaintext(&vault.manifest) {
+            payload.to_vec()
+        } else {
+            encrypt_with_aad(&vault.master_key, payload, &aad)?
+        };
+        let (pt, cz, enc) = (
+            chunk.len() as u64,
+            payload.len() as u64,
+            encrypted.len() as u64,
+        );
+        compressed.zeroize();
         let cipher_hash = blake3::hash(&encrypted).to_hex().to_string();
         let data_offset = vault.data.len() as u64;
         vault
             .data
             .extend_from_slice(&(encrypted.len() as u64).to_le_bytes());
         vault.data.extend_from_slice(&encrypted);
-        let (pt, cz, enc) = (
-            chunk.len() as u64,
-            compressed.len() as u64,
-            encrypted.len() as u64,
-        );
         vault.manifest.chunks.insert(
             chunk_id.clone(),
             ChunkRecordV3 {
@@ -785,6 +929,7 @@ fn ingest_chunk(
                 plaintext_len: pt,
                 compressed_len: cz,
                 cipher_hash,
+                stored_raw,
             },
         );
         vault.emit(|s| s.on_chunk(true, pt, cz, enc));
@@ -817,20 +962,30 @@ fn append_file_at(vault: &mut OpenVaultV3, source: &Path, entry_path: &str) -> R
         }
     }
 
-    let mut plaintext =
-        std::fs::read(source).map_err(|e| format!("Read {}: {e}", source.display()))?;
-    let size = plaintext.len() as u64;
     let chunk_key = hkdf_expand::<KEY_SIZE>(&vault.master_key, HKDF_CHUNK_ID)?;
     let level = manifest_zstd_level(&vault.manifest);
     let bounds = manifest_cdc_bounds(&vault.manifest)?;
     let mut entry_chunks = Vec::new();
 
-    let ranges = chunk_ranges_with(&plaintext, &bounds);
-    for (start, end) in ranges {
-        let chunk_id = ingest_chunk(vault, &plaintext[start..end], &chunk_key, level)?;
+    // Stream the source through the bounded-buffer chunker so peak memory is one
+    // CDC window (`bounds.max` + a refill), not the whole file. The streamed
+    // boundaries are byte-identical to `chunk_ranges_with` over the same bytes
+    // (pinned by `streaming_chunker_matches_whole_buffer`), so chunk ids and the
+    // on-disk container are unchanged. `size` is accumulated from the streamed
+    // chunks, so it equals the bytes actually ingested (as `plaintext.len()` did).
+    let file =
+        std::fs::File::open(source).map_err(|e| format!("Read {}: {e}", source.display()))?;
+    let mut chunker = StreamingChunker::new(file, bounds);
+    let mut size = 0u64;
+    while let Some(mut chunk) = chunker
+        .next_chunk()
+        .map_err(|e| format!("Read {}: {e}", source.display()))?
+    {
+        size += chunk.len() as u64;
+        let chunk_id = ingest_chunk(vault, &chunk, &chunk_key, level)?;
+        chunk.zeroize();
         entry_chunks.push(chunk_id);
     }
-    plaintext.zeroize();
 
     vault.manifest.entries.push(ManifestEntryV3 {
         path: entry_path,
@@ -1192,6 +1347,9 @@ fn copy_entry_in_manifest(vault: &mut OpenVaultV3, from: &str, to: &str) -> Resu
 }
 
 fn change_password_in_place(vault: &mut OpenVaultV3, new_password: &str) -> Result<(), String> {
+    if vault.header.flags & FLAG_PLAINTEXT_CONTENT != 0 {
+        return Err("A plaintext .aerovz archive has no password to change".to_string());
+    }
     if new_password.len() < MIN_PASSWORD_LEN {
         return Err("Password must be at least 8 characters".to_string());
     }
@@ -1343,92 +1501,167 @@ fn extract_file_entry(
         .unwrap_or(CDC_MAX as u64)
         .min(MAX_PLAINTEXT_BLOCK_SIZE);
 
-    let mut out = Vec::with_capacity(end.min(32 * 1024 * 1024));
-    for chunk_id in &entry.chunks {
-        if out.len() >= end {
-            // Everything this entry slices is already decoded; ignore the rest
-            // (a hostile pack may list extra/duplicate chunks past this point).
-            break;
+    // Plaintext (`.aerovz`) lane: blocks are stored unencrypted, so the decode
+    // skips AES-256-GCM-SIV and treats the on-disk block bytes as the
+    // compressed-or-raw payload directly. Computed once for the whole entry.
+    let plaintext_lane = manifest_is_plaintext(&vault.manifest);
+
+    // Stream the entry to disk one block at a time: decode each chunk, write the
+    // portion that falls inside the requested slice [offset, end) straight to a
+    // temp file, and keep only the current decoded block in RAM. Peak memory is
+    // one block (bounded by `max_block_plaintext`), not the whole entry. The temp
+    // is atomically promoted only after the full slice has been written, so a
+    // failure mid-decode leaves no partial output and no plaintext temp artifact.
+    let parent = output_parent_dir(output_path);
+    std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".aerovault-v3-")
+        .tempfile_in(parent)
+        .map_err(|e| format!("Create temp file: {e}"))?;
+
+    // Cumulative decoded plaintext length so far == the old `out.len()`; used to
+    // place each block against the requested slice and to detect a short entry.
+    let mut decoded_len = 0usize;
+    {
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(tmp.as_file_mut());
+        for chunk_id in &entry.chunks {
+            if decoded_len >= end {
+                // Everything this entry slices is already written; ignore the
+                // rest (a hostile pack may list extra/duplicate chunks).
+                break;
+            }
+            let record = vault
+                .manifest
+                .chunks
+                .get(chunk_id)
+                .ok_or_else(|| format!("Missing chunk record: {chunk_id}"))?;
+            let len_start = record.data_offset as usize;
+            let len_end = len_start
+                .checked_add(8)
+                .ok_or_else(|| "Chunk length offset overflow".to_string())?;
+            if len_end > vault.data.len() {
+                return Err("Chunk length is outside data section".to_string());
+            }
+            let block_len = u64::from_le_bytes(
+                vault.data[len_start..len_end]
+                    .try_into()
+                    .expect("slice length"),
+            );
+            if block_len != record.block_len || block_len > MAX_BLOCK_SIZE {
+                return Err("Chunk length metadata mismatch".to_string());
+            }
+            // Reject an over-declared plaintext length before decompressing so a
+            // single block cannot expand to gigabytes (CLAUDE-AV-005).
+            if record.plaintext_len > max_block_plaintext {
+                return Err(format!(
+                    "Plaintext block too large for chunk {chunk_id}: {} bytes (max {max_block_plaintext})",
+                    record.plaintext_len
+                ));
+            }
+            let block_start = len_end;
+            let block_end = block_start
+                .checked_add(block_len as usize)
+                .ok_or_else(|| "Chunk block offset overflow".to_string())?;
+            if block_end > vault.data.len() {
+                return Err("Chunk block is outside data section".to_string());
+            }
+            let encrypted = &vault.data[block_start..block_end];
+            let actual_hash = blake3::hash(encrypted).to_hex().to_string();
+            if actual_hash != record.cipher_hash {
+                return Err(format!("Cipher block hash mismatch for chunk {chunk_id}"));
+            }
+            let aad = block_aad(record.block_index, chunk_id);
+            // `Zeroizing` wipes the decrypted bytes on every exit path, including
+            // the zstd-init / decode / write-error early returns below (the old
+            // manual `.zeroize()` calls missed those error paths).
+            let decrypted: Zeroizing<Vec<u8>> = Zeroizing::new(if plaintext_lane {
+                encrypted.to_vec()
+            } else {
+                decrypt_with_aad(&vault.master_key, encrypted, &aad)?
+            });
+            // A raw-stored (incompressible, #10-B) block is the plaintext itself;
+            // a normal block is zstd and is decoded with a `plaintext_len + 1`
+            // ceiling so a zstd bomb cannot materialise more than one chunk before
+            // the length mismatch below trips.
+            let plaintext: Zeroizing<Vec<u8>> = if record.stored_raw {
+                decrypted
+            } else {
+                let mut decoder = zstd::stream::read::Decoder::new(&decrypted[..])
+                    .map_err(|e| format!("zstd decompress init failed: {e}"))?;
+                let mut decoded: Zeroizing<Vec<u8>> =
+                    Zeroizing::new(Vec::with_capacity(record.plaintext_len as usize));
+                decoder
+                    .by_ref()
+                    .take(record.plaintext_len + 1)
+                    .read_to_end(&mut decoded)
+                    .map_err(|e| format!("zstd decompress failed: {e}"))?;
+                decoded
+            };
+            if plaintext.len() as u64 != record.plaintext_len {
+                return Err(format!("Plaintext length mismatch for chunk {chunk_id}"));
+            }
+            // Write only the slice of this block that intersects [offset, end);
+            // the windowed equivalent of the old `out[offset..end]`.
+            let block_pos = decoded_len;
+            let next_pos = block_pos + plaintext.len();
+            let w_start = offset.max(block_pos);
+            let w_end = end.min(next_pos);
+            if w_start < w_end {
+                writer
+                    .write_all(&plaintext[w_start - block_pos..w_end - block_pos])
+                    .map_err(|e| format!("Write extracted file: {e}"))?;
+            }
+            decoded_len = next_pos;
         }
-        let record = vault
-            .manifest
-            .chunks
-            .get(chunk_id)
-            .ok_or_else(|| format!("Missing chunk record: {chunk_id}"))?;
-        let len_start = record.data_offset as usize;
-        let len_end = len_start
-            .checked_add(8)
-            .ok_or_else(|| "Chunk length offset overflow".to_string())?;
-        if len_end > vault.data.len() {
-            return Err("Chunk length is outside data section".to_string());
-        }
-        let block_len = u64::from_le_bytes(
-            vault.data[len_start..len_end]
-                .try_into()
-                .expect("slice length"),
-        );
-        if block_len != record.block_len || block_len > MAX_BLOCK_SIZE {
-            return Err("Chunk length metadata mismatch".to_string());
-        }
-        // Reject an over-declared plaintext length before decompressing so a
-        // single block cannot expand to gigabytes (CLAUDE-AV-005).
-        if record.plaintext_len > max_block_plaintext {
-            return Err(format!(
-                "Plaintext block too large for chunk {chunk_id}: {} bytes (max {max_block_plaintext})",
-                record.plaintext_len
-            ));
-        }
-        let block_start = len_end;
-        let block_end = block_start
-            .checked_add(block_len as usize)
-            .ok_or_else(|| "Chunk block offset overflow".to_string())?;
-        if block_end > vault.data.len() {
-            return Err("Chunk block is outside data section".to_string());
-        }
-        let encrypted = &vault.data[block_start..block_end];
-        let actual_hash = blake3::hash(encrypted).to_hex().to_string();
-        if actual_hash != record.cipher_hash {
-            return Err(format!("Cipher block hash mismatch for chunk {chunk_id}"));
-        }
-        let aad = block_aad(record.block_index, chunk_id);
-        let mut compressed = decrypt_with_aad(&vault.master_key, encrypted, &aad)?;
-        // Bound the decompressor output to `plaintext_len + 1`: with the cap
-        // above this is at most one chunk, so a zstd bomb cannot materialise
-        // more than that before the length mismatch is detected.
-        let mut decoder = zstd::stream::read::Decoder::new(&compressed[..])
-            .map_err(|e| format!("zstd decompress init failed: {e}"))?;
-        let mut plaintext = Vec::with_capacity(record.plaintext_len as usize);
-        decoder
-            .by_ref()
-            .take(record.plaintext_len + 1)
-            .read_to_end(&mut plaintext)
-            .map_err(|e| format!("zstd decompress failed: {e}"))?;
-        compressed.zeroize();
-        if plaintext.len() as u64 != record.plaintext_len {
-            plaintext.zeroize();
-            return Err(format!("Plaintext length mismatch for chunk {chunk_id}"));
-        }
-        out.extend_from_slice(&plaintext);
-        plaintext.zeroize();
+        writer
+            .flush()
+            .map_err(|e| format!("Flush extracted file: {e}"))?;
     }
-    if end > out.len() {
+    // The decoded stream must reach the end of the requested slice (matches the
+    // old `end > out.len()` guard).
+    if decoded_len < end {
         return Err(format!(
-            "Entry slice [{offset}..{end}] exceeds decoded data ({})",
-            out.len()
+            "Entry slice [{offset}..{end}] exceeds decoded data ({decoded_len})"
         ));
     }
-    let mut sliced = out[offset..end].to_vec();
-    out.zeroize();
-    atomic_write(output_path, &sliced)?;
-    sliced.zeroize();
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|e| format!("Sync temp file: {e}"))?;
+    tmp.persist(output_path)
+        .map_err(|e| format!("Persist vault: {}", e.error))?;
+    fsync_parent_dir(parent);
     Ok(output_path.to_path_buf())
 }
 
-pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = target
+/// Resolve the directory an output/temp file lives in, mapping a parent-less or
+/// empty parent to the current directory. Shared by `atomic_write` and the
+/// streaming `extract_file_entry` so both place their temp beside the target.
+pub(super) fn output_parent_dir(target: &Path) -> &Path {
+    target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Best-effort fsync of a directory so a freshly persisted rename is durable on
+/// crash (Unix). A no-op on other platforms. Single definition so the durability
+/// discipline cannot drift between the write paths that rely on it.
+pub(super) fn fsync_parent_dir(parent: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+}
+
+pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = output_parent_dir(target);
     std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".aerovault-v3-")
@@ -1442,14 +1675,7 @@ pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("Sync temp file: {e}"))?;
     tmp.persist(target)
         .map_err(|e| format!("Persist vault: {}", e.error))?;
-    #[cfg(unix)]
-    {
-        if let Some(parent) = target.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-    }
+    fsync_parent_dir(parent);
     Ok(())
 }
 
@@ -1490,7 +1716,19 @@ fn validate_supported_wrappers(w: &WrapperManifest) -> Result<(), String> {
     check_wrapper("chunking", &w.chunking, "gear-cdc", 1)?;
     check_wrapper("chunk_id", &w.chunk_id, "blake3-keyed-128", 1)?;
     check_wrapper("compression", &w.compression, "zstd", 1)?;
-    check_wrapper("crypt", &w.crypt, "aes-256-gcm-siv", 1)?;
+    // crypt: the encrypted lane records `aes-256-gcm-siv`, the plaintext
+    // (`.aerovz`) lane records `none`. Both are version 1.
+    match w.crypt.algorithm_id.as_str() {
+        CRYPT_ALGORITHM_ENCRYPTED | CRYPT_ALGORITHM_NONE => {
+            if w.crypt.algorithm_version != 1 {
+                return Err(format!(
+                    "Unsupported crypt wrapper version: {}",
+                    w.crypt.algorithm_version
+                ));
+            }
+        }
+        other => return Err(format!("Unsupported crypt wrapper: {other}")),
+    }
     check_wrapper("cipher_hash", &w.cipher_hash, "blake3-256", 1)?;
     Ok(())
 }
@@ -1523,27 +1761,53 @@ fn create_empty_vault(
     path: &Path,
     password: &str,
     level: i32,
+    cdc_bounds: Option<CdcBounds>,
+    lane: VaultLane,
     error_correction: Option<super::ec::RecoveryPlacement>,
     error_correction_pct: u32,
 ) -> Result<(), String> {
-    if password.len() < MIN_PASSWORD_LEN {
-        return Err("Password must be at least 8 characters".to_string());
-    }
+    // The plaintext (`.aerovz`) lane has no password: zero salt + zero wrapped
+    // keys in the header, a public deterministic chunk-id key (all-zero master),
+    // and the header HMAC keyed by the fixed PUBLIC integrity key. The encrypted
+    // lane derives everything from the password exactly as before.
+    let plaintext = lane == VaultLane::Plaintext;
 
-    let salt = random_array::<SALT_SIZE>();
-    let mut base_kek = derive_base_kek(password, &salt)?;
-    let (kek_master, kek_mac) = derive_keks(&base_kek)?;
-    let kek_master = Zeroizing::new(kek_master);
-    let kek_mac = Zeroizing::new(kek_mac);
-    base_kek.zeroize();
-
-    let mut master_key = random_array::<KEY_SIZE>();
-    let mut mac_key = random_array::<KEY_SIZE>();
-    let wrapped_master_key = wrap_key(&kek_master, &master_key)?;
-    let wrapped_mac_key = wrap_key(&kek_mac, &mac_key)?;
+    let (salt, wrapped_master_key, wrapped_mac_key, mut master_key, mut mac_key, flags) =
+        if plaintext {
+            (
+                [0u8; SALT_SIZE],
+                [0u8; WRAPPED_KEY_SIZE],
+                [0u8; WRAPPED_KEY_SIZE],
+                [0u8; KEY_SIZE],
+                aerovz_mac_key()?,
+                FLAG_PLAINTEXT_CONTENT,
+            )
+        } else {
+            if password.len() < MIN_PASSWORD_LEN {
+                return Err("Password must be at least 8 characters".to_string());
+            }
+            let salt = random_array::<SALT_SIZE>();
+            let mut base_kek = derive_base_kek(password, &salt)?;
+            let (kek_master, kek_mac) = derive_keks(&base_kek)?;
+            let kek_master = Zeroizing::new(kek_master);
+            let kek_mac = Zeroizing::new(kek_mac);
+            base_kek.zeroize();
+            let master_key = random_array::<KEY_SIZE>();
+            let mac_key = random_array::<KEY_SIZE>();
+            let wrapped_master_key = wrap_key(&kek_master, &master_key)?;
+            let wrapped_mac_key = wrap_key(&kek_mac, &mac_key)?;
+            (
+                salt,
+                wrapped_master_key,
+                wrapped_mac_key,
+                master_key,
+                mac_key,
+                0u8,
+            )
+        };
 
     let header = VaultHeaderV3 {
-        flags: 0,
+        flags,
         salt,
         wrapped_master_key,
         wrapped_mac_key,
@@ -1559,7 +1823,15 @@ fn create_empty_vault(
         header_mac: [0u8; MAC_SIZE],
     };
 
-    let mut manifest = empty_manifest(level);
+    let mut manifest = if plaintext {
+        empty_manifest_plaintext(level)
+    } else {
+        empty_manifest(level)
+    };
+    if let Some(bounds) = cdc_bounds {
+        bounds.validate()?;
+        manifest.wrappers.chunking.bounds = Some(bounds);
+    }
     // Record the QR-style overhead level so every later seal / export uses the
     // same grid (#276). Only meaningful when Error Correction is enabled.
     if error_correction.is_some() {
@@ -1619,12 +1891,33 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
     file.read_exact(&mut header_bytes)
         .map_err(|e| format!("Read header: {e}"))?;
 
+    // Plaintext (`.aerovz`) lane: when the header parses and carries
+    // FLAG_PLAINTEXT_CONTENT, there is no password — verify the header MAC under
+    // the fixed PUBLIC integrity key and use an all-zero (public) master key for
+    // the deterministic chunk-id derivation. The manifest is read as plaintext
+    // below. EC header recovery stays on the encrypted path (the plaintext
+    // header is still EC-protected by region; recovery for it is a follow-up).
+    let plaintext_header = VaultHeaderV3::from_bytes(&header_bytes)
+        .ok()
+        .is_some_and(|h| h.flags & FLAG_PLAINTEXT_CONTENT != 0);
+
     // HEADER parity (rev. 4): the on-disk header is the happy path. If it fails
     // to parse or its MAC does not verify (bit-rot / bad sector), fall back to
     // rebuilding it from the detached sidecar's header parity. A missing sidecar
     // / no header parity / a rebuild that still does not unlock keeps the
     // original error. The MAC verify inside `open_header_bytes` is the proof.
-    let (header, mac_key, master_key, header_repaired_on_open) =
+    let (header, mac_key, master_key, header_repaired_on_open) = if plaintext_header {
+        let header = VaultHeaderV3::from_bytes(&header_bytes)?;
+        let mac_key = aerovz_mac_key()?;
+        header.verify_mac(&mac_key)?;
+        if header.wrapper_header_version != SUPPORTED_WRAPPER_HEADER_VERSION {
+            return Err(format!(
+                "Unsupported AeroVault v3 wrapper-header version: {} (expected {})",
+                header.wrapper_header_version, SUPPORTED_WRAPPER_HEADER_VERSION
+            ));
+        }
+        (header, mac_key, [0u8; KEY_SIZE], false)
+    } else {
         match open_header_bytes(&header_bytes, password) {
             Ok((h, mac, master)) => (h, mac, master, false),
             Err(orig) => {
@@ -1633,7 +1926,8 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
                     None => return Err(orig),
                 }
             }
-        };
+        }
+    };
 
     validate_ranges(&header, file_len)?;
 
@@ -1676,24 +1970,32 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
     // the detached sidecar's manifest parity (the only copy a pure-detached
     // vault keeps). A successful AEAD decrypt on the rebuilt bytes is the
     // correctness proof; otherwise keep the original error.
-    let (manifest, manifest_repaired_on_open) =
-        match decrypt_manifest(&master_key, &encrypted_manifest) {
-            Ok(m) => (m, false),
-            Err(orig) => {
-                let embedded =
-                    super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
-                let rebuilt = match embedded {
-                    Some(r) if r != encrypted_manifest => Some(r),
-                    _ => super::ec::reconstruct_manifest_from_sidecar(&path, &encrypted_manifest)?,
-                };
-                match rebuilt {
-                    Some(r) if r != encrypted_manifest => {
-                        (decrypt_manifest(&master_key, &r)?, true)
-                    }
-                    _ => return Err(orig),
-                }
+    // Decode the stored manifest blob: AEAD-decrypt on the encrypted lane, parse
+    // plaintext JSON on the `.aerovz` lane. Either way, on a parse/decrypt
+    // failure rebuild the blob from Error-Correction parity (embedded metadata
+    // extension first, then the detached sidecar) and retry — the manifest is
+    // EC-protected by region regardless of whether it is encrypted.
+    let decode_manifest = |blob: &[u8]| -> Result<VaultManifestV3, String> {
+        if plaintext_header {
+            parse_manifest_plaintext(blob)
+        } else {
+            decrypt_manifest(&master_key, blob)
+        }
+    };
+    let (manifest, manifest_repaired_on_open) = match decode_manifest(&encrypted_manifest) {
+        Ok(m) => (m, false),
+        Err(orig) => {
+            let embedded = super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
+            let rebuilt = match embedded {
+                Some(r) if r != encrypted_manifest => Some(r),
+                _ => super::ec::reconstruct_manifest_from_sidecar(&path, &encrypted_manifest)?,
+            };
+            match rebuilt {
+                Some(r) if r != encrypted_manifest => (decode_manifest(&r)?, true),
+                _ => return Err(orig),
             }
-        };
+        }
+    };
     if manifest.format != VERSION {
         return Err(format!(
             "Unsupported AeroVault manifest version: {}",
@@ -1701,6 +2003,13 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
         ));
     }
     validate_supported_wrappers(&manifest.wrappers)?;
+    // The header flag and the manifest `crypt` wrapper are two views of the same
+    // lane; reject a container whose header claims one lane and manifest the
+    // other (a forged/corrupt mismatch would otherwise decode under the wrong
+    // key path).
+    if plaintext_header != manifest_is_plaintext(&manifest) {
+        return Err("AeroVault v3 header/manifest encryption-lane mismatch".to_string());
+    }
     validate_manifest_paths(&manifest)?;
 
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
@@ -1840,16 +2149,40 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
         vault.emit(|s| s.set_error_correction(shards, protected, overhead));
     }
 
-    let bytes = build_file_bytes(
-        vault.header.clone(),
-        &vault.mac_key,
-        &vault.master_key,
-        &vault.manifest,
-        &extensions,
-        &ext_payloads,
-        &vault.data,
-    )?;
-    atomic_write(&vault.path, &bytes)?;
+    // Stream the container straight to the temp file: the data section (already
+    // in RAM on `OpenVaultV3.data`) is written directly rather than copied into a
+    // second whole-file buffer, so the seal no longer doubles peak memory
+    // (T5 sub-task #2). Same atomic temp + sync + persist + dir-fsync discipline
+    // as `atomic_write`, via the shared helpers.
+    {
+        use std::io::Write;
+        let parent = output_parent_dir(&vault.path);
+        std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".aerovault-v3-")
+            .tempfile_in(parent)
+            .map_err(|e| format!("Create temp file: {e}"))?;
+        {
+            let mut w = std::io::BufWriter::new(tmp.as_file_mut());
+            write_container(
+                &mut w,
+                vault.header.clone(),
+                &vault.mac_key,
+                &vault.master_key,
+                &vault.manifest,
+                &extensions,
+                &ext_payloads,
+                &vault.data,
+            )?;
+            w.flush().map_err(|e| format!("Flush temp file: {e}"))?;
+        }
+        tmp.as_file_mut()
+            .sync_all()
+            .map_err(|e| format!("Sync temp file: {e}"))?;
+        tmp.persist(&vault.path)
+            .map_err(|e| format!("Persist vault: {}", e.error))?;
+        fsync_parent_dir(parent);
+    }
 
     // Refresh the staleness baseline so a second save in the same session does
     // not trip the generation guard against the bytes we just wrote.
@@ -1895,8 +2228,7 @@ fn extract_entry(
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."));
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Create output dir: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("Create output dir: {e}"))?;
                 extract_file_entry(vault, entry, dest_path, parent)
             }
         }
@@ -1976,9 +2308,22 @@ fn extract_entry(
 /// under it. Returns the number of files written. Every entry path is
 /// normalized first, so a crafted manifest cannot escape `dest_root`.
 fn extract_all_entries(vault: &OpenVaultV3, dest_root: &Path) -> Result<u64, String> {
+    extract_all_entries_with_progress(vault, dest_root, &mut |_, _| {})
+}
+
+/// `extract_all_entries` with a `(bytes_done, bytes_total)` progress callback
+/// invoked after each file is written (#5: progress for extract). `bytes_total`
+/// is the sum of file-entry plaintext sizes; directory entries do not move it.
+fn extract_all_entries_with_progress(
+    vault: &OpenVaultV3,
+    dest_root: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<u64, String> {
     std::fs::create_dir_all(dest_root).map_err(|e| format!("Create output dir: {e}"))?;
     let mut entries: Vec<&ManifestEntryV3> = vault.manifest.entries.iter().collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let total: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+    let mut done = 0u64;
     let mut files_written = 0u64;
     for entry in entries {
         let rel = normalize_vault_relative_path(&entry.path)?;
@@ -1990,6 +2335,8 @@ fn extract_all_entries(vault: &OpenVaultV3, dest_root: &Path) -> Result<u64, Str
         } else {
             extract_file_entry(vault, entry, &output, dest_root)?;
             files_written += 1;
+            done = done.saturating_add(entry.size);
+            progress(done, total);
         }
     }
     Ok(files_written)
@@ -2172,6 +2519,410 @@ mod tests {
         std::fs::remove_file(&vp).ok();
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn streaming_multi_megabyte_round_trip_is_byte_identical() {
+        // T5 headline: a multi-MB file is ingested through the bounded-buffer
+        // StreamingChunker (many CDC windows + several reader refills) and
+        // re-extracted block-by-block, and must come back byte-for-byte. This
+        // exercises the streaming add + streaming extract paths end to end,
+        // across both the incompressible (stored-raw) and the zstd lanes.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+
+        let src = scratch_dir();
+
+        // 12 MiB pseudo-random => incompressible (stored_raw) and split into
+        // several CDC chunks (min 256 KiB / max 4 MiB => at least 3 chunks).
+        let mut random = vec![0u8; 12 * 1024 * 1024 + 7];
+        let mut x = 0xd1b54a32d192ed03u64;
+        for b in random.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        let rnd_path = src.join("random.bin");
+        std::fs::write(&rnd_path, &random).unwrap();
+
+        // 12 MiB highly compressible => the zstd lane, decoded windowed on extract.
+        let pattern = b"AeroVault v3 streaming round-trip payload block. ";
+        let mut text = Vec::with_capacity(12 * 1024 * 1024);
+        while text.len() < 12 * 1024 * 1024 {
+            text.extend_from_slice(pattern);
+        }
+        let txt_path = src.join("text.bin");
+        std::fs::write(&txt_path, &text).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[
+                (rnd_path.clone(), "random.bin".to_string()),
+                (txt_path.clone(), "text.bin".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Both files must have been split into multiple CDC chunks, i.e. the
+        // streaming chunker actually crossed window boundaries (not one big read).
+        let rnd_entry = vault
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path == "random.bin")
+            .unwrap();
+        assert!(
+            rnd_entry.chunks.len() >= 3,
+            "12 MiB random file should split into multiple CDC chunks, got {}",
+            rnd_entry.chunks.len()
+        );
+
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("random.bin")).unwrap(),
+            random,
+            "incompressible multi-chunk file must round-trip byte-identically"
+        );
+        assert_eq!(
+            std::fs::read(out.join("text.bin")).unwrap(),
+            text,
+            "compressible multi-chunk file must round-trip byte-identically"
+        );
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn streaming_packed_small_files_cross_chunk_round_trip() {
+        // Exercises the windowed streaming extract with offset > 0 AND a file
+        // straddling a CDC chunk boundary: many sub-threshold files are batched
+        // into one pack, the pack is chunked (>= 2 chunks), and each member's
+        // [pack_offset, pack_offset+size) slice is reassembled block-by-block.
+        // This is the most error-prone new arithmetic (w_start/w_end clamp) and
+        // the old offset==0 round-trip tests do not cover it.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+
+        let src = scratch_dir();
+        // 48 distinct ~100 KiB files => ~4.8 MiB packed, which the CDC (avg 1 MiB,
+        // max 4 MiB) splits into several chunks, so members straddle boundaries.
+        // Each file gets unique pseudo-random content (no dedup collapse, so the
+        // per-file byte comparison is meaningful).
+        let mut files: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
+        for i in 0..48u64 {
+            let len = 100 * 1024 + (i as usize); // vary length so boundaries shift
+            let mut data = vec![0u8; len];
+            let mut x = 0xa5a5_0000_0000_0001u64.wrapping_add(i.wrapping_mul(0x9e3779b97f4a7c15));
+            for b in data.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = (x & 0xff) as u8;
+            }
+            let name = format!("packed/file_{i:03}.bin");
+            let path = src.join(format!("file_{i:03}.bin"));
+            std::fs::write(&path, &data).unwrap();
+            files.push((path, name, data));
+        }
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        let sources: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|(p, n, _)| (p.clone(), n.clone()))
+            .collect();
+        VaultV3::add_files(&mut vault, &sources).unwrap();
+
+        // The pack must have split into multiple chunks AND at least one member
+        // must span >1 chunk (i.e. a real cross-boundary windowed extract).
+        assert!(
+            vault.manifest.chunks.len() >= 2,
+            "packed set should chunk into >= 2 blocks, got {}",
+            vault.manifest.chunks.len()
+        );
+        assert!(
+            vault.manifest.entries.iter().any(|e| e.chunks.len() >= 2),
+            "at least one packed file must straddle a chunk boundary"
+        );
+
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        for (_, name, data) in &files {
+            assert_eq!(
+                &std::fs::read(out.join(name)).unwrap(),
+                data,
+                "packed cross-chunk file {name} must round-trip byte-identically"
+            );
+        }
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn probe_classifies_compressible_and_random() {
+        // Highly repetitive text shrinks well past the threshold.
+        let text = b"the quick brown fox jumps over the lazy dog. ".repeat(4096);
+        assert!(!probe_incompressible(&text));
+
+        // High-entropy bytes do not shrink: stored raw.
+        let mut noise = vec![0u8; 256 * 1024];
+        let mut x = 0x243f6a8885a308d3u64;
+        for b in noise.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        assert!(probe_incompressible(&noise));
+
+        // Empty input is never "incompressible".
+        assert!(!probe_incompressible(&[]));
+    }
+
+    #[test]
+    fn probe_does_not_let_noisy_prefix_hide_large_compressible_chunk() {
+        let mut chunk = b"AeroVault representative probe body. ".repeat(80_000);
+        let mut x = 0x9e3779b97f4a7c15u64;
+        for b in chunk[..INCOMPRESSIBLE_PROBE_SAMPLE].iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+
+        assert!(chunk.len() > INCOMPRESSIBLE_PROBE_MAX_SAMPLE);
+        assert!(
+            !probe_incompressible(&chunk),
+            "a noisy prefix must not force a large compressible chunk to raw"
+        );
+    }
+
+    #[test]
+    fn probe_still_stores_large_high_entropy_chunks_raw() {
+        let mut noise = vec![0u8; INCOMPRESSIBLE_PROBE_MAX_SAMPLE * 2];
+        let mut x = 0x6a09e667f3bcc909u64;
+        for b in noise.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+
+        assert!(probe_incompressible(&noise));
+    }
+
+    #[test]
+    fn incompressible_chunks_store_raw_and_round_trip() {
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        let src = scratch_dir();
+
+        // Compressible file (>CDC threshold so it takes the per-file path).
+        let text = src.join("text.txt");
+        let text_payload = b"AeroVault incompressible-skip round trip. ".repeat(12_000);
+        std::fs::write(&text, &text_payload).unwrap();
+
+        // Incompressible file: high-entropy, also above the threshold.
+        let noise = src.join("noise.bin");
+        let mut noise_payload = vec![0u8; PACK_SMALL_FILE_THRESHOLD + 500_000];
+        let mut x = 0xdeadbeefcafef00du64;
+        for b in noise_payload.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        std::fs::write(&noise, &noise_payload).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[
+                (text.clone(), "text.txt".to_string()),
+                (noise.clone(), "noise.bin".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Both representations must be present: the noise chunks are stored raw,
+        // the text chunks are compressed.
+        let any_raw = vault.manifest.chunks.values().any(|c| c.stored_raw);
+        let any_compressed = vault.manifest.chunks.values().any(|c| !c.stored_raw);
+        assert!(
+            any_raw,
+            "incompressible file should store at least one raw chunk"
+        );
+        assert!(
+            any_compressed,
+            "compressible file should store at least one zstd chunk"
+        );
+        // A raw chunk never stores more than its plaintext.
+        for c in vault.manifest.chunks.values().filter(|c| c.stored_raw) {
+            assert_eq!(c.compressed_len, c.plaintext_len);
+        }
+
+        // Decode honours the flag: both files come back byte-identical.
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("text.txt")).unwrap(), text_payload);
+        assert_eq!(std::fs::read(out.join("noise.bin")).unwrap(), noise_payload);
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn plaintext_lane_round_trip_and_unencrypted_storage() {
+        // `.aerovz` (#7): no password, content + manifest stored unencrypted,
+        // still compressed (+ EC available). create_empty_vault + add + extract.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        assert!(VaultV3::is_vault_v3(&vp));
+
+        let src = scratch_dir();
+        // A small (packed) file and a large compressible file (per-file CDC path).
+        let small = src.join("note.txt");
+        std::fs::write(&small, b"plaintext archive note").unwrap();
+        let big = src.join("big.txt");
+        let big_payload = b"Aerovz plaintext compressible body. ".repeat(20_000);
+        std::fs::write(&big, &big_payload).unwrap();
+
+        // Opens without any password (auto-detected via the header flag).
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        assert!(vault.header.flags & FLAG_PLAINTEXT_CONTENT != 0);
+        assert!(manifest_is_plaintext(&vault.manifest));
+        VaultV3::add_files(
+            &mut vault,
+            &[
+                (small.clone(), "note.txt".to_string()),
+                (big.clone(), "big.txt".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(vault);
+
+        // Reopen and extract byte-identical.
+        let vault = VaultV3::open_plaintext(&vp).unwrap();
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(
+            std::fs::read(out.join("note.txt")).unwrap(),
+            b"plaintext archive note"
+        );
+        assert_eq!(std::fs::read(out.join("big.txt")).unwrap(), big_payload);
+
+        // The data section is genuinely unencrypted: the compressed body of the
+        // large file zstd-decodes straight off disk WITHOUT any key. We find the
+        // big file's first stored block and decompress it.
+        let raw = std::fs::read(&vp).unwrap();
+        let big_entry = vault
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.path == "big.txt")
+            .unwrap();
+        let first_id = big_entry.chunks.first().unwrap();
+        let rec = vault.manifest.chunks.get(first_id).unwrap();
+        // `data_offset` is relative to the data section, which starts at
+        // DATA_OFFSET in the file; +8 skips the block length prefix.
+        let start = DATA_OFFSET as usize + rec.data_offset as usize + 8;
+        let block = &raw[start..start + rec.block_len as usize];
+        let decoded = zstd::stream::decode_all(block).unwrap();
+        assert!(
+            big_payload.starts_with(&decoded),
+            "plaintext-lane block must zstd-decode off disk with no key"
+        );
+
+        // A plaintext archive has no password to change.
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        assert!(VaultV3::change_password(&mut vault, "irrelevant-pw-123").is_err());
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn create_options_decouple_zstd_level_from_cdc_bounds() {
+        let vp = vault_path();
+        let opts = CreateOptionsV3::new_plaintext(&vp)
+            .with_zstd_level(19)
+            .with_cdc_bounds(CdcBounds::defaults());
+        VaultV3::create(&opts).unwrap();
+
+        let vault = VaultV3::open_plaintext(&vp).unwrap();
+        let bounds = manifest_cdc_bounds(&vault.manifest).unwrap();
+        let defaults = CdcBounds::defaults();
+        assert_eq!(manifest_zstd_level(&vault.manifest), 19);
+        assert_eq!(bounds.min, defaults.min);
+        assert_eq!(bounds.avg, defaults.avg);
+        assert_eq!(bounds.max, defaults.max);
+
+        std::fs::remove_file(&vp).ok();
+    }
+
+    #[test]
+    fn plaintext_lane_stored_raw_composition() {
+        // stored_raw (#10-B) composes with the plaintext lane: an incompressible
+        // chunk is stored BOTH raw AND unencrypted, and still round-trips.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let src = scratch_dir();
+        let noise = src.join("noise.bin");
+        let mut noise_payload = vec![0u8; PACK_SMALL_FILE_THRESHOLD + 400_000];
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for b in noise_payload.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        std::fs::write(&noise, &noise_payload).unwrap();
+
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        VaultV3::add_files(&mut vault, &[(noise.clone(), "noise.bin".to_string())]).unwrap();
+        assert!(
+            vault.manifest.chunks.values().any(|c| c.stored_raw),
+            "incompressible input should store raw chunks"
+        );
+        let out = scratch_dir();
+        VaultV3::extract_all(&vault, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("noise.bin")).unwrap(), noise_payload);
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    #[cfg(feature = "test-vectors")]
+    fn plaintext_empty_archive_is_deterministic() {
+        // The plaintext lane has zero randomness (no salt, no random keys, fixed
+        // public MAC key) and, under `test-vectors`, a fixed timestamp — so an
+        // empty `.aerovz` is byte-deterministic. Freeze its digest to catch any
+        // accidental layout drift in the plaintext header/manifest path.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let bytes = std::fs::read(&vp).unwrap();
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        let vp2 = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp2)).unwrap();
+        assert_eq!(
+            digest,
+            blake3::hash(&std::fs::read(&vp2).unwrap())
+                .to_hex()
+                .to_string(),
+            "empty plaintext archive must be byte-deterministic"
+        );
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&vp2).ok();
     }
 
     #[derive(Default)]
@@ -2509,7 +3260,11 @@ mod tests {
         std::fs::write(&secret, secret_bytes).unwrap();
 
         let mut vault = VaultV3::open(&vp, PW).unwrap();
-        VaultV3::add_files(&mut vault, &[(secret.clone(), "sub/secret.txt".to_string())]).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[(secret.clone(), "sub/secret.txt".to_string())],
+        )
+        .unwrap();
 
         let dest = scratch_dir();
         let victim = scratch_dir();
@@ -2591,7 +3346,11 @@ mod tests {
         let secret = src.join("secret.txt");
         std::fs::write(&secret, b"TOP SECRET PLAINTEXT THAT MUST STAY CONTAINED").unwrap();
         let mut vault = VaultV3::open(&vp, PW).unwrap();
-        VaultV3::add_files(&mut vault, &[(secret.clone(), "sub/secret.txt".to_string())]).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[(secret.clone(), "sub/secret.txt".to_string())],
+        )
+        .unwrap();
 
         let dest = scratch_dir(); // exists & is a dir -> output_root = dest/sub
         let victim = scratch_dir();

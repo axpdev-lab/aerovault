@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::chunking::CdcBounds;
-use super::constants::{BLOCK_AAD_PREFIX, DEFAULT_ZSTD_LEVEL, MANIFEST_AAD, VERSION};
+use super::constants::{
+    BLOCK_AAD_PREFIX, CRYPT_ALGORITHM_ENCRYPTED, CRYPT_ALGORITHM_NONE, DEFAULT_ZSTD_LEVEL,
+    MANIFEST_AAD, VERSION,
+};
 use crate::aerocrypt::{decrypt_with_aad, encrypt_with_aad, KEY_SIZE};
 
 /// One wrapper-stack layer: an algorithm id + version, optional zstd level,
@@ -58,6 +61,13 @@ pub struct ChunkRecordV3 {
     pub plaintext_len: u64,
     pub compressed_len: u64,
     pub cipher_hash: String,
+    /// `true` when the block stores the raw plaintext (still encrypted) because
+    /// the chunk was incompressible: the zstd pass was skipped at ingest and
+    /// must be skipped on decode. Absent (false) in pre-T3 manifests and for
+    /// every compressible chunk, so it costs no bytes there and the on-disk
+    /// major stays 3.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stored_raw: bool,
 }
 
 /// The full manifest, encrypted as one AEAD blob under `MANIFEST_AAD`.
@@ -98,7 +108,19 @@ pub fn now_iso() -> String {
     "2026-06-17T00:00:00Z".to_string()
 }
 
+/// The default wrapper stack for the encrypted lane (`crypt = aes-256-gcm-siv`).
 pub fn default_wrappers(level: i32) -> WrapperManifest {
+    default_wrappers_for_crypt(level, CRYPT_ALGORITHM_ENCRYPTED)
+}
+
+/// The default wrapper stack for the plaintext (`.aerovz`) lane: identical to
+/// the encrypted stack except the `crypt` wrapper records `none` — content
+/// blocks and the manifest are stored unencrypted (#7).
+pub fn default_wrappers_plaintext(level: i32) -> WrapperManifest {
+    default_wrappers_for_crypt(level, CRYPT_ALGORITHM_NONE)
+}
+
+fn default_wrappers_for_crypt(level: i32, crypt_id: &str) -> WrapperManifest {
     WrapperManifest {
         packing: AlgorithmSpec {
             algorithm_id: "small-file-batching".to_string(),
@@ -125,7 +147,7 @@ pub fn default_wrappers(level: i32) -> WrapperManifest {
             bounds: None,
         },
         crypt: AlgorithmSpec {
-            algorithm_id: "aes-256-gcm-siv".to_string(),
+            algorithm_id: crypt_id.to_string(),
             algorithm_version: 1,
             level: None,
             bounds: None,
@@ -139,13 +161,30 @@ pub fn default_wrappers(level: i32) -> WrapperManifest {
     }
 }
 
+/// `true` when this manifest describes the plaintext (`.aerovz`) lane: the
+/// single source of truth for whether content blocks and the manifest itself
+/// are stored unencrypted. Mirrored cheaply by [`FLAG_PLAINTEXT_CONTENT`] in the
+/// header so the open path can branch before it can read the manifest.
+pub fn manifest_is_plaintext(manifest: &VaultManifestV3) -> bool {
+    manifest.wrappers.crypt.algorithm_id == CRYPT_ALGORITHM_NONE
+}
+
 pub fn empty_manifest(level: i32) -> VaultManifestV3 {
+    empty_manifest_with_wrappers(level, default_wrappers(level))
+}
+
+/// An empty manifest for the plaintext (`.aerovz`) lane.
+pub fn empty_manifest_plaintext(level: i32) -> VaultManifestV3 {
+    empty_manifest_with_wrappers(level, default_wrappers_plaintext(level))
+}
+
+fn empty_manifest_with_wrappers(_level: i32, wrappers: WrapperManifest) -> VaultManifestV3 {
     let now = now_iso();
     VaultManifestV3 {
         format: VERSION,
         created: now.clone(),
         modified: now,
-        wrappers: default_wrappers(level),
+        wrappers,
         entries: Vec::new(),
         chunks: BTreeMap::new(),
         error_correction_pct: None,
@@ -192,6 +231,18 @@ pub fn encrypt_manifest(
 pub fn decrypt_manifest(key: &[u8; KEY_SIZE], encrypted: &[u8]) -> Result<VaultManifestV3, String> {
     let json = decrypt_with_aad(key, encrypted, MANIFEST_AAD)?;
     serde_json::from_slice(&json).map_err(|e| format!("Manifest parse: {e}"))
+}
+
+/// Serialize the manifest as plaintext JSON for the `.aerovz` lane (no AEAD).
+/// The stored bytes are the manifest blob the header offsets address and that
+/// Error Correction protects, exactly like the encrypted blob but unencrypted.
+pub fn serialize_manifest_plaintext(manifest: &VaultManifestV3) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(manifest).map_err(|e| format!("Manifest serialize: {e}"))
+}
+
+/// Parse a plaintext (`.aerovz`) manifest blob.
+pub fn parse_manifest_plaintext(bytes: &[u8]) -> Result<VaultManifestV3, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("Manifest parse: {e}"))
 }
 
 /// Next free block index = max existing + 1 (0 for an empty manifest).
@@ -245,6 +296,7 @@ mod tests {
                 plaintext_len: 1,
                 compressed_len: 1,
                 cipher_hash: "x".to_string(),
+                stored_raw: false,
             },
         );
         assert_eq!(next_block_index(&m), 6);

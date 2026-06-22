@@ -1021,6 +1021,57 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_lane_embedded_ec_scrub_repair_over_plaintext() {
+        // `.aerovz` (#7) + Error Correction: parity is computed over the
+        // PLAINTEXT (compressed, unencrypted) data region. Corrupt it, scrub must
+        // detect, repair from the embedded extension restores byte-identical.
+        let vp = tmp("aerovz-embedded.aerovz");
+        let src = tmp("aerovz-embedded-src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&vp),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        assert!(VaultV3::has_error_correction(&vp).unwrap());
+
+        // Passwordless open (auto-detected via the header flag).
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+
+        let good_out = tmp("aerovz-embedded-good");
+        VaultV3::extract_all(&VaultV3::open_plaintext(&vp).unwrap(), &good_out).unwrap();
+
+        corrupt_data_section(&vp, 600);
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        assert!(
+            !VaultV3::scrub(&vault).is_empty(),
+            "scrub must detect plaintext-region corruption"
+        );
+        let (repaired, source) = VaultV3::repair(&mut vault, false, None).unwrap();
+        assert!(repaired > 0);
+        assert_eq!(source, ParitySource::Embedded);
+        drop(vault);
+
+        let vault = VaultV3::open_plaintext(&vp).unwrap();
+        assert!(VaultV3::scrub(&vault).is_empty());
+        let after_out = tmp("aerovz-embedded-after");
+        VaultV3::extract_all(&vault, &after_out).unwrap();
+        assert_eq!(
+            std::fs::read(after_out.join("big.bin")).unwrap(),
+            std::fs::read(good_out.join("big.bin")).unwrap(),
+        );
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&good_out);
+        let _ = std::fs::remove_dir_all(&after_out);
+    }
+
+    #[test]
     fn beyond_budget_corruption_fails_closed_vault_untouched() {
         let vp = tmp("budget.aerovault");
         let src = tmp("budget-src");

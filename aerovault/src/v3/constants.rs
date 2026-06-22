@@ -30,10 +30,49 @@ pub const MAX_PLAINTEXT_BLOCK_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Data section starts immediately after the fixed header.
 pub const DATA_OFFSET: u64 = HEADER_SIZE as u64;
+
+/// Header `flags` bit (byte 11) marking the unencrypted `.aerovz` plaintext
+/// lane (#7): content blocks AND the manifest are stored in the clear (still
+/// compressed + Error-Correction-protected), there is no password, and the
+/// header HMAC is keyed by the fixed PUBLIC integrity key below. This lane is
+/// integrity + recovery, NOT confidentiality — the data is readable by anyone.
+/// Absent (0) on every encrypted `.aerovault`, so those containers are
+/// byte-identical and old readers fail closed on an unknown crypt id.
+pub const FLAG_PLAINTEXT_CONTENT: u8 = 0x01;
+
+/// `crypt` wrapper algorithm id recorded for the encrypted lane.
+pub const CRYPT_ALGORITHM_ENCRYPTED: &str = "aes-256-gcm-siv";
+/// `crypt` wrapper algorithm id recorded for the plaintext (`.aerovz`) lane.
+pub const CRYPT_ALGORITHM_NONE: &str = "none";
+
+/// Public, fixed input keying material for the plaintext lane's header HMAC.
+/// Public by design: it authenticates the header against bit-rot / accidental
+/// tampering; it provides NO confidentiality (the lane has none).
+pub const AEROVZ_MAC_IKM: &[u8] = b"AeroVault v3 aerovz public container";
+/// HKDF-SHA256 label deriving the plaintext-lane header-integrity MAC key.
+pub const HKDF_AEROVZ_MAC: &[u8] = b"AeroVault v3 aerovz header integrity key";
 /// Default zstd compression level (`balanced` profile).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 9;
 /// The only wrapper-header layout this build understands.
 pub const SUPPORTED_WRAPPER_HEADER_VERSION: u16 = 1;
+
+/// Incompressible-skip probe (#10-B): size of each representative window that
+/// is trial-compressed at a fast level to decide whether the full, possibly
+/// expensive, zstd pass is worth running.
+pub const INCOMPRESSIBLE_PROBE_SAMPLE: usize = 64 * 1024;
+/// Maximum bytes sampled by the incompressibility probe. Chunks at or below
+/// this size are probed as a whole; larger chunks are sampled with windows
+/// spread across the chunk so a noisy prefix cannot force a compressible block
+/// to be stored raw.
+pub const INCOMPRESSIBLE_PROBE_MAX_SAMPLE: usize = 1024 * 1024;
+/// zstd level used for the cheap probe (fast, just enough signal).
+pub const INCOMPRESSIBLE_PROBE_LEVEL: i32 = 3;
+/// A chunk is treated as incompressible when the probe leaves the sample at or
+/// above this percentage of its original size (i.e. it shrank by less than
+/// 3 %): the chunk is then stored raw (still encrypted) and the full pass is
+/// skipped. Media/already-compressed data lands here; text/code shrinks well
+/// past it and takes the normal compression path.
+pub const INCOMPRESSIBLE_RATIO_PCT: u64 = 97;
 
 /// CDC minimum chunk size (256 KiB).
 pub const CDC_MIN: usize = 256 * 1024;

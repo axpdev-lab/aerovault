@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "CLI for AeroVault v2/v3 encrypted vaults with detached .aerocorrect Reed-Solomon error correction"
+readme = "README.md"
 
 [[bin]]
 name = "aerovault"

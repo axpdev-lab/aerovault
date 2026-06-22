@@ -16,6 +16,7 @@ use super::sidecar::{
 };
 use super::{
     compute_error_correction_shards_grid, error_correction_grid, reconstruct_from_error_correction,
+    scan_error_correction_health, ShardHealth,
 };
 
 /// Default per-file cap for sync error correction. Windowed streaming bounds the
@@ -210,6 +211,29 @@ pub fn generate_sync_sidecar_for_file_capped(
         max_file_size,
         max_overhead_pct,
         AEROCORRECT_WINDOW_SIZE,
+        &mut |_, _| {},
+    )
+}
+
+/// `generate_sync_sidecar_for_file_capped` with a `(bytes_done, bytes_total)`
+/// progress callback invoked after each window's parity is computed (#5:
+/// progress for `correct` generation).
+pub fn generate_sync_sidecar_for_file_capped_with_progress(
+    rel_path: &str,
+    path: &Path,
+    pct: u32,
+    max_file_size: u64,
+    max_overhead_pct: u32,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<SyncEcGenerateResult, String> {
+    generate_sync_sidecar_for_file_capped_windowed(
+        rel_path,
+        path,
+        pct,
+        max_file_size,
+        max_overhead_pct,
+        AEROCORRECT_WINDOW_SIZE,
+        progress,
     )
 }
 
@@ -223,6 +247,7 @@ fn generate_sync_sidecar_for_file_capped_windowed(
     max_file_size: u64,
     max_overhead_pct: u32,
     window: u64,
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcGenerateResult, String> {
     let metadata = std::fs::metadata(path).map_err(|e| {
         format!(
@@ -275,6 +300,7 @@ fn generate_sync_sidecar_for_file_capped_windowed(
             window_len: len,
             avec_bytes,
         });
+        progress(off.saturating_add(len), file_size);
     }
     let file_sha256 = finalize_sha256(hasher);
     let sidecar = AeroCorrectSidecar::new(file_sha256, file_size, segments);
@@ -449,6 +475,26 @@ pub fn verify_repair_sync_file_streamed(
     path: &Path,
     sidecar_path: &Path,
 ) -> Result<SyncEcRepairResult, String> {
+    verify_repair_sync_file_streamed_with_progress(
+        rel_path,
+        expected_sha256,
+        path,
+        sidecar_path,
+        &mut |_, _| {},
+    )
+}
+
+/// `verify_repair_sync_file_streamed` with a `(bytes_done, bytes_total)` progress
+/// callback invoked after each window is streamed/repaired (#5: progress for
+/// `correct` repair). On the fast verified path (file already intact) no per-window
+/// callback fires.
+pub fn verify_repair_sync_file_streamed_with_progress(
+    rel_path: &str,
+    expected_sha256: &[u8; 32],
+    path: &Path,
+    sidecar_path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<SyncEcRepairResult, String> {
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
         .len();
@@ -506,6 +552,12 @@ pub fn verify_repair_sync_file_streamed(
             hasher.update(&blocks[0]);
             out.write_all(&blocks[0])
                 .map_err(|e| format!("write AeroSync EC repair temp {}: {e}", path.display()))?;
+            progress(
+                reader.segments()[idx]
+                    .window_offset
+                    .saturating_add(reader.segments()[idx].window_len),
+                file_size,
+            );
         }
         out.flush()
             .map_err(|e| format!("flush AeroSync EC repair temp {}: {e}", path.display()))?;
@@ -580,6 +632,69 @@ pub fn verify_standalone_file_streamed(
     }
 }
 
+/// Read-only scan of a standalone file against its `.aerocorrect` sidecar that
+/// returns BOTH the verified verdict and a per-shard health readout (#9), in a
+/// single streamed pass (bounded memory: one window plus its parity). The file
+/// is never mutated. The hot sync path keeps using the lighter
+/// `verify_standalone_file_streamed` (hash-only); this is the explicit
+/// `correct verify` health readout.
+pub fn scan_standalone_file_streamed(
+    rel_path: &str,
+    path: &Path,
+    sidecar_path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(StandaloneVerifyResult, ShardHealth), String> {
+    let mut reader = AeroCorrectSidecarReader::open(sidecar_path)?;
+    let expected = reader.content_sha256;
+    reader.verify_binding(&expected).map_err(|e| {
+        format!("Standalone EC sidecar for {rel_path} is internally inconsistent: {e}")
+    })?;
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    if reader.total_len != file_size {
+        return Err(format!(
+            "Standalone EC sidecar total length {} != file length {file_size} for {rel_path}",
+            reader.total_len
+        ));
+    }
+    validate_window_tiling_iter(
+        reader
+            .segments()
+            .iter()
+            .map(|s| (s.window_offset, s.window_len)),
+        file_size,
+    )
+    .map_err(|e| format!("Standalone EC sidecar for {rel_path}: {e}"))?;
+
+    let mut src = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut health = ShardHealth::default();
+    for idx in 0..reader.segments().len() {
+        let window_len = usize::try_from(reader.segments()[idx].window_len)
+            .map_err(|_| format!("Standalone EC sidecar window {idx} length exceeds usize"))?;
+        let avec = reader.read_segment_avec(idx)?;
+        let mut buf = vec![0u8; window_len];
+        src.read_exact(&mut buf)
+            .map_err(|e| format!("read {} window {idx}: {e}", path.display()))?;
+        hasher.update(&buf);
+        let blocks = vec![buf];
+        scan_error_correction_health(&blocks, &avec, &mut health)?;
+        progress(
+            reader.segments()[idx]
+                .window_offset
+                .saturating_add(reader.segments()[idx].window_len),
+            file_size,
+        );
+    }
+    let result = if finalize_sha256(hasher) == expected {
+        StandaloneVerifyResult::Verified
+    } else {
+        StandaloneVerifyResult::NeedsRepair
+    };
+    Ok((result, health))
+}
+
 /// Repair a standalone file from its own `.aerocorrect` sidecar (atomic, all-or-nothing).
 /// The sidecar's stored `content_sha256` is the expected good hash; parity is
 /// read window-by-window by `verify_repair_sync_file_streamed`.
@@ -594,6 +709,24 @@ pub fn verify_repair_standalone_file_streamed(
     sidecar_path: &Path,
     expect_sha256: Option<&[u8; 32]>,
 ) -> Result<SyncEcRepairResult, String> {
+    verify_repair_standalone_file_streamed_with_progress(
+        rel_path,
+        path,
+        sidecar_path,
+        expect_sha256,
+        &mut |_, _| {},
+    )
+}
+
+/// `verify_repair_standalone_file_streamed` with a `(bytes_done, bytes_total)`
+/// progress callback (#5: progress for standalone `correct repair`).
+pub fn verify_repair_standalone_file_streamed_with_progress(
+    rel_path: &str,
+    path: &Path,
+    sidecar_path: &Path,
+    expect_sha256: Option<&[u8; 32]>,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<SyncEcRepairResult, String> {
     let reader = AeroCorrectSidecarReader::open(sidecar_path)?;
     let expected = reader.content_sha256;
     drop(reader);
@@ -604,7 +737,13 @@ pub fn verify_repair_standalone_file_streamed(
             ));
         }
     }
-    verify_repair_sync_file_streamed(rel_path, &expected, path, sidecar_path)
+    verify_repair_sync_file_streamed_with_progress(
+        rel_path,
+        &expected,
+        path,
+        sidecar_path,
+        progress,
+    )
 }
 
 #[cfg(test)]
@@ -704,6 +843,72 @@ mod tests {
             SyncEcRepairResult::Verified => panic!("damaged data should need repair"),
         }
         assert_eq!(damaged, data);
+    }
+
+    #[test]
+    fn scan_reports_shard_health_on_corruption() {
+        // #9: the read-only scan returns a per-shard health readout alongside the
+        // verified verdict, for both an intact and a lightly-damaged file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("data.bin");
+        let data = sample_data(200 * 1024 + 7);
+        std::fs::write(&file, &data).expect("write file");
+        let file_str = file.to_str().unwrap();
+        crate::error_correction::correct_generate(file_str, 20, None).expect("generate sidecar");
+        let sidecar = crate::error_correction::aerocorrect_sidecar_path_for(file_str);
+        let sidecar_path = std::path::Path::new(&sidecar);
+
+        // Intact: verified, zero damage, sane non-zero totals.
+        let (res, health) =
+            scan_standalone_file_streamed("data.bin", &file, sidecar_path, &mut |_, _| {})
+                .expect("scan intact");
+        assert_eq!(res, StandaloneVerifyResult::Verified);
+        assert_eq!(health.damaged_data_shards, 0);
+        assert_eq!(health.damaged_parity_shards, 0);
+        assert_eq!(health.unrecoverable_groups, 0);
+        assert!(health.total_data_shards > 0);
+        assert!(health.total_parity_shards > 0);
+
+        // One flipped byte: needs repair, at least one damaged data shard, still
+        // within recovery (no unrecoverable group), totals unchanged.
+        let mut damaged = data.clone();
+        damaged[123_456] ^= 0xA5;
+        std::fs::write(&file, &damaged).expect("write damaged");
+        let (res2, health2) =
+            scan_standalone_file_streamed("data.bin", &file, sidecar_path, &mut |_, _| {})
+                .expect("scan damaged");
+        assert_eq!(res2, StandaloneVerifyResult::NeedsRepair);
+        assert!(health2.damaged_data_shards >= 1);
+        assert_eq!(
+            health2.unrecoverable_groups, 0,
+            "single-byte damage must stay recoverable"
+        );
+        assert_eq!(health2.total_data_shards, health.total_data_shards);
+    }
+
+    #[test]
+    fn correct_generate_reports_progress_to_total() {
+        // #5: the progress callback fires during sidecar generation and reaches
+        // (total, total) on the last window.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("d.bin");
+        let data = sample_data(300 * 1024 + 5);
+        std::fs::write(&file, &data).expect("write");
+        let mut calls = 0u32;
+        let mut last = (0u64, 0u64);
+        crate::error_correction::correct_generate_with_progress(
+            file.to_str().unwrap(),
+            20,
+            None,
+            &mut |done, total| {
+                calls += 1;
+                last = (done, total);
+            },
+        )
+        .expect("generate with progress");
+        assert!(calls >= 1, "progress callback must fire at least once");
+        assert_eq!(last.1, data.len() as u64, "total should be the file size");
+        assert_eq!(last.0, last.1, "final progress should reach the total");
     }
 
     #[test]
@@ -811,6 +1016,7 @@ mod tests {
             AEROSYNC_EC_MAX_FILE_SIZE,
             0,
             window,
+            &mut |_, _| {},
         )
         .unwrap()
         {
@@ -854,6 +1060,7 @@ mod tests {
             AEROSYNC_EC_MAX_FILE_SIZE,
             0,
             window,
+            &mut |_, _| {},
         )
         .unwrap()
         {
@@ -916,6 +1123,7 @@ mod tests {
             AEROSYNC_EC_MAX_FILE_SIZE,
             0,
             window,
+            &mut |_, _| {},
         )
         .unwrap()
         {
@@ -967,6 +1175,7 @@ mod tests {
                 AEROSYNC_EC_MAX_FILE_SIZE,
                 0,
                 window,
+                &mut |_, _| {},
             )
             .unwrap()
             {
