@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories = ["cryptography", "filesystem", "compression"]
+description = "Encrypted vault container format in Rust: AES-256-GCM-SIV, Argon2id, AES-KW, HMAC-SHA512, content-defined chunking with deduplication, and detached Reed-Solomon .aerocorrect error-correction sidecars"
 readme = "../README.md"
 
 [features]
