@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 sync vault operations engine.
 //!
 //! A faithful, byte-for-byte port of the AeroFTP application's AEROVAULT3 vault
@@ -11,7 +15,7 @@
 //! intentionally out of scope; it is wired in T6. Every place the app branched
 //! on EC is marked with a `// T6:` comment.
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};

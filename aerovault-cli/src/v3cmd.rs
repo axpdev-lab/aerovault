@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 container CLI surface (`aerovault vault ...`).
 //!
 //! Drives the crate's [`aerovault::v3`] sync API: create / list / add / extract /
@@ -7,7 +11,7 @@
 //! container lives on the top-level commands (`create`, `list`, ...); this group
 //! is AEROVAULT3 only.
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use std::path::{Path, PathBuf};
 

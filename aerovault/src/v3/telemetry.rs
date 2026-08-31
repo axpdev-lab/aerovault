@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Optional telemetry seam for AEROVAULT3 operations.
 //!
 //! The crate's vault operations are pure and emit no telemetry by default. An
@@ -13,7 +17,7 @@
 //! converged onto the crate. When no sink is attached every call is a no-op and
 //! the produced container bytes are unchanged (the T5 golden proves this).
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 /// A sink that receives technical telemetry events as an AEROVAULT3 operation
 /// runs. All methods default to no-ops so an embedder only implements what it

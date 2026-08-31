@@ -6,7 +6,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/aerovault-cli)](https://crates.io/crates/aerovault-cli)
 [![Library](https://img.shields.io/crates/v/aerovault?label=aerovault%20lib)](https://crates.io/crates/aerovault)
-[![License: GPL-3.0](https://img.shields.io/crates/l/aerovault-cli)](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE)
+[![License: MPL-2.0](https://img.shields.io/crates/l/aerovault-cli)](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE)
 
 Command-line interface for **AeroVault**: military-grade single-file encrypted vaults
 (**AES-256-GCM-SIV**, **Argon2id**, optional **ChaCha20-Poly1305** cascade) with detached
@@ -177,4 +177,4 @@ payload metadata rather than from a CLI-level assumption.
 
 ## License
 
-GPL-3.0-only. See [LICENSE](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE).
+MPL-2.0. See [LICENSE](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE).
