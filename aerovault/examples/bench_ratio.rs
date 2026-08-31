@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Compression-ratio benchmark for the .aerozip (plaintext, EC-off) lane.
 //! Creates an .aerozip from every regular file under a directory at a given zstd
 //! level and reports the container size, so it can be compared apples-to-apples

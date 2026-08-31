@@ -1,10 +1,14 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 1024-byte header: layout, serialize/deserialize, HMAC-SHA512
 //! integrity, and the base-KEK -> (master KEK, MAC KEK) derivation. Byte-for-byte
 //! port of the AeroFTP app (`aerovault_v3.rs`). The exact field offsets and the
 //! "MAC over the full header with the MAC field zeroed" rule are part of the
 //! on-disk contract (T5).
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use hmac::{Hmac, Mac};
 use sha2::Sha512;

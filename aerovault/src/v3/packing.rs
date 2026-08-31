@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 small-file packing layout (the byte-affecting part of the app's
 //! `append_sources_batched` / `flush_pack`). Files strictly smaller than
 //! `PACK_SMALL_FILE_THRESHOLD` are sorted by vault path, concatenated, and
@@ -7,7 +11,7 @@
 //! path. This module models the pure layout so it can be unit-tested without
 //! crypto; `v3::VaultV3` wires it to chunking + encryption (T4).
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use super::constants::{PACK_SMALL_FILE_THRESHOLD, PACK_TARGET};
 

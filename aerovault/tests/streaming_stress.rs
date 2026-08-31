@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! T5 streaming stress + anti-regression suite.
 //!
 //! Two things this file proves that the in-crate unit tests cannot:
@@ -11,7 +15,7 @@
 //!      (empty, 1 byte, min-1/min/min+1, max-1/max/max+1, multi-max, pack
 //!      threshold) round-trips byte-identically through the streaming paths.
 //!
-//! SPDX-License-Identifier: GPL-3.0-only
+//! SPDX-License-Identifier: MPL-2.0
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;

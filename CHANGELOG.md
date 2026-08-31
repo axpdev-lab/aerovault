@@ -2,6 +2,14 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.4] - 2026-08-31
+
+No code change: this release exists to change the licence.
+
+### Changed
+
+- **Licence: GPL-3.0-only to MPL-2.0.** A GPL-3.0-only crate is effectively unusable as a general purpose Rust library: any distributed work built on it has to be distributed under GPL-compatible terms, which in an ecosystem that runs on MIT and Apache-2.0 means almost nobody can take it. The previous terms protected nothing in practice and only made the crate impossible to depend on. MPL-2.0 is file-level copyleft: `aerovault` can be used inside proprietary software without the licence reaching up into the consuming code, and modifications to `aerovault`'s own files must be made available under the MPL when they are distributed. Private, undistributed changes carry no such obligation. Every source file carries the MPL Exhibit A notice. The Exhibit B notice ("Incompatible With Secondary Licenses") is deliberately **not** applied anywhere: MPL 2.0 section 3.3 is what permits a larger work combining MPL files with GPL code, and that permission is lost if Exhibit B is used, so its absence is what keeps this crate combinable with the GPL-3.0-or-later AeroFTP application that consumes it. Versions up to and including 0.6.3 remain available under GPL-3.0-only and are unaffected.
+
 ## [0.6.3] - 2026-06-21
 
 No on-disk format change for encrypted `.aerovault` containers or `.aerocorrect` sidecars: existing containers round-trip identically and the cross-impl goldens still pin byte-for-byte.

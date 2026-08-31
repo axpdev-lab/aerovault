@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Binary format definitions for the AeroVault v2 container.
 //!
 //! This module defines the on-disk structures: the 512-byte header, the encrypted

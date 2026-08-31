@@ -6,7 +6,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/aerovault)](https://crates.io/crates/aerovault)
 [![docs.rs](https://docs.rs/aerovault/badge.svg)](https://docs.rs/aerovault)
-[![License: GPL-3.0](https://img.shields.io/crates/l/aerovault)](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE)
+[![License: MPL-2.0](https://img.shields.io/crates/l/aerovault)](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE)
 
 Military-grade encrypted vault format for single-file encrypted containers.
 
@@ -22,7 +22,7 @@ Three different numbers are easy to conflate; they are independent:
 
 - **Container on-disk major** is the magic plus format byte in the file. Two lineages exist: legacy `AEROVAULT2` (512-byte header) and `AEROVAULT3` (1024-byte header).
 - **Container product revision** is `rev. 3` for the AEROVAULT3 container alone, `rev. 4` once the non-critical Reed-Solomon Error Correction extension is added. The on-disk major stays 3 either way (a rev. 3 reader opens a rev. 4 file).
-- **Crate package version** is this crate's semver (`0.6.0`), unrelated to either of the above.
+- **Crate package version** is this crate's semver (`0.6.4`), unrelated to either of the above.
 
 ## Cryptographic Stack
 
@@ -314,7 +314,7 @@ The KDF, cipher, wrapping and filename rows are shared by both container lineage
 
 ## License
 
-GPL-3.0 -- See [LICENSE](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE) for details.
+MPL-2.0 -- See [LICENSE](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE) for details. File-level copyleft: aerovault can be used inside proprietary software, and modifications to aerovault's own files must be made available under the MPL when you distribute them.
 
 ## Origin
 

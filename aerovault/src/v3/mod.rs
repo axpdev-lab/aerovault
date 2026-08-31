@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 container (product revision 3, and revision 4 with the
 //! `.aerocorrect` Error Correction extension).
 //!
@@ -12,7 +16,7 @@
 //! - T4 `VaultV3`: the sync vault API.
 //! - T6 `ec`: Error Correction wiring (rev. 4).
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 pub mod block;
 pub mod chunking;

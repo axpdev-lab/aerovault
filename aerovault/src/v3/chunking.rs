@@ -1,10 +1,14 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 content pipeline: content-defined chunking (gear-CDC), keyed
 //! BLAKE3 chunk ids, per-chunk zstd. Byte-for-byte port of the AeroFTP app
 //! (`aerovault_v3.rs`): the gear seed string, rolling-hash formula, break
 //! condition, chunk-id truncation, and zstd level must all match exactly or a
 //! container will not cross-open with the app (T5 contract).
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use serde::{Deserialize, Serialize};
 

@@ -1,9 +1,13 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 manifest: the encrypted JSON index of wrappers, entries, and
 //! chunk records, plus the extension directory entry type. Byte-for-byte port
 //! of the AeroFTP app structs and their serde shape (field names + order +
 //! skip-if-none) so an app-written manifest deserializes here and vice versa.
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use std::collections::BTreeMap;
 

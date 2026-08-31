@@ -1,10 +1,14 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 block + file assembly. The data section is a sequence of
 //! `[block_len: u64 LE][ciphertext]` records starting at `DATA_OFFSET`; the file
 //! is `header | data | encrypted manifest | extension dir JSON | extension
 //! payloads`, with all offsets/lengths recorded in the (MAC-covered) header.
 //! Byte-for-byte port of the app `build_file_bytes` / section reader.
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use std::io::{Read, Seek, SeekFrom, Write};
 

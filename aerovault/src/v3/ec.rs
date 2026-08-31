@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! AEROVAULT3 rev. 4 Error Correction (Reed-Solomon `.aerocorrect`).
 //!
 //! A faithful, byte-for-byte port of the AeroFTP application's AEROVAULT3 Error
@@ -15,7 +19,7 @@
 //! overwrite good data (CLAUDE-AV-ECC-01). The `.aerocorrect` content-SHA binding
 //! is informational and is never enforced on the repair path (#276).
 
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: MPL-2.0
 
 use std::collections::BTreeMap;
 use std::fs::File;
