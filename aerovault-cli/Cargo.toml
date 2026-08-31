@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "CLI for AeroVault v2/v3 encrypted vaults with detached .aerocorrect Reed-Solomon error correction"
 readme = "README.md"
 
