@@ -74,7 +74,18 @@
 //! See [`AEROVAULT-V2-SPEC.md`](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V2-SPEC.md)
 //! for the complete format specification.
 
+// `fast-kdf-for-tests` lowers the KDF cost to the floor; a vault written that
+// way is unreadable by a production build. Refuse the feature anywhere that
+// is not a debug build, so it can never ride into a release by feature
+// unification.
+#[cfg(all(feature = "fast-kdf-for-tests", not(debug_assertions)))]
+compile_error!("aerovault: the `fast-kdf-for-tests` feature is for debug test builds only");
+
 pub mod aerocrypt;
+/// The audited Argon2id profile by name, whatever features this build has:
+/// consumers that describe a real vault (an emergency kit, a security report)
+/// refer to these, never to the constants a test build may have lowered.
+pub use constants::{AUDITED_ARGON2_M_COST, AUDITED_ARGON2_T_COST};
 pub(crate) mod constants;
 pub(crate) mod crypto;
 pub mod error;

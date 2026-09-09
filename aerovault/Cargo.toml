@@ -17,6 +17,13 @@ readme = "../README.md"
 # timestamp so containers are byte-reproducible for the cross-impl golden (T5).
 # Never enable in a production build.
 test-vectors = []
+# Test-only: derive keys with the cheapest Argon2id profile (8 MiB, t=1)
+# instead of the audited 128 MiB / t=4, so a consumer's test suite that
+# creates and opens thousands of vaults does not spend its time in the KDF.
+# A vault written under this feature cannot be opened by a production build
+# (the profile is a format constant, not a header field), which is the point:
+# it is refused at compile time in any non-debug build. Never ship it.
+fast-kdf-for-tests = []
 
 [dependencies]
 aes-gcm-siv = { workspace = true }
