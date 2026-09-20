@@ -2,6 +2,12 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.5] - 2026-09-09
+
+### Added
+
+- **`fast-kdf-for-tests` feature: derive with the cheapest Argon2id profile (8 MiB, t=1) instead of the audited 128 MiB / t=4, for a consumer's test suite only.** AeroFTP's tests create and open thousands of vaults per run and spent 1722 s in the KDF alone. The profile is a format constant, not a header field, so a vault written under the feature cannot be opened by a production build: the feature is refused at compile time in any non-debug build (`compile_error!`), and the audited numbers stay reachable by name (`AUDITED_ARGON2_M_COST`, `AUDITED_ARGON2_T_COST`, re-exported at the crate root). No change to any derivation without the feature; a test pins the audited profile in both feature states.
+
 ## [0.6.4] - 2026-08-31
 
 No code change: this release exists to change the licence.

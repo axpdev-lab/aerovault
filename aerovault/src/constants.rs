@@ -49,11 +49,25 @@ pub const MIN_PASSWORD_LENGTH: usize = 8;
 // --- Argon2id Parameters ---
 // These exceed OWASP 2024 recommendations (64 MiB / t=3 / p=1).
 
-/// Argon2id memory cost in KiB (128 MiB).
-pub const ARGON2_M_COST: u32 = 128 * 1024;
+/// The audited Argon2id memory cost in KiB (128 MiB).
+pub const AUDITED_ARGON2_M_COST: u32 = 128 * 1024;
 
-/// Argon2id time cost (iterations).
-pub const ARGON2_T_COST: u32 = 4;
+/// The audited Argon2id time cost (iterations).
+pub const AUDITED_ARGON2_T_COST: u32 = 4;
+
+/// Argon2id memory cost in KiB used by every derivation: the audited 128 MiB,
+/// or 8 MiB under the test-only `fast-kdf-for-tests` feature (see Cargo.toml).
+#[cfg(not(feature = "fast-kdf-for-tests"))]
+pub const ARGON2_M_COST: u32 = AUDITED_ARGON2_M_COST;
+#[cfg(feature = "fast-kdf-for-tests")]
+pub const ARGON2_M_COST: u32 = 8 * 1024;
+
+/// Argon2id time cost (iterations): the audited 4, or 1 under
+/// `fast-kdf-for-tests`.
+#[cfg(not(feature = "fast-kdf-for-tests"))]
+pub const ARGON2_T_COST: u32 = AUDITED_ARGON2_T_COST;
+#[cfg(feature = "fast-kdf-for-tests")]
+pub const ARGON2_T_COST: u32 = 1;
 
 /// Argon2id parallelism degree.
 pub const ARGON2_P_COST: u32 = 4;
@@ -71,3 +85,36 @@ pub const HKDF_LABEL_CHACHA: &[u8] = b"AeroVault v2 ChaCha20-Poly1305 cascade";
 
 /// HKDF info label for the AES-SIV filename encryption key.
 pub const HKDF_LABEL_SIV: &[u8] = b"AeroVault v2 AES-SIV filename encryption";
+
+#[cfg(test)]
+mod kdf_profile_tests {
+    use super::*;
+
+    /// The audited profile is what every build derives with unless the
+    /// test-only feature is on; a silent change to the numbers shows here.
+    #[cfg(not(feature = "fast-kdf-for-tests"))]
+    #[test]
+    fn every_derivation_uses_the_audited_profile() {
+        assert_eq!(
+            (ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST),
+            (128 * 1024, 4, 4)
+        );
+        assert_eq!(ARGON2_M_COST, AUDITED_ARGON2_M_COST);
+        assert_eq!(ARGON2_T_COST, AUDITED_ARGON2_T_COST);
+    }
+
+    /// Under the feature the profile is the floor, and the audited numbers
+    /// are still reachable by name so a consumer can describe the real vault.
+    #[cfg(feature = "fast-kdf-for-tests")]
+    #[test]
+    fn the_test_feature_derives_at_the_floor_and_keeps_the_audited_numbers_by_name() {
+        assert_eq!(
+            (ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST),
+            (8 * 1024, 1, 4)
+        );
+        assert_eq!(
+            (AUDITED_ARGON2_M_COST, AUDITED_ARGON2_T_COST),
+            (128 * 1024, 4)
+        );
+    }
+}

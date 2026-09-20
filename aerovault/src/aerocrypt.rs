@@ -39,8 +39,10 @@ pub const WRAPPED_KEY_SIZE: usize = 40;
 
 /// The audited AeroVault Argon2id profile: 128 MiB / t=4 / p=4
 /// (RFC 9106, exceeds OWASP 2024). Tuned once, shared by every consumer.
-const ARGON2_MEM_KIB: u32 = 128 * 1024;
-const ARGON2_TIME: u32 = 4;
+// Same profile and same test-only reduction as `constants::ARGON2_*`: the two
+// families (v2 vault, AEROVAULT3 / AeroCrypt) share one audited profile.
+const ARGON2_MEM_KIB: u32 = crate::constants::ARGON2_M_COST;
+const ARGON2_TIME: u32 = crate::constants::ARGON2_T_COST;
 const ARGON2_LANES: u32 = 4;
 
 /// Argon2id memory cost (KiB) of the shared profile. Exposed so consumers can
