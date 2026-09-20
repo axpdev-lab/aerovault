@@ -32,6 +32,10 @@
 use aes_gcm_siv::aead::Aead;
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use aes_kw::Kek;
+// The two AEADs come from different generations of the RustCrypto stack, so
+// their `Aead` and `KeyInit` traits are different traits with the same names.
+// Import ChaCha's under its own names rather than shadowing AES-GCM-SIV's.
+use chacha20poly1305::aead::{Aead as ChaChaAead, KeyInit as ChaChaKeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -324,23 +328,23 @@ pub(crate) fn encrypt_chunk_cascade_bound(
     let inner = encrypt_chunk_bound(master_key, plaintext, chunk_index, file_id, chunk_count)?;
 
     // Second layer: ChaCha20-Poly1305
-    let chacha = ChaCha20Poly1305::new_from_slice(chacha_key)
+    let chacha = <ChaCha20Poly1305 as ChaChaKeyInit>::new_from_slice(chacha_key)
         .map_err(|e| CryptoError::SivOperation(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
 
     let aad = chunk_aad(chunk_index, file_id, chunk_count);
-    let outer = chacha
-        .encrypt(
-            nonce,
-            chacha20poly1305::aead::Payload {
-                msg: &inner,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::CascadeEncrypt { chunk_index })?;
+    let outer = ChaChaAead::encrypt(
+        &chacha,
+        &nonce,
+        chacha20poly1305::aead::Payload {
+            msg: &inner,
+            aad: &aad,
+        },
+    )
+    .map_err(|_| CryptoError::CascadeEncrypt { chunk_index })?;
 
     let mut output = Vec::with_capacity(NONCE_SIZE + outer.len());
     output.extend_from_slice(&nonce_bytes);
@@ -372,22 +376,24 @@ pub(crate) fn decrypt_chunk_cascade_bound(
     }
 
     // Peel outer layer: ChaCha20-Poly1305
-    let chacha = ChaCha20Poly1305::new_from_slice(chacha_key)
+    let chacha = <ChaCha20Poly1305 as ChaChaKeyInit>::new_from_slice(chacha_key)
         .map_err(|e| CryptoError::SivOperation(e.to_string()))?;
 
-    let nonce = chacha20poly1305::Nonce::from_slice(&encrypted[..NONCE_SIZE]);
+    let mut nonce_bytes = [0u8; NONCE_SIZE];
+    nonce_bytes.copy_from_slice(&encrypted[..NONCE_SIZE]);
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
     let ciphertext = &encrypted[NONCE_SIZE..];
     let aad = chunk_aad(chunk_index, file_id, chunk_count);
 
-    let inner = chacha
-        .decrypt(
-            nonce,
-            chacha20poly1305::aead::Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| CryptoError::CascadeDecrypt { chunk_index })?;
+    let inner = ChaChaAead::decrypt(
+        &chacha,
+        &nonce,
+        chacha20poly1305::aead::Payload {
+            msg: ciphertext,
+            aad: &aad,
+        },
+    )
+    .map_err(|_| CryptoError::CascadeDecrypt { chunk_index })?;
 
     // Peel inner layer: AES-256-GCM-SIV
     decrypt_chunk_bound(master_key, &inner, chunk_index, file_id, chunk_count)

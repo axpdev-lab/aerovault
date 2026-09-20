@@ -2,6 +2,14 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.6] - 2026-09-20
+
+No on-disk format change: the cross-impl goldens still pin byte-for-byte, and a container written by an earlier version opens unchanged.
+
+### Changed
+
+- **`chacha20poly1305` 0.10 to 0.11.** The outer layer of the cascade moves to the current RustCrypto AEAD generation. ChaCha20-Poly1305 is RFC 8439 and the crate version does not change it, so the ciphertext a given key, nonce and associated data produce is the same: `crate_opens_and_extracts_golden` reads the fixture written months ago and `golden_is_byte_reproducible` reproduces its bytes exactly. The change is confined to how the API is called: the two AEADs in the cascade now come from different generations of the stack, whose `Aead` and `KeyInit` traits share their names, so ChaCha's are imported under their own names instead of shadowing AES-GCM-SIV's, and the nonce is built as an array rather than through the removed `from_slice`. The benefit is for the consumer: an application that also uses `chacha20poly1305` directly no longer has to hold 0.10 back for this crate, and carries one copy of the dependency instead of two.
+
 ## [0.6.5] - 2026-09-09
 
 ### Added
