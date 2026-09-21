@@ -15,7 +15,7 @@ readme = "../README.md"
 [features]
 # Test-only: replace the CSPRNG with a deterministic stream and freeze the
 # timestamp so containers are byte-reproducible for the cross-impl golden (T5).
-# Never enable in a production build.
+# Refused without debug assertions. Never enable in a production build.
 test-vectors = []
 # Test-only: derive keys with the cheapest Argon2id profile (8 MiB, t=1)
 # instead of the audited 128 MiB / t=4, so a consumer's test suite that

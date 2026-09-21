@@ -2376,10 +2376,15 @@ fn add_directory_into(
     let mut all_entries: Vec<DirEntry> = Vec::new();
     for entry in walkdir::WalkDir::new(&source)
         .follow_links(false)
-        .max_depth(100)
+        // Inspect one level beyond the supported depth so truncation is an
+        // error rather than a successful but incomplete archive.
+        .max_depth(101)
         .into_iter()
-        .filter_map(|e| e.ok())
     {
+        let entry = entry.map_err(|e| format!("Scan directory {}: {e}", source.display()))?;
+        if entry.depth() > 100 {
+            return Err("Directory exceeds maximum depth (100)".to_string());
+        }
         if entry.path() == source {
             continue;
         }

@@ -49,7 +49,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build CLI
-        run: cargo build --release -p aerovault-cli --target ${{ matrix.target }}
+        run: cargo build --locked --release -p aerovault-cli --target ${{ matrix.target }}
 
       - name: Package (Linux)
         if: matrix.archive == 'tar.gz'

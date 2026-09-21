@@ -37,6 +37,24 @@ Three different numbers are easy to conflate; they are independent:
 | Key Separation | HKDF-SHA256 | RFC 5869 |
 | Error Correction | Reed-Solomon parity sidecar | `.aerocorrect` v2 (self-healing) |
 
+## Memory and concurrency contracts
+
+AEROVAULT3 processes input and extraction in chunks, but an open `VaultV3`
+keeps the complete stored data section in memory. RAM therefore scales with
+compressed/encrypted vault size, plus metadata, transient KDF memory and any
+error-correction work. Streaming seal avoids a second whole-container copy;
+it does not make total memory independent of vault size.
+
+Mutating an AEROVAULT3 vault from multiple processes requires an external lock
+held from before opening through the final save. The generation check detects
+many stale writes but is not a cross-process lock. The current CLI does not
+supply that lock: serialize commands that mutate the same vault.
+
+The `test-vectors` and `fast-kdf-for-tests` features are exclusively for tests.
+Do not enable either in software handling real data, including debug builds.
+Run compatibility goldens with `test-vectors` alone: the fast KDF deliberately
+cannot unlock production-profile fixtures.
+
 ## Installation
 
 ### From source

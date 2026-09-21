@@ -1,0 +1,36 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - name: Production-profile compatibility golden
+        if: runner.os == 'Linux'
+        run: cargo test -p aerovault --locked --features test-vectors --test aerovault3_cross_impl_v3
+      - name: Reject test-only features without debug assertions
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for feature in test-vectors fast-kdf-for-tests; do
+            if cargo check -p aerovault --locked --release --features "$feature" > feature.log 2>&1; then
+              echo "Unsafe release feature accepted: $feature"
+              exit 1
+            fi
+            grep -F "feature is for debug test builds only" feature.log
+          done

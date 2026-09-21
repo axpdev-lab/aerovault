@@ -81,6 +81,11 @@
 #[cfg(all(feature = "fast-kdf-for-tests", not(debug_assertions)))]
 compile_error!("aerovault: the `fast-kdf-for-tests` feature is for debug test builds only");
 
+// Deterministic keys/nonces are only for golden fixtures. Match the existing
+// fast-KDF guard; debug assertions remain required for either test seam.
+#[cfg(all(feature = "test-vectors", not(debug_assertions)))]
+compile_error!("aerovault: the `test-vectors` feature is for debug test builds only");
+
 pub mod aerocrypt;
 /// The audited Argon2id profile by name, whatever features this build has:
 /// consumers that describe a real vault (an emergency kit, a security report)
