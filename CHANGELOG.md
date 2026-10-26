@@ -2,6 +2,12 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.7] - 2026-10-26
+
+### Security
+
+- Require zstd 0.14.3, resolving the old zstd 0.13 / zstd-safe 7 dependency path and its RustSec stream-context, decompression and memory-safety advisories. The container formats and public API are unchanged.
+
 ## [0.6.6] - 2026-09-20
 
 No on-disk format change: the cross-impl goldens still pin byte-for-byte, and a container written by an earlier version opens unchanged.

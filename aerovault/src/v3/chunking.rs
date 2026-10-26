@@ -220,7 +220,7 @@ impl<R: std::io::Read> StreamingChunker<R> {
 
 /// Per-chunk zstd compression at `level` (matches the app's
 /// `zstd::stream::encode_all`). Frames are byte-identical when the linked
-/// libzstd version matches (this crate and the app both pin zstd 0.13.x).
+/// libzstd version matches (this crate and the app both require zstd 0.14.3 or later in the 0.14 line).
 pub fn zstd_compress(chunk: &[u8], level: i32) -> Result<Vec<u8>, String> {
     zstd::stream::encode_all(chunk, level).map_err(|e| format!("zstd compress failed: {e}"))
 }
