@@ -2,6 +2,18 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.8] - 2026-10-27
+
+### Security
+
+- **Exclusive temporary vault files.** Legacy vault creation, manifest replacement, compaction and password changes use randomly named, exclusively created files in the destination directory instead of predictable temporary paths. Writes, flush and file synchronization use the open handle before replacement.
+
+### Fixed
+
+- **Existing Unix vault permissions survive replacement.** Regular vault files retain their permission bits during updates, compaction and password changes, with special bits removed. New vaults remain private at0600, and symlink modes are not inherited. This does not preserve ownership, ACLs or extended attributes, and the existing Windows remove-before-rename behavior is unchanged.
+
+No container-format, encryption-algorithm or key-derivation change.
+
 ## [0.6.7] - 2026-10-26
 
 ### Security
