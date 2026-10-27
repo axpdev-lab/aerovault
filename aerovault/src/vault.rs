@@ -1623,9 +1623,23 @@ fn temporary_vault_file(path: &Path, suffix: &str) -> crate::Result<tempfile::Na
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    Ok(tempfile::Builder::new()
+    let tmp = tempfile::Builder::new()
         .prefix(&format!(".aerovault-{suffix}-"))
-        .tempfile_in(parent)?)
+        .tempfile_in(parent)?;
+    // The rename replaces the vault's mode with the temp file's 0600. Keep the
+    // mode of an existing regular vault (special bits dropped); a symlink's
+    // 0777 is never lent, and a new vault stays 0600.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(
+                    meta.permissions().mode() & 0o777,
+                ))?;
+        }
+    }
+    Ok(tmp)
 }
 
 /// Atomic rename: tmp -> final as the single visible commit point.
@@ -2154,5 +2168,43 @@ mod tests {
 
         let reopened = Vault::open(&path, "new-password-456").unwrap();
         assert!(reopened.list().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_replacement_preserves_existing_vault_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerovault");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let mut vault = Vault::create(CreateOptions::new(&path, "old-password-123")).unwrap();
+        assert_eq!(mode(&path), 0o600, "a new vault stays private");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let input = dir.path().join("input.txt");
+        std::fs::write(&input, b"vault payload").unwrap();
+        vault.add_files(&[&input]).unwrap();
+        assert_eq!(mode(&path), 0o640, "manifest update");
+        vault.compact().unwrap();
+        assert_eq!(mode(&path), 0o640, "compaction");
+        vault.change_password("new-password-456").unwrap();
+        assert_eq!(mode(&path), 0o640, "password change");
+
+        // Special bits are never carried over, and a symlinked vault path does
+        // not lend its link mode (0777 on Linux) to the replacement file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4640)).unwrap();
+        let second = dir.path().join("second.txt");
+        std::fs::write(&second, b"second payload").unwrap();
+        vault.add_files(&[&second]).unwrap();
+        assert_eq!(mode(&path), 0o640, "setuid dropped");
+        let target = dir.path().join("real.aerovault");
+        std::fs::rename(&path, &target).unwrap();
+        symlink(&target, &path).unwrap();
+        let reopened = Vault::open(&path, "new-password-456").unwrap();
+        let third = dir.path().join("third.txt");
+        std::fs::write(&third, b"third payload").unwrap();
+        reopened.add_files(&[&third]).unwrap();
+        assert_eq!(mode(&path), 0o600, "symlink mode not copied");
     }
 }
