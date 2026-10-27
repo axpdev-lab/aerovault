@@ -175,9 +175,8 @@ impl Vault {
         let manifest_bytes = encrypted_manifest.as_bytes();
 
         // Write vault file atomically via temp + fsync + rename
-        let tmp_path = format!("{}.create.tmp", opts.path.display());
-        let file = File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
+        let tmp = temporary_vault_file(&opts.path, "create")?;
+        let mut writer = BufWriter::new(tmp.as_file());
 
         writer.write_all(&header.to_bytes())?;
         writer.write_all(&(manifest_bytes.len() as u32).to_le_bytes())?;
@@ -186,7 +185,7 @@ impl Vault {
         writer.get_ref().sync_all()?;
         drop(writer);
 
-        atomic_rename(&tmp_path, &opts.path)?;
+        atomic_rename(tmp.path(), &opts.path)?;
 
         let master_key = SecretVec::new(master_key_raw.to_vec());
         let mac_key = SecretVec::new(mac_key_raw.to_vec());
@@ -1264,9 +1263,8 @@ impl Vault {
             crypto::encrypt_filename(self.master_key.expose_secret(), &manifest_json)?;
         let manifest_bytes = encrypted_manifest.as_bytes();
 
-        let tmp_path = format!("{}.compact.tmp", self.path.display());
-        let tmp_file = File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(tmp_file);
+        let tmp = temporary_vault_file(&self.path, "compact")?;
+        let mut writer = BufWriter::new(tmp.as_file());
 
         writer.write_all(&header_buf)?;
         writer.write_all(&(manifest_bytes.len() as u32).to_le_bytes())?;
@@ -1276,7 +1274,7 @@ impl Vault {
         writer.get_ref().sync_all()?;
         drop(writer);
 
-        atomic_rename(&tmp_path, &self.path)?;
+        atomic_rename(tmp.path(), &self.path)?;
 
         let compacted_size = std::fs::metadata(&self.path)?.len();
 
@@ -1385,9 +1383,8 @@ impl Vault {
             crypto::encrypt_filename(self.master_key.expose_secret(), &manifest_json)?;
         let manifest_bytes = encrypted_manifest.as_bytes();
 
-        let tmp_path = format!("{}.tmp", self.path.display());
-        let file = File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
+        let tmp = temporary_vault_file(&self.path, "write")?;
+        let mut writer = BufWriter::new(tmp.as_file());
 
         writer.write_all(header_buf)?;
         writer.write_all(&(manifest_bytes.len() as u32).to_le_bytes())?;
@@ -1398,7 +1395,7 @@ impl Vault {
         writer.get_ref().sync_all()?;
         drop(writer);
 
-        atomic_rename(&tmp_path, &self.path)?;
+        atomic_rename(tmp.path(), &self.path)?;
         Ok(())
     }
 }
@@ -1621,8 +1618,32 @@ fn fsync_parent_dir(_path: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+fn temporary_vault_file(path: &Path, suffix: &str) -> crate::Result<tempfile::NamedTempFile> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!(".aerovault-{suffix}-"))
+        .tempfile_in(parent)?;
+    // The rename replaces the vault's mode with the temp file's 0600. Keep the
+    // mode of an existing regular vault (special bits dropped); a symlink's
+    // 0777 is never lent, and a new vault stays 0600.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(
+                    meta.permissions().mode() & 0o777,
+                ))?;
+        }
+    }
+    Ok(tmp)
+}
+
 /// Atomic rename: tmp -> final as the single visible commit point.
-fn atomic_rename(tmp_path: &str, final_path: &Path) -> crate::Result<()> {
+fn atomic_rename(tmp_path: &Path, final_path: &Path) -> crate::Result<()> {
     #[cfg(windows)]
     if final_path.exists() {
         std::fs::remove_file(final_path)?;
@@ -1635,9 +1656,8 @@ fn atomic_rename(tmp_path: &str, final_path: &Path) -> crate::Result<()> {
 
 /// Atomic write: write to temp file with fsync, then rename.
 fn atomic_write(path: &Path, data: &[u8], suffix: &str) -> crate::Result<()> {
-    let tmp_path = format!("{}.{suffix}.tmp", path.display());
-    let file = File::create(&tmp_path)?;
-    let mut writer = BufWriter::new(file);
+    let tmp = temporary_vault_file(path, suffix)?;
+    let mut writer = BufWriter::new(tmp.as_file());
     writer.write_all(data)?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
@@ -1648,7 +1668,7 @@ fn atomic_write(path: &Path, data: &[u8], suffix: &str) -> crate::Result<()> {
         std::fs::remove_file(path)?;
     }
 
-    std::fs::rename(&tmp_path, path)?;
+    std::fs::rename(tmp.path(), path)?;
     fsync_parent_dir(path)?;
     Ok(())
 }
@@ -2086,5 +2106,105 @@ mod tests {
         assert!(vault.copy_entry("docs", "docs/archive").is_err());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_legacy_temp_symlinks_are_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerovault");
+        let victim = dir.path().join("outside.txt");
+        std::fs::write(&victim, b"outside-vault-target").unwrap();
+
+        let plant = |name: &str| {
+            let temp = PathBuf::from(format!("{}.{}", path.display(), name));
+            symlink(&victim, &temp).unwrap();
+            temp
+        };
+        let assert_victim_intact = || {
+            assert_eq!(std::fs::read(&victim).unwrap(), b"outside-vault-target");
+        };
+
+        let create_tmp = plant("create.tmp");
+        let mut vault = Vault::create(CreateOptions::new(&path, "old-password-123")).unwrap();
+        assert_victim_intact();
+        assert!(create_tmp
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let input = dir.path().join("input.txt");
+        std::fs::write(&input, b"vault payload").unwrap();
+        let write_tmp = plant("tmp");
+        vault.add_files(&[&input]).unwrap();
+        assert_victim_intact();
+        assert!(write_tmp
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let chpw_tmp = plant("chpw.tmp");
+        vault.change_password("new-password-456").unwrap();
+        assert_victim_intact();
+        assert!(chpw_tmp
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        vault.delete_entry("input.txt").unwrap();
+        let compact_tmp = plant("compact.tmp");
+        vault.compact().unwrap();
+        assert_victim_intact();
+        assert!(compact_tmp
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let reopened = Vault::open(&path, "new-password-456").unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_replacement_preserves_existing_vault_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerovault");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let mut vault = Vault::create(CreateOptions::new(&path, "old-password-123")).unwrap();
+        assert_eq!(mode(&path), 0o600, "a new vault stays private");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let input = dir.path().join("input.txt");
+        std::fs::write(&input, b"vault payload").unwrap();
+        vault.add_files(&[&input]).unwrap();
+        assert_eq!(mode(&path), 0o640, "manifest update");
+        vault.compact().unwrap();
+        assert_eq!(mode(&path), 0o640, "compaction");
+        vault.change_password("new-password-456").unwrap();
+        assert_eq!(mode(&path), 0o640, "password change");
+
+        // Special bits are never carried over, and a symlinked vault path does
+        // not lend its link mode (0777 on Linux) to the replacement file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4640)).unwrap();
+        let second = dir.path().join("second.txt");
+        std::fs::write(&second, b"second payload").unwrap();
+        vault.add_files(&[&second]).unwrap();
+        assert_eq!(mode(&path), 0o640, "setuid dropped");
+        let target = dir.path().join("real.aerovault");
+        std::fs::rename(&path, &target).unwrap();
+        symlink(&target, &path).unwrap();
+        let reopened = Vault::open(&path, "new-password-456").unwrap();
+        let third = dir.path().join("third.txt");
+        std::fs::write(&third, b"third payload").unwrap();
+        reopened.add_files(&[&third]).unwrap();
+        assert_eq!(mode(&path), 0o600, "symlink mode not copied");
     }
 }
