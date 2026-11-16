@@ -1297,6 +1297,44 @@ mod tests {
     }
 
     #[test]
+    fn writes_refuse_damaged_blocks_so_embedded_parity_survives() {
+        // Every save recomputes the embedded parity from the current blocks;
+        // over a damaged block that would destroy the parity that repairs it.
+        let vp = tmp("embedded-damaged.aerovault");
+        let src = tmp("embedded-damaged-src");
+        std::fs::create_dir_all(&src).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&vp, PW),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+        corrupt_data_section(&vp, 32);
+        let damaged = std::fs::read(&vp).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        let err = VaultV3::change_password(&mut vault, "ec-test-new-password-456").unwrap_err();
+        assert!(err.contains("damaged"), "{err}");
+        let extra = src.join("extra.txt");
+        std::fs::write(&extra, b"extra").unwrap();
+        let err = VaultV3::add_files(&mut vault, &[(extra, "extra.txt".to_string())]).unwrap_err();
+        assert!(err.contains("damaged"), "{err}");
+        assert_eq!(std::fs::read(&vp).unwrap(), damaged);
+
+        let (repaired, _) = VaultV3::repair(&mut vault, false, None).unwrap();
+        assert!(repaired > 0);
+        drop(vault);
+        let vault = VaultV3::open(&vp, PW).unwrap();
+        assert!(VaultV3::scrub(&vault).is_empty());
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
     fn change_password_refuses_damaged_blocks_and_keeps_sidecar() {
         // Refreshing the sidecar over a damaged block would replace the parity
         // that can still repair it: the change must be refused, nothing touched.

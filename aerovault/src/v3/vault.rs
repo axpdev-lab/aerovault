@@ -477,8 +477,10 @@ impl VaultV3 {
 
     /// Add files into the vault at the given vault-relative paths, then persist.
     pub fn add_files(vault: &mut OpenVaultV3, sources: &[(PathBuf, String)]) -> Result<(), String> {
-        append_sources_batched(vault, sources)?;
-        save_open_vault(vault)
+        restore_on_err(vault, |v| {
+            append_sources_batched(v, sources)?;
+            save_open_vault(v)
+        })
     }
 
     /// Add `sources` into directory `target_dir`, joining each source's file
@@ -500,11 +502,13 @@ impl VaultV3 {
             };
             mapped.push((source.clone(), entry_path));
         }
-        if !target.is_empty() {
-            create_directory_in_manifest(&mut vault.manifest, target)?;
-        }
-        append_sources_batched(vault, &mapped)?;
-        save_open_vault(vault)
+        restore_on_err(vault, |v| {
+            if !target.is_empty() {
+                create_directory_in_manifest(&mut v.manifest, target)?;
+            }
+            append_sources_batched(v, &mapped)?;
+            save_open_vault(v)
+        })
     }
 
     /// Create a directory (and any missing parents) inside the vault, persist.
@@ -523,7 +527,7 @@ impl VaultV3 {
         source_dir: &Path,
         target_prefix: Option<&str>,
     ) -> Result<(usize, usize), String> {
-        add_directory_into(vault, source_dir, target_prefix)
+        restore_on_err(vault, |v| add_directory_into(v, source_dir, target_prefix))
     }
 
     /// Delete a single entry (file or empty directory), then persist.
@@ -591,8 +595,15 @@ impl VaultV3 {
                 "Vault has damaged blocks: run repair before changing the password".to_string(),
             );
         }
+        let (header, modified) = (vault.header.clone(), vault.manifest.modified.clone());
         change_password_in_place(vault, new_password)?;
-        save_open_vault(vault)?;
+        if let Err(e) = save_open_vault(vault) {
+            // The caller is told the change failed: a later save on this
+            // handle must not persist the new password.
+            vault.header = header;
+            vault.manifest.modified = modified;
+            return Err(e);
+        }
         if refresh {
             refresh_sidecar(vault, &sidecar, new_password)?;
         }
@@ -1127,15 +1138,24 @@ fn flush_pack(
 /// Add a set of sources, batching sub-threshold files into shared packs before
 /// chunking and routing large files through the per-file path. Deterministic
 /// path ordering keeps packs (and therefore dedup) stable across identical adds.
-fn append_sources_batched(
+/// Extract progress total: file sizes come from the manifest, so the sum saturates.
+fn progress_total(entries: &[&ManifestEntryV3]) -> u64 {
+    entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .fold(0u64, |acc, e| acc.saturating_add(e.size))
+}
+
+/// Run an add and its save; on any error restore the open handle, so a later
+/// write cannot persist a change the caller was told had failed (such as the
+/// removal of a file it was replacing).
+fn restore_on_err<T>(
     vault: &mut OpenVaultV3,
-    sources: &[(PathBuf, String)],
-) -> Result<(), String> {
-    // An add that fails part-way must not leave the open handle half-applied:
-    // a later save would persist the removal of a file it was replacing.
+    op: impl FnOnce(&mut OpenVaultV3) -> Result<T, String>,
+) -> Result<T, String> {
     let manifest = vault.manifest.clone();
     let data_len = vault.data.len();
-    let result = append_sources_into(vault, sources);
+    let result = op(vault);
     if result.is_err() {
         vault.manifest = manifest;
         vault.data.truncate(data_len);
@@ -1143,7 +1163,7 @@ fn append_sources_batched(
     result
 }
 
-fn append_sources_into(
+fn append_sources_batched(
     vault: &mut OpenVaultV3,
     sources: &[(PathBuf, String)],
 ) -> Result<(), String> {
@@ -2223,6 +2243,15 @@ fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
 /// must apply their own external lock.
 pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     assert_vault_generation_current(vault)?;
+    // The embedded parity is recomputed below from the current blocks: over a
+    // damaged block it would replace the parity that can still repair it.
+    let has_embedded_parity = vault
+        .extensions
+        .iter()
+        .any(|e| e.extension_id == super::constants::ERROR_CORRECTION_EXTENSION_ID);
+    if has_embedded_parity && !super::ec::scrub_vault(vault).is_empty() {
+        return Err("Vault has damaged blocks: run repair before writing to it".to_string());
+    }
 
     let mut extensions = vault.extensions.clone();
     let mut ext_payloads = vec![];
@@ -2457,10 +2486,7 @@ fn extract_all_entries_with_progress(
     std::fs::create_dir_all(dest_root).map_err(|e| format!("Create output dir: {e}"))?;
     let mut entries: Vec<&ManifestEntryV3> = vault.manifest.entries.iter().collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let total: u64 = entries
-        .iter()
-        .filter(|e| !e.is_dir)
-        .fold(0u64, |acc, e| acc.saturating_add(e.size));
+    let total = progress_total(&entries);
     let mut done = 0u64;
     let mut files_written = 0u64;
     for entry in entries {
@@ -2625,6 +2651,54 @@ mod tests {
 
         std::fs::remove_file(&vp).ok();
         std::fs::remove_file(&sidecar).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_does_not_leave_the_add_in_the_handle() {
+        // The add succeeds in memory but the save fails (read-only folder).
+        // A later write on the same handle must not persist the replacement.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir();
+        let vp = dir.join("v.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let (old, new) = (dir.join("old.txt"), dir.join("new.txt"));
+        std::fs::write(&old, b"original").unwrap();
+        std::fs::write(&new, b"replacement").unwrap();
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        VaultV3::add_files(&mut vault, &[(old, "f.txt".to_string())]).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            // Running as a user that ignores permissions: nothing to test.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let failed = VaultV3::add_files(&mut vault, &[(new, "f.txt".to_string())]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed.is_err());
+
+        VaultV3::create_directory(&mut vault, "later").unwrap();
+        drop(vault);
+        let vault = VaultV3::open_plaintext(&vp).unwrap();
+        let out = VaultV3::extract_entry(&vault, "f.txt", &dir.join("out")).unwrap();
+        assert_eq!(std::fs::read(out).unwrap(), b"original");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn progress_total_saturates_on_manifest_sizes() {
+        let entry = |size| ManifestEntryV3 {
+            path: "f".to_string(),
+            size,
+            modified: String::new(),
+            is_dir: false,
+            chunks: Vec::new(),
+            pack_offset: None,
+        };
+        let (a, b) = (entry(u64::MAX), entry(2));
+        assert_eq!(progress_total(&[&a, &b]), u64::MAX);
     }
 
     #[test]
