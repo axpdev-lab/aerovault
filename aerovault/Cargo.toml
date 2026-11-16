@@ -22,7 +22,9 @@ test-vectors = []
 # creates and opens thousands of vaults does not spend its time in the KDF.
 # A vault written under this feature cannot be opened by a production build
 # (the profile is a format constant, not a header field), which is the point:
-# it is refused at compile time in any non-debug build. Never ship it.
+# it is refused at compile time whenever debug assertions are off (every
+# standard release build; a profile that turns debug assertions on is not
+# covered). Never ship it.
 fast-kdf-for-tests = []
 
 [dependencies]

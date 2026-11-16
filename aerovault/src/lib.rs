@@ -77,7 +77,8 @@
 // `fast-kdf-for-tests` lowers the KDF cost to the floor; a vault written that
 // way is unreadable by a production build. Refuse the feature anywhere that
 // is not a debug build, so it can never ride into a release by feature
-// unification.
+// unification. The guard keys on debug assertions: a release profile that
+// turns them on is not refused.
 #[cfg(all(feature = "fast-kdf-for-tests", not(debug_assertions)))]
 compile_error!("aerovault: the `fast-kdf-for-tests` feature is for debug test builds only");
 

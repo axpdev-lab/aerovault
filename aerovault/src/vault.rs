@@ -1644,11 +1644,8 @@ fn temporary_vault_file(path: &Path, suffix: &str) -> crate::Result<tempfile::Na
 
 /// Atomic rename: tmp -> final as the single visible commit point.
 fn atomic_rename(tmp_path: &Path, final_path: &Path) -> crate::Result<()> {
-    #[cfg(windows)]
-    if final_path.exists() {
-        std::fs::remove_file(final_path)?;
-    }
-
+    // std::fs::rename replaces an existing file on Windows too, so the vault is
+    // never deleted before its replacement is in place.
     std::fs::rename(tmp_path, final_path)?;
     fsync_parent_dir(final_path)?;
     Ok(())
@@ -1662,11 +1659,6 @@ fn atomic_write(path: &Path, data: &[u8], suffix: &str) -> crate::Result<()> {
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
-
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
 
     std::fs::rename(tmp.path(), path)?;
     fsync_parent_dir(path)?;

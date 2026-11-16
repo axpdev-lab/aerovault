@@ -718,7 +718,9 @@ pub fn correct_generate_with_progress(
     let sidecar_path = out
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
-    std::fs::write(&sidecar_path, &generated.sidecar_bytes)
+    // Temp file + rename, like every vault write: a symlink planted at the
+    // sidecar path is replaced, never followed.
+    crate::v3::vault::atomic_write(Path::new(&sidecar_path), &generated.sidecar_bytes)
         .map_err(|e| format!("write sidecar {sidecar_path}: {e}"))?;
     let segments =
         sidecar::aerocorrect_windows(generated.file_size, sidecar::AEROCORRECT_WINDOW_SIZE).len()
@@ -1042,6 +1044,24 @@ mod tests {
         assert!(v.verified && v.status == "verified");
         let r = correct_repair(&file, None).unwrap();
         assert!(!r.repaired && r.status == "verified");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn correct_generate_replaces_a_planted_symlink_instead_of_following_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_file(dir.path(), "data.bin", &sample(40_000));
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"do not overwrite").unwrap();
+        let sidecar = aerocorrect_sidecar_path_for(&file);
+        std::os::unix::fs::symlink(&sentinel, &sidecar).unwrap();
+
+        correct_generate(&file, 15, None).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not overwrite");
+        let meta = std::fs::symlink_metadata(&sidecar).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

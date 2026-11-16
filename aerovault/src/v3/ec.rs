@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use super::constants::{
     DATA_OFFSET, ERROR_CORRECTION_ALGORITHM_ID, ERROR_CORRECTION_ALGORITHM_VERSION,
-    ERROR_CORRECTION_EXTENSION_ID, ERROR_CORRECTION_META_EXTENSION_ID, HEADER_SIZE,
+    ERROR_CORRECTION_EXTENSION_ID, ERROR_CORRECTION_META_EXTENSION_ID, HEADER_SIZE, MAX_BLOCK_SIZE,
     MAX_EXTENSION_DIR_SIZE, MAX_MANIFEST_SIZE,
 };
 use super::format::VaultHeaderV3;
@@ -125,7 +125,7 @@ pub(super) fn error_correction_stub_extension() -> ExtensionEntryV3 {
 }
 
 /// Default sidecar path for a vault: `X` gets `X.aerocorrect`.
-fn default_sidecar_path(vault_path: &Path) -> PathBuf {
+pub(super) fn default_sidecar_path(vault_path: &Path) -> PathBuf {
     PathBuf::from(aerocorrect_sidecar_path(&vault_path.to_string_lossy()))
 }
 
@@ -287,10 +287,12 @@ pub(super) fn resolve_parity_source(
         let bytes = std::fs::read(&sidecar_path)
             .map_err(|e| format!("read recovery file {}: {e}", sidecar_path.display()))?;
         let sidecar = AeroCorrectSidecar::from_bytes(&bytes)?;
-        return Ok((
-            vault_sidecar_parity(&sidecar, VAULT_SIDECAR_SEG_DATA).to_vec(),
-            ParitySource::Detached,
-        ));
+        let parity = vault_sidecar_parity(&sidecar, VAULT_SIDECAR_SEG_DATA);
+        // The sidecar seeded at create time has no data parity until
+        // export-parity fills it; it must not hide the embedded parity.
+        if !parity.is_empty() {
+            return Ok((parity.to_vec(), ParitySource::Detached));
+        }
     }
     // 3. Embedded extension payload.
     if let Some(bytes) = read_embedded_error_correction(vault)? {
@@ -552,6 +554,19 @@ pub(super) fn repair_vault(
             .map(|(id, r)| (id.clone(), r.clone()))
             .collect();
         ordered.sort_by_key(|(_, r)| r.data_offset);
+        // On the plaintext lane block_len comes from an unauthenticated manifest
+        // and sizes the buffers below: bound each block like every other reader,
+        // and the total by the data section, since live blocks never overlap.
+        let total = ordered.iter().try_fold(0u64, |acc, (_, r)| {
+            (r.block_len <= MAX_BLOCK_SIZE)
+                .then(|| acc.checked_add(8 + r.block_len))
+                .flatten()
+        });
+        if !matches!(total, Some(t) if t <= vault.data.len() as u64) {
+            return Err(
+                "AeroVault v3 chunk records exceed the block limit or the data section".to_string(),
+            );
+        }
 
         let mut blocks: Vec<Vec<u8>> = ordered
             .iter()
@@ -630,6 +645,15 @@ pub(super) fn repair_vault(
         // byte-for-byte untouched (repaired_count stays 0) so no redundancy is lost.
     }
 
+    // Damage was found but nothing could be repaired (no parity, damage beyond
+    // the parity budget, or a stale/foreign sidecar): say so instead of
+    // returning a zero count that reads as "nothing to repair".
+    if repaired_count == 0 {
+        return Err(format!(
+            "{} damaged block(s) could not be repaired from the available Error Correction parity",
+            damaged.len()
+        ));
+    }
     Ok((repaired_count, source))
 }
 
@@ -1128,8 +1152,11 @@ mod tests {
         let corrupt_bytes = std::fs::read(&vp).unwrap();
 
         let mut vault = VaultV3::open(&vp, PW).unwrap();
-        let (repaired, _source) = VaultV3::repair(&mut vault, false, None).unwrap();
-        assert_eq!(repaired, 0, "beyond-budget repair must heal nothing");
+        let err = VaultV3::repair(&mut vault, false, None).unwrap_err();
+        assert!(
+            err.contains("could not be repaired"),
+            "beyond-budget repair must heal nothing: {err}"
+        );
         drop(vault);
 
         // The container is left byte-for-byte untouched (all-or-nothing).
@@ -1171,6 +1198,168 @@ mod tests {
         let _ = std::fs::remove_file(&vp);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn rotted_plaintext_flag_bit_still_recovers_header_from_sidecar() {
+        // One flipped flag bit on an encrypted header used to send open down the
+        // plaintext branch, which failed on the public MAC and never tried the
+        // sidecar header parity.
+        let vp = tmp("flagrot.aerovault");
+        let src = tmp("flagrot-src");
+        std::fs::create_dir_all(&src).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&vp, PW),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+        VaultV3::export_parity(&vp, PW, None).unwrap();
+
+        let mut bytes = std::fs::read(&vp).unwrap();
+        bytes[11] ^= 0x01;
+        std::fs::write(&vp, &bytes).unwrap();
+
+        let vault = VaultV3::open(&vp, PW).unwrap();
+        assert!(vault.header_repaired_on_open);
+        drop(vault);
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_file(default_sidecar_path(&vp));
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn change_password_refreshes_sidecar_so_old_password_stops_working() {
+        // A sidecar exported before a password change held the old header's
+        // parity; header recovery rebuilt it and the old password still opened.
+        let vp = tmp("chpw.aerovault");
+        let src = tmp("chpw-src");
+        std::fs::create_dir_all(&src).unwrap();
+        const NEW_PW: &str = "ec-test-new-password-456";
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&vp, PW),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+        VaultV3::export_parity(&vp, PW, None).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::change_password(&mut vault, NEW_PW).unwrap();
+        drop(vault);
+
+        assert!(VaultV3::open(&vp, PW).is_err());
+        assert!(VaultV3::open(&vp, NEW_PW).is_ok());
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_file(default_sidecar_path(&vp));
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn repair_bounds_chunk_records_before_sizing_buffers() {
+        // On the plaintext lane block_len comes from an unauthenticated manifest
+        // and sizes the repair buffers: refuse one block above the limit, and
+        // records that add up to more than the data section, file untouched.
+        let vp = tmp("repair-bounds.aerovz");
+        let src = tmp("repair-bounds-src");
+        std::fs::create_dir_all(&src).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&vp),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+        let before = std::fs::read(&vp).unwrap();
+
+        for block_len in [MAX_BLOCK_SIZE + 1, MAX_BLOCK_SIZE] {
+            let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+            let rec = vault.manifest.chunks.values_mut().next().unwrap();
+            rec.block_len = block_len;
+            let err = VaultV3::repair(&mut vault, false, None).unwrap_err();
+            assert!(err.contains("exceed"), "{err}");
+            drop(vault);
+            assert_eq!(std::fs::read(&vp).unwrap(), before);
+        }
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn change_password_refuses_damaged_blocks_and_keeps_sidecar() {
+        // Refreshing the sidecar over a damaged block would replace the parity
+        // that can still repair it: the change must be refused, nothing touched.
+        let vp = tmp("chpw-damaged.aerovault");
+        let src = tmp("chpw-damaged-src");
+        std::fs::create_dir_all(&src).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&vp, PW),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+        VaultV3::export_parity(&vp, PW, None).unwrap();
+        let sidecar = std::fs::read(default_sidecar_path(&vp)).unwrap();
+        corrupt_data_section(&vp, 32);
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        let err = VaultV3::change_password(&mut vault, "ec-test-new-password-456").unwrap_err();
+        assert!(err.contains("damaged"), "{err}");
+        drop(vault);
+        assert_eq!(std::fs::read(default_sidecar_path(&vp)).unwrap(), sidecar);
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        assert!(VaultV3::repair(&mut vault, false, None).is_ok());
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_file(default_sidecar_path(&vp));
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn empty_seed_sidecar_does_not_hide_embedded_parity() {
+        // `Both` seeds an empty sidecar at create time; repair must fall back to
+        // the embedded parity instead of resolving to that empty sidecar.
+        let vp = tmp("both-seed.aerovault");
+        let src = tmp("both-seed-src");
+        std::fs::create_dir_all(&src).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&vp, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        assert!(default_sidecar_path(&vp).exists());
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+
+        corrupt_data_section(&vp, 600);
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        let (repaired, source) = VaultV3::repair(&mut vault, false, None).unwrap();
+        assert!(repaired > 0);
+        assert_eq!(source, ParitySource::Embedded);
+        drop(vault);
+        let vault = VaultV3::open(&vp, PW).unwrap();
+        assert!(VaultV3::scrub(&vault).is_empty());
+        drop(vault);
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_file(default_sidecar_path(&vp));
+        let _ = std::fs::remove_dir_all(&src);
     }
 
     #[test]

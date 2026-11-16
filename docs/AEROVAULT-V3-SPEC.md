@@ -96,13 +96,11 @@ The crypt wrapper and the key hierarchy use the following primitives. Readers di
 | Layer | Algorithm | Standard | Role |
 |---|---|---|---|
 | Content encryption | AES-256-GCM-SIV | RFC 8452 | Nonce-misuse-resistant AEAD over each compressed chunk |
-| Filename encryption | AES-256-SIV | RFC 5297 | Deterministic, so the same plaintext name maps to the same ciphertext without leaking name structure |
 | Master-key wrapping | AES-256-KW | RFC 3394 | Wraps the per-vault master and MAC keys in the header |
 | Key derivation | Argon2id | RFC 9106 | Memory-hard KDF (128 MiB, t=4, p=4), above the OWASP 2024 baseline |
-| Optional cascade | ChaCha20-Poly1305 | RFC 8439 | Defense-in-depth second cipher (paranoid mode, inheritable from v2) |
 | Header integrity | HMAC-SHA512 | RFC 4231 | MAC over the 1024-byte header, so metadata tampering is caught before any key is used |
 
-The per-file chunk binding (the v3 `file_id` plus the chunk index and count, section 7) is carried as AAD on the content AEAD and on the optional cascade, so a chunk cannot be spliced across files or reordered.
+AEROVAULT3 has no separate filename encryption and no cascade: in an encrypted container, paths live inside the encrypted manifest, and both layers use AES-256-GCM-SIV. A plaintext-lane container (header flag `0x01`, section 5) encrypts neither. Each content block is sealed with AAD `"AeroVault v3 block"` followed by its `block_index` (u64 little-endian) and its chunk id. The manifest is sealed with the constant AAD `"AeroVault v3 manifest"`. Chunks are content-addressed and shared across files by deduplication, so there is no per-file binding: the authenticated manifest is what maps each file to its chunks. (The per-file `file_id` binding belongs to the AEROVAULT2 lineage.)
 
 ## 4. File Layout
 
@@ -155,6 +153,14 @@ The fixed header is 1024 bytes.
 
 Readers MUST reject unknown non-zero reserved fields until a future spec assigns them.
 
+Header flags:
+
+| Bit | Name | Meaning |
+|---:|---|---|
+| `0x01` | `FLAG_PLAINTEXT_CONTENT` | Plaintext lane (`.aerozip`): no password, the manifest and content blocks are stored unencrypted, and the header MAC uses a fixed public key. Integrity and recovery only, no confidentiality. The manifest `crypt` wrapper is `none` and MUST agree with this flag. |
+
+Because the plaintext-lane header MAC key is public, anyone can produce a valid plaintext container. A reader that unlocks with a password MUST reject a container with `FLAG_PLAINTEXT_CONTENT` set whose header verifies under the public key, before reading its payload, and open it only through an explicit plaintext path. If the flag is set but the header does not verify under the public key, the flag bit may have rotted on an encrypted vault: the reader treats it as encrypted, so the real MAC check and header recovery still apply. Otherwise, replacing an encrypted vault with a plaintext container would make the unlock succeed and later writes would be stored in the clear.
+
 ## 6. Extension Directory
 
 The extension directory is a UTF-8 JSON array. v3 writers emit `[]`.
@@ -198,7 +204,7 @@ The manifest is AES-256-GCM-SIV encrypted. Its plaintext is JSON:
 
 `entries` describe user-visible files and directories. Each file entry carries `path`, `size`, `modified`, `is_dir`, `chunks` (the ordered chunk ids that contain its bytes) and an optional `pack_offset`. `pack_offset` is the byte offset of the file inside the concatenation of its listed chunks; when absent the file owns its chunks whole from offset 0 (the per-file path and all pre-packing v3 vaults). `chunks` is keyed by the 128-bit keyed-BLAKE3 chunk id and stores block location metadata.
 
-A v3 manifest also binds a per-file 16-byte `file_id` into the chunk AAD (the inner AEAD and the optional ChaCha20-Poly1305 cascade) to prevent chunk splicing and reordering. The `file_id` is stored in the AES-SIV-authenticated manifest and the on-disk version is covered by the HMAC-SHA512 header MAC, so neither the `file_id` nor the version can be stripped to force the legacy v2 path.
+In an encrypted container the manifest is authenticated by its AES-256-GCM-SIV seal and the on-disk version is covered by the HMAC-SHA512 header MAC, so the version cannot be stripped to force another code path. A plaintext-lane manifest has no seal and its header MAC key is public: anyone can modify it and recompute the MAC, so there these checks detect accidental damage only, not tampering.
 
 ## 8. Hash Separation
 

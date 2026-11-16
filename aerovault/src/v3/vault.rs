@@ -46,6 +46,11 @@ use crate::aerocrypt::{
     wrap_key, KEY_SIZE, SALT_SIZE, WRAPPED_KEY_SIZE,
 };
 
+/// Error returned by [`VaultV3::open`] for a plaintext container. Kept stable:
+/// embedders match on it to tell the user the file is not a vault.
+const PLAINTEXT_NOT_A_VAULT: &str =
+    "unencrypted .aerozip archive (plaintext lane), not an encrypted vault: open it with open_plaintext";
+
 /// Which cryptographic lane a container uses.
 ///
 /// The encrypted lane is the standard password-protected `.aerovault`. The
@@ -388,13 +393,23 @@ impl VaultV3 {
         &buf[..10] == MAGIC && buf[10] == VERSION
     }
 
-    /// Open and unlock a container with `password`. A plaintext (`.aerovz`)
-    /// container is opened regardless of `password` (it has none); pass `""`.
+    /// Open and unlock an encrypted container with `password`.
+    ///
+    /// Errors on a plaintext (`.aerovz`) container: it has no password, so
+    /// accepting it here would let anyone who can replace the file turn a
+    /// password unlock into an unencrypted archive whose later writes are stored
+    /// in the clear. Open those with [`VaultV3::open_plaintext`].
     pub fn open(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
-        open_vault(path, password)
+        // Refused from the header alone, before any payload is read: a hostile
+        // plaintext container can declare a data section as large as the file.
+        let vault = open_vault_with(path, password, true)?;
+        if vault.header.flags & FLAG_PLAINTEXT_CONTENT != 0 {
+            return Err(PLAINTEXT_NOT_A_VAULT.to_string());
+        }
+        Ok(vault)
     }
 
-    /// Open a plaintext (`.aerovz`) container — convenience for `open(path, "")`.
+    /// Open a plaintext (`.aerovz`) container, which has no password.
     /// Errors if the container is an encrypted `.aerovault`.
     pub fn open_plaintext(path: impl Into<PathBuf>) -> Result<OpenVaultV3, String> {
         let vault = open_vault(path, "")?;
@@ -562,9 +577,26 @@ impl VaultV3 {
     }
 
     /// Re-wrap the keys under a new password (new salt + KEKs), then persist.
+    /// A `<vault>.aerocorrect` sidecar is re-exported under the new header.
     pub fn change_password(vault: &mut OpenVaultV3, new_password: &str) -> Result<(), String> {
+        // A sidecar exported before the change holds parity of the old header,
+        // and header recovery would rebuild that header, so the old password
+        // would keep opening the vault. It is refreshed under the new header,
+        // which first needs intact blocks: parity of a damaged block would
+        // replace the parity that can still repair it.
+        let sidecar = super::ec::default_sidecar_path(&vault.path);
+        let refresh = sidecar.exists();
+        if refresh && !super::ec::scrub_vault(vault).is_empty() {
+            return Err(
+                "Vault has damaged blocks: run repair before changing the password".to_string(),
+            );
+        }
         change_password_in_place(vault, new_password)?;
-        save_open_vault(vault)
+        save_open_vault(vault)?;
+        if refresh {
+            refresh_sidecar(vault, &sidecar, new_password)?;
+        }
+        Ok(())
     }
 
     /// Extract one entry (file or directory subtree) to `dest`.
@@ -917,6 +949,13 @@ fn ingest_chunk(
             encrypted.len() as u64,
         );
         compressed.zeroize();
+        // Readers refuse a block above MAX_BLOCK_SIZE, which custom CDC bounds
+        // can exceed. Fail the write instead of sealing a block nobody can read.
+        if enc > MAX_BLOCK_SIZE {
+            return Err(format!(
+                "AeroVault v3 block of {enc} bytes exceeds the {MAX_BLOCK_SIZE}-byte limit; use a smaller CDC max bound"
+            ));
+        }
         let cipher_hash = blake3::hash(&encrypted).to_hex().to_string();
         let data_offset = vault.data.len() as u64;
         vault
@@ -986,9 +1025,10 @@ fn append_file_at(vault: &mut OpenVaultV3, source: &Path, entry_path: &str) -> R
         .map_err(|e| format!("Read {}: {e}", source.display()))?
     {
         size += chunk.len() as u64;
-        let chunk_id = ingest_chunk(vault, &chunk, &chunk_key, level)?;
+        // Wipe the plaintext chunk on the error path too.
+        let chunk_id = ingest_chunk(vault, &chunk, &chunk_key, level);
         chunk.zeroize();
-        entry_chunks.push(chunk_id);
+        entry_chunks.push(chunk_id?);
     }
 
     vault.manifest.entries.push(ManifestEntryV3 {
@@ -1091,6 +1131,22 @@ fn append_sources_batched(
     vault: &mut OpenVaultV3,
     sources: &[(PathBuf, String)],
 ) -> Result<(), String> {
+    // An add that fails part-way must not leave the open handle half-applied:
+    // a later save would persist the removal of a file it was replacing.
+    let manifest = vault.manifest.clone();
+    let data_len = vault.data.len();
+    let result = append_sources_into(vault, sources);
+    if result.is_err() {
+        vault.manifest = manifest;
+        vault.data.truncate(data_len);
+    }
+    result
+}
+
+fn append_sources_into(
+    vault: &mut OpenVaultV3,
+    sources: &[(PathBuf, String)],
+) -> Result<(), String> {
     let chunk_key = hkdf_expand::<KEY_SIZE>(&vault.master_key, HKDF_CHUNK_ID)?;
     let level = manifest_zstd_level(&vault.manifest);
     let bounds = manifest_cdc_bounds(&vault.manifest)?;
@@ -1137,15 +1193,17 @@ fn append_sources_batched(
             data.zeroize();
             members.push((entry_path.clone(), start, len));
             if pack.len() >= PACK_TARGET {
-                flush_pack(vault, &pack, &members, &chunk_key, level, &bounds)?;
+                let flushed = flush_pack(vault, &pack, &members, &chunk_key, level, &bounds);
                 pack.zeroize();
+                flushed?;
                 pack.clear();
                 members.clear();
             }
         }
         if !members.is_empty() {
-            flush_pack(vault, &pack, &members, &chunk_key, level, &bounds)?;
+            let flushed = flush_pack(vault, &pack, &members, &chunk_key, level, &bounds);
             pack.zeroize();
+            flushed?;
         }
     }
 
@@ -1664,7 +1722,7 @@ pub(super) fn fsync_parent_dir(parent: &Path) {
     }
 }
 
-pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = output_parent_dir(target);
     std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
     let mut tmp = tempfile::Builder::new()
@@ -1884,7 +1942,60 @@ fn create_empty_vault(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once right after a save renames its file into place,
+    /// so a test can let another writer change the vault in that window.
+    static AFTER_PERSIST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_persist_hook() {
+    if let Some(hook) = AFTER_PERSIST.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Re-export the sidecar after a password change. On failure a stale sidecar
+/// would keep the old password working, so it is removed, unless another handle
+/// has changed the vault since: the sidecar then belongs to that change.
+fn refresh_sidecar(vault: &OpenVaultV3, sidecar: &Path, new_password: &str) -> Result<(), String> {
+    let Err(e) = super::ec::export_parity(&vault.path, new_password, None) else {
+        return Ok(());
+    };
+    let outcome = if assert_vault_generation_current(vault).is_err() {
+        "the vault was changed by another writer meanwhile"
+    } else if std::fs::remove_file(sidecar).is_ok() {
+        "the old one was removed"
+    } else {
+        "remove the old one, it still accepts the old password"
+    };
+    Err(format!(
+        "Password changed, but the .aerocorrect recovery file could not be refreshed ({e}); {outcome}; run export-parity"
+    ))
+}
+
+/// A plaintext-lane header: the flag is set and the header verifies under the
+/// public key. A flag bit rotted on an encrypted vault fails the MAC check.
+fn plaintext_lane_header(header_bytes: &[u8]) -> bool {
+    VaultHeaderV3::from_bytes(header_bytes)
+        .ok()
+        .filter(|h| h.flags & FLAG_PLAINTEXT_CONTENT != 0)
+        .is_some_and(|h| aerovz_mac_key().is_ok_and(|k| h.verify_mac(&k).is_ok()))
+}
+
 pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
+    open_vault_with(path, password, false)
+}
+
+/// `encrypted_only` refuses a plaintext-lane container from its header, read
+/// from the same handle as the payload, before the payload is read.
+fn open_vault_with(
+    path: impl Into<PathBuf>,
+    password: &str,
+    encrypted_only: bool,
+) -> Result<OpenVaultV3, String> {
     let path = path.into();
     let mut file = std::fs::File::open(&path).map_err(|e| format!("Open vault: {e}"))?;
     let file_len = file
@@ -1901,9 +2012,22 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
     // the deterministic chunk-id derivation. The manifest is read as plaintext
     // below. EC header recovery stays on the encrypted path (the plaintext
     // header is still EC-protected by region; recovery for it is a follow-up).
-    let plaintext_header = VaultHeaderV3::from_bytes(&header_bytes)
-        .ok()
-        .is_some_and(|h| h.flags & FLAG_PLAINTEXT_CONTENT != 0);
+    //
+    // The flag byte is read before any MAC, so with a password (an encrypted
+    // unlock) the flag alone is not enough: the header must also verify under
+    // the public key. A flag bit rotted on an encrypted vault then fails that
+    // check and goes down the encrypted path, where the real MAC fails and the
+    // sidecar header recovery runs. With no password (open_plaintext) a header
+    // that carries the flag stays on this lane and reports its own MAC error.
+    let plaintext_header = if password.is_empty() {
+        VaultHeaderV3::from_bytes(&header_bytes)
+            .is_ok_and(|h| h.flags & FLAG_PLAINTEXT_CONTENT != 0)
+    } else {
+        plaintext_lane_header(&header_bytes)
+    };
+    if encrypted_only && plaintext_header {
+        return Err(PLAINTEXT_NOT_A_VAULT.to_string());
+    }
 
     // HEADER parity (rev. 4): the on-disk header is the happy path. If it fails
     // to parse or its MAC does not verify (bit-rot / bad sector), fall back to
@@ -2158,8 +2282,8 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     // second whole-file buffer, so the seal no longer doubles peak memory
     // (T5 sub-task #2). Same atomic temp + sync + persist + dir-fsync discipline
     // as `atomic_write`, via the shared helpers.
-    {
-        use std::io::Write;
+    let (file_len, header_bytes) = {
+        use std::io::{Seek, Write};
         let parent = output_parent_dir(&vault.path);
         std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
         let mut tmp = tempfile::Builder::new()
@@ -2183,21 +2307,28 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
         tmp.as_file_mut()
             .sync_all()
             .map_err(|e| format!("Sync temp file: {e}"))?;
+        // Take the staleness baseline from the bytes this writer sealed, not
+        // from a later read of the path, which may already show another
+        // writer's generation.
+        let file = tmp.as_file_mut();
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("Vault metadata: {e}"))?
+            .len();
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        file.seek(std::io::SeekFrom::Start(0))
+            .and_then(|_| file.read_exact(&mut header_bytes))
+            .map_err(|e| format!("Read header: {e}"))?;
         tmp.persist(&vault.path)
             .map_err(|e| format!("Persist vault: {}", e.error))?;
         fsync_parent_dir(parent);
-    }
+        #[cfg(test)]
+        run_after_persist_hook();
+        (file_len, header_bytes)
+    };
 
     // Refresh the staleness baseline so a second save in the same session does
     // not trip the generation guard against the bytes we just wrote.
-    let mut file = std::fs::File::open(&vault.path).map_err(|e| format!("Open vault: {e}"))?;
-    let file_len = file
-        .metadata()
-        .map_err(|e| format!("Vault metadata: {e}"))?
-        .len();
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    file.read_exact(&mut header_bytes)
-        .map_err(|e| format!("Read header: {e}"))?;
     let header = VaultHeaderV3::from_bytes(&header_bytes)?;
     vault.opened_file_len = file_len;
     vault.opened_header_mac = header.header_mac;
@@ -2326,7 +2457,10 @@ fn extract_all_entries_with_progress(
     std::fs::create_dir_all(dest_root).map_err(|e| format!("Create output dir: {e}"))?;
     let mut entries: Vec<&ManifestEntryV3> = vault.manifest.entries.iter().collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let total: u64 = entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+    let total: u64 = entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .fold(0u64, |acc, e| acc.saturating_add(e.size));
     let mut done = 0u64;
     let mut files_written = 0u64;
     for entry in entries {
@@ -2447,6 +2581,103 @@ mod tests {
         p.push(format!("av3-scratch-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Encrypted vault with one file and an exported detached sidecar.
+    fn vault_with_sidecar() -> (PathBuf, PathBuf) {
+        use super::super::ec::{default_sidecar_path, RecoveryPlacement};
+        let vp = vault_path();
+        let opts = CreateOptionsV3::new(&vp, PW);
+        VaultV3::create_with_error_correction(&opts, RecoveryPlacement::Detached, 20).unwrap();
+        let src = scratch_dir();
+        let file = src.join("a.txt");
+        std::fs::write(&file, b"sidecar test content").unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(&mut vault, &[(file, "a.txt".to_string())]).unwrap();
+        drop(vault);
+        std::fs::remove_dir_all(&src).ok();
+        VaultV3::export_parity(&vp, PW, None).unwrap();
+        let sidecar = default_sidecar_path(&vp);
+        (vp, sidecar)
+    }
+
+    #[test]
+    fn password_change_cleanup_keeps_a_newer_writers_sidecar() {
+        // Handle A saves its new header; before A refreshes the sidecar, handle
+        // B changes the password again and exports its own. A's refresh fails
+        // (the vault no longer opens with A's password) and must not delete B's.
+        const PW_A: &str = "password-a-12345";
+        const PW_B: &str = "password-b-12345";
+        let (vp, sidecar) = vault_with_sidecar();
+        let mut a = VaultV3::open(&vp, PW).unwrap();
+        change_password_in_place(&mut a, PW_A).unwrap();
+        save_open_vault(&mut a).unwrap();
+        let mut b = VaultV3::open(&vp, PW_A).unwrap();
+        VaultV3::change_password(&mut b, PW_B).unwrap();
+        let sidecar_b = std::fs::read(&sidecar).unwrap();
+
+        let err = refresh_sidecar(&a, &sidecar, PW_A).unwrap_err();
+        assert!(err.contains("another writer"), "{err}");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_b);
+        assert!(VaultV3::open(&vp, PW).is_err());
+        assert!(VaultV3::open(&vp, PW_A).is_err());
+        assert!(VaultV3::open(&vp, PW_B).is_ok());
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&sidecar).ok();
+    }
+
+    #[test]
+    fn save_baseline_is_the_generation_this_writer_sealed() {
+        // B changes the password right after A's save renames its file, before
+        // A records its baseline. A's baseline must still be A's own header, so
+        // A's sidecar cleanup sees the other writer and leaves B's sidecar.
+        const PW_A: &str = "password-a-12345";
+        const PW_B: &str = "password-b-12345";
+        let (vp, sidecar) = vault_with_sidecar();
+        let mut a = VaultV3::open(&vp, PW).unwrap();
+        change_password_in_place(&mut a, PW_A).unwrap();
+        let path = vp.clone();
+        AFTER_PERSIST.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let mut b = VaultV3::open(&path, PW_A).unwrap();
+                VaultV3::change_password(&mut b, PW_B).unwrap();
+            }));
+        });
+        save_open_vault(&mut a).unwrap();
+        let sidecar_b = std::fs::read(&sidecar).unwrap();
+
+        let err = refresh_sidecar(&a, &sidecar, PW_A).unwrap_err();
+        assert!(err.contains("another writer"), "{err}");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_b);
+        assert!(VaultV3::open(&vp, PW_B).is_ok());
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&sidecar).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_change_reports_a_sidecar_it_can_neither_refresh_nor_remove() {
+        // A directory at the sidecar path can be neither replaced nor removed.
+        // The password change is saved, the error says so and what to do, and
+        // the vault opens with the new password only.
+        const NEW_PW: &str = "new-password-12345";
+        let (vp, sidecar) = vault_with_sidecar();
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        std::fs::write(sidecar.join("keep"), b"x").unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        let err = VaultV3::change_password(&mut vault, NEW_PW).unwrap_err();
+        assert!(err.starts_with("Password changed"), "{err}");
+        assert!(err.contains("remove the old one"), "{err}");
+        drop(vault);
+        assert!(VaultV3::open(&vp, NEW_PW).is_ok());
+        assert!(VaultV3::open(&vp, PW).is_err());
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&sidecar).ok();
     }
 
     #[test]
@@ -2851,6 +3082,95 @@ mod tests {
         std::fs::remove_file(&vp).ok();
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn open_with_password_refuses_plaintext_from_header_alone() {
+        // A hostile plaintext container can declare a data section as large as
+        // a sparse file, so the refusal must come before any payload is read.
+        // Undecodable payload bytes show the header alone decided.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let mut bytes = std::fs::read(&vp).unwrap();
+        bytes[HEADER_SIZE..].fill(0xA5);
+        std::fs::write(&vp, &bytes).unwrap();
+        assert_eq!(VaultV3::open(&vp, PW).unwrap_err(), PLAINTEXT_NOT_A_VAULT);
+        std::fs::remove_file(&vp).ok();
+    }
+
+    #[test]
+    fn open_with_password_rejects_plaintext_container() {
+        // Someone who can replace the vault file swaps in a plaintext container
+        // built with the public API. A password unlock must refuse it, whatever
+        // the password, and leave the file untouched; only open_plaintext opens it.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        std::fs::remove_file(&vp).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let before = std::fs::read(&vp).unwrap();
+
+        for pw in [PW, "any other password", ""] {
+            let err = VaultV3::open(&vp, pw).unwrap_err();
+            assert_eq!(err, PLAINTEXT_NOT_A_VAULT);
+        }
+        assert_eq!(std::fs::read(&vp).unwrap(), before);
+        assert!(VaultV3::open_plaintext(&vp).is_ok());
+
+        // An encrypted vault still opens with its password and only with it.
+        let enc = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&enc, PW)).unwrap();
+        assert!(VaultV3::open(&enc, PW).is_ok());
+        assert!(VaultV3::open(&enc, "wrong-password-123").is_err());
+        assert!(VaultV3::open_plaintext(&enc).is_err());
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&enc).ok();
+    }
+
+    #[test]
+    fn oversized_block_is_refused_at_write_not_sealed_unreadable() {
+        // Custom CDC bounds may exceed MAX_BLOCK_SIZE, which readers refuse.
+        // The write must fail and leave the vault as it was.
+        let vp = vault_path();
+        // min above the file size: the whole file is one chunk.
+        let bounds = CdcBounds {
+            min: 96 * 1024 * 1024,
+            avg: 128 * 1024 * 1024,
+            max: 128 * 1024 * 1024,
+        };
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp).with_cdc_bounds(bounds)).unwrap();
+        let src = scratch_dir();
+        let big = src.join("big.bin");
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let data: Vec<u8> = (0..(MAX_BLOCK_SIZE as usize + 1024 * 1024))
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        std::fs::write(&big, &data).unwrap();
+        drop(data);
+        let small = src.join("small.bin");
+        std::fs::write(&small, b"original").unwrap();
+        let mut vault = VaultV3::open_plaintext(&vp).unwrap();
+        VaultV3::add_files(&mut vault, &[(small, "big.bin".to_string())]).unwrap();
+        let before = std::fs::read(&vp).unwrap();
+
+        // The rejected replacement leaves the file and the open handle intact:
+        // a later write on the same handle must not persist a removal.
+        let err = VaultV3::add_files(&mut vault, &[(big, "big.bin".to_string())]).unwrap_err();
+        assert!(err.contains("exceeds"), "{err}");
+        assert_eq!(std::fs::read(&vp).unwrap(), before);
+        VaultV3::create_directory(&mut vault, "after").unwrap();
+        drop(vault);
+        let vault = VaultV3::open_plaintext(&vp).unwrap();
+        let out = VaultV3::extract_entry(&vault, "big.bin", &src.join("out")).unwrap();
+        assert_eq!(std::fs::read(out).unwrap(), b"original");
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
     }
 
     #[test]

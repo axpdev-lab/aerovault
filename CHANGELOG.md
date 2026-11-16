@@ -2,6 +2,40 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.6.9] - 2026-11-16
+
+### Security
+
+- **A password unlock no longer opens a plaintext container.** `VaultV3::open(path, password)` accepted a plaintext-lane (`.aerozip`) container whatever the password, because that lane has no password and its header MAC key is public. Anyone able to replace a vault file (shared or synced folder, removable media) could swap in a plaintext container built with this crate: the unlock succeeded and files added afterwards were stored unencrypted. The original vault's data was not exposed. `open` now returns the stable error `unencrypted .aerozip archive (plaintext lane), not an encrypted vault: open it with open_plaintext`, decided from the header alone, without reading the payload or touching the file; `open_plaintext` is the only way to open the plaintext lane. Function signatures are unchanged. A caller that opened a plaintext container through `open(path, "")` must switch to `open_plaintext`. The CLI `vault` commands inherit the check.
+
+- **Changing the password refreshes the `.aerocorrect` sidecar.** A sidecar exported before the change kept parity of the old header; header recovery rebuilt that header, so the old password still opened the vault. `VaultV3::change_password` now re-exports `<vault>.aerocorrect` when it exists, and first refuses the change if any block is damaged, so the parity that can still repair it is not replaced (run `repair` first). If the refresh itself fails, the old sidecar is removed, unless another handle has changed the vault in the meantime, and the error says to run `export-parity`; if the old sidecar cannot be removed either, the error says so, since it still accepts the old password. A sidecar kept at a custom path must be re-exported by hand.
+- **`correct gen` no longer writes through a symlink.** The sidecar is written with a temp file and rename, like every vault write, so a symlink planted at the sidecar path is replaced instead of followed. The new sidecar is created private (0600 on Unix) instead of with the default umask, since its parity can rebuild small files.
+- **Repair bounds chunk records.** `repair` refuses chunk records above the 64 MiB block limit, or larger in total than the data section, before sizing its buffers. On the plaintext lane those lengths come from an unauthenticated manifest.
+
+### Fixed
+
+- **A rotted plaintext-flag bit no longer blocks header recovery.** With a password, the plaintext branch is taken only when the header also verifies under the public key, so a flipped flag bit on an encrypted vault goes through the encrypted path and its sidecar header recovery.
+- **Oversized blocks are refused at write time.** Custom CDC bounds can produce a block above the 64 MiB limit that readers refuse. Such a write now fails and leaves the vault unchanged, instead of sealing content that cannot be extracted.
+- **A failed add no longer leaves the open vault half-changed.** When an add fails part-way, the open handle is restored, so a later write on it cannot persist the removal of a file that was being replaced.
+- **An empty seeded sidecar no longer hides embedded parity.** With `Both` placement, the sidecar written at creation has no data parity until `export-parity` fills it; repair now falls back to the embedded parity instead of resolving to it.
+- **Repair reports damage it cannot fix.** When damaged blocks are found and none can be repaired (no parity, damage beyond the parity budget, or a stale sidecar), `repair` returns an error instead of `Ok` with a zero count. The CLI no longer prints "No repair needed" in that case.
+- **Legacy vault writes on Windows no longer delete the vault before replacing it.** `std::fs::rename` already replaces an existing file; removing the vault first meant that a failed rename lost both the vault and its replacement (the temp file is deleted on drop since 0.6.8).
+- **Rejected writes wipe the plaintext chunk.** A chunk or small-file pack refused by the content pipeline is zeroized before the error is returned.
+- **A save records the generation it wrote.** The baseline that later saves compare against is taken from the sealed file before it replaces the vault, not by re-reading the path afterwards, which could already show another writer's change.
+- **Extract progress no longer overflows** on manifest sizes whose sum exceeds `u64`.
+
+### Documentation
+
+- The v3 spec now defines header flag `0x01` (`FLAG_PLAINTEXT_CONTENT`) and requires password readers to reject it.
+- The v3 spec no longer claims a per-file `file_id` binding, AES-SIV filename encryption or a ChaCha20-Poly1305 cascade for AEROVAULT3; those belong to AEROVAULT2. It now states the actual block and manifest AAD.
+- The `fast-kdf-for-tests` guard is described as what it is: it refuses the feature when debug assertions are off.
+
+### Known limits
+
+- **Concurrent writers can lose an update.** Each save checks that the vault has not changed since it was opened, but the check runs before the write and nothing locks the file across handles or processes. Two writers saving the same vault at once can both succeed while only one change survives. Measured with two writers adding files concurrently, 40 trials of 10 adds: 180 of 381 successful adds were lost. An advisory lock on the vault file itself does not close this, because every save replaces the file (17 lost); a lock on a separate, stable lock file does (0 lost). Until a release adds that lock, serialize writes to one vault in the embedder.
+
+No container-format, encryption-algorithm or key-derivation change.
+
 ## [0.6.8] - 2026-10-27
 
 ### Security
