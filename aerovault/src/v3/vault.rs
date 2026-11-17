@@ -142,7 +142,10 @@ pub struct OpenVaultV3 {
     pub(super) path: PathBuf,
     pub(super) header: VaultHeaderV3,
     pub(super) opened_file_len: u64,
-    pub(super) opened_header_mac: [u8; MAC_SIZE],
+    /// Header bytes as read from disk at open (or written by the last save):
+    /// the generation baseline. Kept apart from `header`, which may have been
+    /// recovered from a sidecar while the disk still holds the damaged bytes.
+    pub(super) opened_header: [u8; HEADER_SIZE],
     pub(super) master_key: [u8; KEY_SIZE],
     pub(super) mac_key: [u8; KEY_SIZE],
     pub(super) manifest: VaultManifestV3,
@@ -2214,7 +2217,7 @@ fn open_vault_with(
     Ok(OpenVaultV3 {
         path,
         opened_file_len: file_len,
-        opened_header_mac: header.header_mac,
+        opened_header: header_bytes,
         header,
         master_key,
         mac_key,
@@ -2267,8 +2270,7 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
     let mut header_bytes = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_bytes)
         .map_err(|e| format!("Read header: {e}"))?;
-    let header = VaultHeaderV3::from_bytes(&header_bytes)?;
-    if file_len != vault.opened_file_len || header.header_mac != vault.opened_header_mac {
+    if file_len != vault.opened_file_len || header_bytes != vault.opened_header {
         return Err("Vault changed while this write was in progress; retry operation".to_string());
     }
     Ok(())
@@ -2278,7 +2280,7 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
 ///
 /// Concurrency contract (audit M6): this provides only a *same-open generation
 /// check* via [`assert_vault_generation_current`] (it refuses to seal if the file
-/// length or header MAC changed since open). It takes **no cross-process lock**, so
+/// length or the on-disk header bytes changed since open). It takes **no cross-process lock**, so
 /// two writers that both opened the same generation can each pass the check and race
 /// the final rename, last-writer-wins. Cross-process safety is the **embedder's
 /// responsibility**: the AeroFTP app serializes all mutations behind an O_EXCL
@@ -2396,7 +2398,7 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     // not trip the generation guard against the bytes we just wrote.
     let header = VaultHeaderV3::from_bytes(&header_bytes)?;
     vault.opened_file_len = file_len;
-    vault.opened_header_mac = header.header_mac;
+    vault.opened_header = header_bytes;
     vault.header = header;
     Ok(())
 }
@@ -3695,7 +3697,7 @@ mod tests {
                 header_mac: [0u8; MAC_SIZE],
             },
             opened_file_len: 0,
-            opened_header_mac: [0u8; MAC_SIZE],
+            opened_header: [0u8; HEADER_SIZE],
             master_key: [0u8; KEY_SIZE],
             mac_key: [0u8; KEY_SIZE],
             manifest,

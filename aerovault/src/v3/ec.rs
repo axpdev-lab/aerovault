@@ -1239,6 +1239,51 @@ mod tests {
     }
 
     #[test]
+    fn recovered_header_still_exports_and_repairs() {
+        // Damage in the header MAC is recovered from the sidecar at open; the
+        // disk keeps the damaged bytes. That is not another writer: the export
+        // and the repair save must both go through.
+        let vp = tmp("mac-rot.aerovault");
+        let src = tmp("mac-rot-src");
+        let other = tmp("mac-rot-copy.aerocorrect");
+        std::fs::create_dir_all(&src).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&vp, PW),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        seed_tree(&mut vault, &src);
+        drop(vault);
+        VaultV3::export_parity(&vp, PW, None).unwrap();
+
+        let mut bytes = std::fs::read(&vp).unwrap();
+        let mac = super::super::constants::HEADER_MAC_OFFSET;
+        for b in &mut bytes[mac..mac + 4] {
+            *b ^= 0xff;
+        }
+        std::fs::write(&vp, &bytes).unwrap();
+
+        VaultV3::export_parity(&vp, PW, Some(&other)).unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        assert!(vault.header_repaired_on_open);
+        VaultV3::repair(&mut vault, false, None).unwrap();
+        drop(vault);
+        let vault = VaultV3::open(&vp, PW).unwrap();
+        assert!(
+            !vault.header_repaired_on_open,
+            "repair persisted the header"
+        );
+        drop(vault);
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_file(default_sidecar_path(&vp));
+        let _ = std::fs::remove_file(&other);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
     fn change_password_refreshes_sidecar_so_old_password_stops_working() {
         // A sidecar exported before a password change held the old header's
         // parity; header recovery rebuilt it and the old password still opened.
