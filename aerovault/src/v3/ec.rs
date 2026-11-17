@@ -34,7 +34,8 @@ use super::constants::{
 use super::format::VaultHeaderV3;
 use super::manifest::{ChunkRecordV3, ExtensionEntryV3};
 use super::vault::{
-    atomic_write, open_header_bytes, open_vault, read_capped, save_open_vault, OpenVaultV3,
+    assert_vault_generation_current, atomic_write, open_header_bytes, open_vault, read_capped,
+    save_open_vault, OpenVaultV3,
 };
 use crate::aerocrypt::KEY_SIZE;
 use crate::error_correction::sidecar::aerocorrect_sidecar_path;
@@ -372,6 +373,11 @@ pub(super) fn export_parity(
     let out = out_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| default_sidecar_path(vault_path));
+    // A save by another writer since this export opened the vault makes these
+    // bytes stale: publishing them would replace that writer's newer sidecar.
+    #[cfg(test)]
+    super::vault::run_before_sidecar_publish_hook();
+    assert_vault_generation_current(&vault)?;
     atomic_write(&out, &bytes)?;
     Ok(ExportParityResult {
         path: out,
@@ -1332,6 +1338,69 @@ mod tests {
 
         let _ = std::fs::remove_file(&vp);
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn refused_writes_are_not_persisted_by_a_later_repair() {
+        // Two small files share one packed chunk, which gets damaged. Every
+        // write is refused before it changes the handle, so repairing through
+        // the same handle must bring back exactly the original tree.
+        let vp = tmp("refused-delete.aerovault");
+        let src = tmp("refused-delete-src");
+        std::fs::create_dir_all(&src).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&vp, PW),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        let (a, b) = (src.join("a.txt"), src.join("b.txt"));
+        std::fs::write(&a, b"first small file").unwrap();
+        std::fs::write(&b, b"second small file").unwrap();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(
+            &mut vault,
+            &[(a, "a.txt".to_string()), (b, "b.txt".to_string())],
+        )
+        .unwrap();
+        assert_eq!(vault.manifest.chunks.len(), 1, "both files in one pack");
+        drop(vault);
+        corrupt_data_section(&vp, 32);
+        let damaged = std::fs::read(&vp).unwrap();
+
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        let before = vault.manifest.clone();
+        for err in [
+            VaultV3::delete_entry(&mut vault, "a.txt").map(|_| ()),
+            VaultV3::rename_entry(&mut vault, "b.txt", "c.txt"),
+            VaultV3::copy_entry(&mut vault, "a.txt", "d.txt"),
+            VaultV3::create_directory(&mut vault, "dir").map(|_| ()),
+        ] {
+            assert!(err.unwrap_err().contains("damaged"));
+        }
+        assert_eq!(std::fs::read(&vp).unwrap(), damaged);
+        assert_eq!(vault.manifest.entries.len(), before.entries.len());
+
+        let (repaired, _) = VaultV3::repair(&mut vault, false, None).unwrap();
+        assert!(repaired > 0);
+        drop(vault);
+        let vault = VaultV3::open(&vp, PW).unwrap();
+        let paths: Vec<&str> = vault
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(paths, ["a.txt", "b.txt"]);
+        let out = tmp("refused-delete-out");
+        let got = VaultV3::extract_entry(&vault, "a.txt", &out).unwrap();
+        assert_eq!(std::fs::read(got).unwrap(), b"first small file");
+        let got = VaultV3::extract_entry(&vault, "b.txt", &out).unwrap();
+        assert_eq!(std::fs::read(got).unwrap(), b"second small file");
+
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

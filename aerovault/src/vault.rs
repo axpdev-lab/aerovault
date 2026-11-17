@@ -1644,11 +1644,26 @@ fn temporary_vault_file(path: &Path, suffix: &str) -> crate::Result<tempfile::Na
 
 /// Atomic rename: tmp -> final as the single visible commit point.
 fn atomic_rename(tmp_path: &Path, final_path: &Path) -> crate::Result<()> {
-    // std::fs::rename replaces an existing file on Windows too, so the vault is
-    // never deleted before its replacement is in place.
-    std::fs::rename(tmp_path, final_path)?;
+    rename_into_place(tmp_path, final_path)?;
     fsync_parent_dir(final_path)?;
     Ok(())
+}
+
+/// The single commit point of every write. `std::fs::rename` replaces an
+/// existing file on Windows too, so the vault is never deleted before its
+/// replacement is in place: if the rename fails, the old vault is untouched.
+fn rename_into_place(tmp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_RENAME.with(|f| f.replace(false)) {
+        return Err(std::io::Error::other("injected rename failure"));
+    }
+    std::fs::rename(tmp_path, final_path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes the next commit rename fail.
+    static FAIL_NEXT_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Atomic write: write to temp file with fsync, then rename.
@@ -1660,7 +1675,7 @@ fn atomic_write(path: &Path, data: &[u8], suffix: &str) -> crate::Result<()> {
     writer.get_ref().sync_all()?;
     drop(writer);
 
-    std::fs::rename(tmp.path(), path)?;
+    rename_into_place(tmp.path(), path)?;
     fsync_parent_dir(path)?;
     Ok(())
 }
@@ -1677,6 +1692,33 @@ mod tests {
             rand::random::<u64>()
         ));
         path
+    }
+
+    #[test]
+    fn failed_commit_rename_leaves_the_old_vault_intact() {
+        // Each write commits by one rename over the vault. When that rename
+        // fails, the original must still be there and open, on every platform.
+        let path = temp_vault_path();
+        let vault = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        let input =
+            std::env::temp_dir().join(format!("aerovault-rename-{}.txt", rand::random::<u64>()));
+        std::fs::write(&input, b"kept").unwrap();
+        vault.add_files(&[&input]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        FAIL_NEXT_RENAME.with(|f| f.set(true));
+        assert!(vault.create_directory("later").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let mut vault = Vault::open(&path, "test-password-123").unwrap();
+        FAIL_NEXT_RENAME.with(|f| f.set(true));
+        assert!(vault.change_password("other-password-456").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let vault = Vault::open(&path, "test-password-123").unwrap();
+        assert_eq!(vault.list().unwrap().len(), 1);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&input).ok();
     }
 
     #[test]

@@ -477,7 +477,7 @@ impl VaultV3 {
 
     /// Add files into the vault at the given vault-relative paths, then persist.
     pub fn add_files(vault: &mut OpenVaultV3, sources: &[(PathBuf, String)]) -> Result<(), String> {
-        restore_on_err(vault, |v| {
+        write_op(vault, |v| {
             append_sources_batched(v, sources)?;
             save_open_vault(v)
         })
@@ -502,7 +502,7 @@ impl VaultV3 {
             };
             mapped.push((source.clone(), entry_path));
         }
-        restore_on_err(vault, |v| {
+        write_op(vault, |v| {
             if !target.is_empty() {
                 create_directory_in_manifest(&mut v.manifest, target)?;
             }
@@ -515,9 +515,11 @@ impl VaultV3 {
     /// Returns `true` when the leaf directory was newly created, `false` when it
     /// already existed.
     pub fn create_directory(vault: &mut OpenVaultV3, dir_path: &str) -> Result<bool, String> {
-        let created = create_directory_in_manifest(&mut vault.manifest, dir_path)?;
-        save_open_vault(vault)?;
-        Ok(created)
+        write_op(vault, |v| {
+            let created = create_directory_in_manifest(&mut v.manifest, dir_path)?;
+            save_open_vault(v)?;
+            Ok(created)
+        })
     }
 
     /// Recursively add `source_dir` (depth <= 100, <= 500000 entries) under
@@ -527,18 +529,12 @@ impl VaultV3 {
         source_dir: &Path,
         target_prefix: Option<&str>,
     ) -> Result<(usize, usize), String> {
-        restore_on_err(vault, |v| add_directory_into(v, source_dir, target_prefix))
+        write_op(vault, |v| add_directory_into(v, source_dir, target_prefix))
     }
 
     /// Delete a single entry (file or empty directory), then persist.
     pub fn delete_entry(vault: &mut OpenVaultV3, entry_name: &str) -> Result<usize, String> {
-        let removed = delete_entries_from_manifest(
-            vault,
-            std::slice::from_ref(&entry_name.to_string()),
-            false,
-        )?;
-        save_open_vault(vault)?;
-        Ok(removed)
+        Self::delete_entries(vault, std::slice::from_ref(&entry_name.to_string()), false)
     }
 
     /// Delete entries; with `recursive` a directory drops its whole subtree.
@@ -547,15 +543,26 @@ impl VaultV3 {
         entry_names: &[String],
         recursive: bool,
     ) -> Result<usize, String> {
-        let removed = delete_entries_from_manifest(vault, entry_names, recursive)?;
-        save_open_vault(vault)?;
-        Ok(removed)
+        write_op(vault, |v| {
+            // Compaction replaces the data section: keep the old one until the
+            // save succeeds, so a failed delete leaves the handle as it was.
+            let (removed, replaced) = delete_entries_from_manifest(v, entry_names, recursive)?;
+            if let Err(e) = save_open_vault(v) {
+                if let Some(data) = replaced {
+                    v.data = data;
+                }
+                return Err(e);
+            }
+            Ok(removed)
+        })
     }
 
     /// Move (or rename across directories) an entry/subtree, then persist.
     pub fn move_entry(vault: &mut OpenVaultV3, from: &str, to: &str) -> Result<(), String> {
-        move_entry_in_manifest(vault, from, to)?;
-        save_open_vault(vault)
+        write_op(vault, |v| {
+            move_entry_in_manifest(v, from, to)?;
+            save_open_vault(v)
+        })
     }
 
     /// Rename an entry within its parent directory, then persist.
@@ -570,14 +577,18 @@ impl VaultV3 {
             Some(parent) => join_vault_path(parent, &leaf),
             None => leaf,
         };
-        move_entry_in_manifest(vault, &current, &target)?;
-        save_open_vault(vault)
+        write_op(vault, |v| {
+            move_entry_in_manifest(v, &current, &target)?;
+            save_open_vault(v)
+        })
     }
 
     /// Copy an entry/subtree (reusing the same content chunks), then persist.
     pub fn copy_entry(vault: &mut OpenVaultV3, from: &str, to: &str) -> Result<(), String> {
-        copy_entry_in_manifest(vault, from, to)?;
-        save_open_vault(vault)
+        write_op(vault, |v| {
+            copy_entry_in_manifest(v, from, to)?;
+            save_open_vault(v)
+        })
     }
 
     /// Re-wrap the keys under a new password (new salt + KEKs), then persist.
@@ -587,10 +598,11 @@ impl VaultV3 {
         // and header recovery would rebuild that header, so the old password
         // would keep opening the vault. It is refreshed under the new header,
         // which first needs intact blocks: parity of a damaged block would
-        // replace the parity that can still repair it.
+        // replace the parity that can still repair it (embedded parity is
+        // recomputed on every save, so the same holds without a sidecar).
         let sidecar = super::ec::default_sidecar_path(&vault.path);
         let refresh = sidecar.exists();
-        if refresh && !super::ec::scrub_vault(vault).is_empty() {
+        if (refresh || has_embedded_parity(vault)) && !super::ec::scrub_vault(vault).is_empty() {
             return Err(
                 "Vault has damaged blocks: run repair before changing the password".to_string(),
             );
@@ -1146,13 +1158,20 @@ fn progress_total(entries: &[&ManifestEntryV3]) -> u64 {
         .fold(0u64, |acc, e| acc.saturating_add(e.size))
 }
 
-/// Run an add and its save; on any error restore the open handle, so a later
-/// write cannot persist a change the caller was told had failed (such as the
-/// removal of a file it was replacing).
-fn restore_on_err<T>(
+/// Run a mutation and its save. A vault with embedded parity and damaged
+/// blocks is refused before anything changes: the save recomputes that parity
+/// from the current blocks and would destroy the parity that repairs them. On
+/// any later error the manifest and the appended data are restored, so a later
+/// write (or a repair) on this handle cannot persist a change the caller was
+/// told had failed. Operations that replace the data section (delete) restore
+/// it themselves.
+fn write_op<T>(
     vault: &mut OpenVaultV3,
     op: impl FnOnce(&mut OpenVaultV3) -> Result<T, String>,
 ) -> Result<T, String> {
+    if has_embedded_parity(vault) && !super::ec::scrub_vault(vault).is_empty() {
+        return Err("Vault has damaged blocks: run repair before writing to it".to_string());
+    }
     let manifest = vault.manifest.clone();
     let data_len = vault.data.len();
     let result = op(vault);
@@ -1161,6 +1180,13 @@ fn restore_on_err<T>(
         vault.data.truncate(data_len);
     }
     result
+}
+
+fn has_embedded_parity(vault: &OpenVaultV3) -> bool {
+    vault
+        .extensions
+        .iter()
+        .any(|e| e.extension_id == super::constants::ERROR_CORRECTION_EXTENSION_ID)
 }
 
 fn append_sources_batched(
@@ -1235,7 +1261,8 @@ fn append_sources_batched(
 /// Garbage-collect orphaned chunks: keep only chunk records still referenced by
 /// a live entry, rewrite the data section in block-index order, and remap each
 /// surviving record's `data_offset`.
-fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<(), String> {
+/// Rewrite the data section with only the live chunks; returns the old one.
+fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<Vec<u8>, String> {
     let live_chunk_ids: HashSet<String> = vault
         .manifest
         .entries
@@ -1245,8 +1272,7 @@ fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<(), String> {
 
     if live_chunk_ids.is_empty() {
         vault.manifest.chunks.clear();
-        vault.data.clear();
-        return Ok(());
+        return Ok(std::mem::take(&mut vault.data));
     }
 
     let mut ordered_ids: Vec<(u64, String)> = vault
@@ -1297,16 +1323,17 @@ fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<(), String> {
         new_chunks.insert(chunk_id, record);
     }
 
-    vault.data = new_data;
     vault.manifest.chunks = new_chunks;
-    Ok(())
+    Ok(std::mem::replace(&mut vault.data, new_data))
 }
 
+/// Returns the removed count and, when compaction ran, the data section it
+/// replaced.
 fn delete_entries_from_manifest(
     vault: &mut OpenVaultV3,
     entry_names: &[String],
     recursive: bool,
-) -> Result<usize, String> {
+) -> Result<(usize, Option<Vec<u8>>), String> {
     let mut removed = 0usize;
 
     for entry_name in entry_names {
@@ -1341,13 +1368,14 @@ fn delete_entries_from_manifest(
         }
     }
 
+    let mut replaced = None;
     if removed > 0 {
-        compact_live_chunks(vault)?;
+        replaced = Some(compact_live_chunks(vault)?);
         sort_entries(&mut vault.manifest);
         vault.manifest.modified = now_iso();
     }
 
-    Ok(removed)
+    Ok((removed, replaced))
 }
 
 fn remap_entry_path(path: &str, from: &str, to: &str) -> String {
@@ -1971,6 +1999,21 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test seam: runs once in `export_parity` right before the sidecar is
+    /// published, so a test can let another writer save in that window.
+    pub(super) static BEFORE_SIDECAR_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn run_before_sidecar_publish_hook() {
+    if let Some(hook) = BEFORE_SIDECAR_PUBLISH.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
 fn run_after_persist_hook() {
     if let Some(hook) = AFTER_PERSIST.with(|h| h.borrow_mut().take()) {
         hook();
@@ -2215,7 +2258,7 @@ fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<(), String> 
 
 /// Staleness guard: refuse to seal if the on-disk vault changed since open
 /// (concurrent writer), keyed on file length + header MAC.
-fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
+pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
     let mut file = std::fs::File::open(&vault.path).map_err(|e| format!("Open vault: {e}"))?;
     let file_len = file
         .metadata()
@@ -2243,15 +2286,8 @@ fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
 /// must apply their own external lock.
 pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     assert_vault_generation_current(vault)?;
-    // The embedded parity is recomputed below from the current blocks: over a
-    // damaged block it would replace the parity that can still repair it.
-    let has_embedded_parity = vault
-        .extensions
-        .iter()
-        .any(|e| e.extension_id == super::constants::ERROR_CORRECTION_EXTENSION_ID);
-    if has_embedded_parity && !super::ec::scrub_vault(vault).is_empty() {
-        return Err("Vault has damaged blocks: run repair before writing to it".to_string());
-    }
+    // Writers refuse damaged blocks before mutating (`write_op`); repair saves
+    // only a fully verified reconstruction.
 
     let mut extensions = vault.extensions.clone();
     let mut ext_payloads = vec![];
@@ -2655,9 +2691,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_save_does_not_leave_the_add_in_the_handle() {
-        // The add succeeds in memory but the save fails (read-only folder).
-        // A later write on the same handle must not persist the replacement.
+    fn failed_save_does_not_leave_the_change_in_the_handle() {
+        // The add and the delete succeed in memory but the save fails
+        // (read-only folder). A later write on the same handle must not
+        // persist either of them.
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch_dir();
         let vp = dir.join("v.aerozip");
@@ -2676,8 +2713,11 @@ mod tests {
             return;
         }
         let failed = VaultV3::add_files(&mut vault, &[(new, "f.txt".to_string())]);
+        // Delete compacts the data section before the save: it must come back too.
+        let failed_delete = VaultV3::delete_entry(&mut vault, "f.txt");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(failed.is_err());
+        assert!(failed_delete.is_err());
 
         VaultV3::create_directory(&mut vault, "later").unwrap();
         drop(vault);
@@ -2699,6 +2739,35 @@ mod tests {
         };
         let (a, b) = (entry(u64::MAX), entry(2));
         assert_eq!(progress_total(&[&a, &b]), u64::MAX);
+    }
+
+    #[test]
+    fn stale_sidecar_export_does_not_replace_a_newer_one() {
+        // A's refresh has read the vault and is about to publish its sidecar
+        // when B changes the password and publishes its own. A's bytes are
+        // stale (they would rebuild A's header): B's sidecar must survive.
+        const PW_A: &str = "password-a-12345";
+        const PW_B: &str = "password-b-12345";
+        let (vp, sidecar) = vault_with_sidecar();
+        let sidecar_b = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (path, side, seen) = (vp.clone(), sidecar.clone(), sidecar_b.clone());
+        BEFORE_SIDECAR_PUBLISH.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let mut b = VaultV3::open(&path, PW_A).unwrap();
+                VaultV3::change_password(&mut b, PW_B).unwrap();
+                *seen.borrow_mut() = std::fs::read(&side).unwrap();
+            }));
+        });
+        let mut a = VaultV3::open(&vp, PW).unwrap();
+        let err = VaultV3::change_password(&mut a, PW_A).unwrap_err();
+        assert!(err.contains("another writer"), "{err}");
+        assert!(!sidecar_b.borrow().is_empty());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), *sidecar_b.borrow());
+        assert!(VaultV3::open(&vp, PW_A).is_err());
+        assert!(VaultV3::open(&vp, PW_B).is_ok());
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&sidecar).ok();
     }
 
     #[test]
