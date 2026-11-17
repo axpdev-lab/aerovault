@@ -1726,7 +1726,9 @@ mod tests {
             "{err}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        let err = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap_err();
+        let Err(err) = Vault::create(CreateOptions::new(&path, "test-password-123")) else {
+            panic!("create must refuse while another writer holds the lock");
+        };
         assert!(
             err.to_string().contains("locked by another writer"),
             "{err}"

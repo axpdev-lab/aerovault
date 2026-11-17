@@ -46,24 +46,7 @@ pub(crate) fn lock_path(vault: &Path) -> PathBuf {
 /// the lock could not be taken, or another writer kept it too long.
 pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
     let path = lock_path(vault);
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(io::Error::other(format!(
-            "vault lock file {} is a symbolic link; remove it",
-            path.display()
-        )));
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("open vault lock file {}: {e}", path.display()),
-            )
-        })?;
+    let file = open_lock_file(&path)?;
     let deadline = Instant::now() + WAIT;
     loop {
         match file.try_lock() {
@@ -86,6 +69,55 @@ pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
             }
         }
     }
+}
+
+/// Open (or create) the lock file without following a symbolic link (or, on
+/// Windows, a reparse point) at its path, and refuse anything that is not a
+/// regular file (a link, a directory, a FIFO, a device). The check is on the
+/// opened handle, so nothing can be swapped in between the check and the open.
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    let named =
+        |what: &str| io::Error::other(format!("vault lock file {}: {what}", path.display()));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK: opening a FIFO planted at the path must not wait for a
+        // peer (POSIX leaves O_RDWR on a FIFO undefined; Linux does not wait).
+        // It has no effect on a regular file or on the lock itself.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|e| {
+        // Diagnosis only (the open itself refused to follow the link).
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            named("is a symbolic link; remove it")
+        } else {
+            io::Error::new(
+                e.kind(),
+                format!("open vault lock file {}: {e}", path.display()),
+            )
+        }
+    })?;
+    let meta = file.metadata().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("inspect vault lock file {}: {e}", path.display()),
+        )
+    })?;
+    // On Windows `is_file` is false for a symbolic link or junction (a
+    // name-surrogate reparse point) and true for other reparse points such as
+    // cloud-sync placeholders, which are ordinary files to lock.
+    if !meta.is_file() {
+        return Err(named("is not a regular file; remove it"));
+    }
+    Ok(file)
 }
 
 /// [`acquire`] when `path` is an AeroVault container (v2 or v3 magic), so a
@@ -156,11 +188,51 @@ mod tests {
     #[test]
     fn symlinked_lock_file_is_refused() {
         let dir = scratch();
+        let vault = dir.join("v.aerovault");
+        // Dangling: following it would create the target.
         let target = dir.join("elsewhere");
-        std::os::unix::fs::symlink(&target, dir.join("v.aerovault.lock")).unwrap();
-        let err = acquire(&dir.join("v.aerovault")).unwrap_err();
+        std::os::unix::fs::symlink(&target, lock_path(&vault)).unwrap();
+        let err = acquire(&vault).unwrap_err();
         assert!(err.to_string().contains("symbolic link"), "{err}");
-        assert!(!target.exists());
+        assert!(!target.exists(), "the link was followed");
+        // Pointing at an existing file: following it would lock that file.
+        std::fs::remove_file(lock_path(&vault)).unwrap();
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, lock_path(&vault)).unwrap();
+        let err = acquire(&vault).unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn directory_at_the_lock_path_names_the_cause() {
+        let dir = scratch();
+        let vault = dir.join("v.aerovault");
+        std::fs::create_dir(lock_path(&vault)).unwrap();
+        let err = acquire(&vault).unwrap_err();
+        assert!(err.to_string().contains("vault lock file"), "{err}");
+        assert!(!err.to_string().contains("another writer"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_at_the_lock_path_is_refused_without_hanging() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch();
+        let vault = dir.join("v.aerovault");
+        let fifo = CString::new(lock_path(&vault).as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let v = vault.clone();
+        std::thread::spawn(move || tx.send(acquire(&v).map(drop)).ok());
+        let res = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("opening a FIFO at the lock path hung");
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
