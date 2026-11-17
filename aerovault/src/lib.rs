@@ -92,6 +92,7 @@ pub(crate) mod crypto;
 pub mod error;
 pub mod error_correction;
 pub mod format;
+pub(crate) mod lock;
 pub mod v3;
 pub mod vault;
 

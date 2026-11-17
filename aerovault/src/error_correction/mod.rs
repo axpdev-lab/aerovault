@@ -690,6 +690,8 @@ pub fn correct_generate_with_progress(
 ) -> Result<CorrectGenerateReport, String> {
     let path = Path::new(file);
     let rel = rel_name(file);
+    // On a vault, hold its write lock from the read to the sidecar rename.
+    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
     // it even for tiny files (the gate is a sync-pipeline opt-in, not a CLI-of-one concern).
     let result = sync::generate_sync_sidecar_for_file_capped_with_progress(
@@ -806,6 +808,8 @@ pub fn correct_repair_anchored_with_progress(
 ) -> Result<CorrectRepairReport, String> {
     let path = Path::new(file);
     let rel = rel_name(file);
+    // On a vault, hold its write lock from the read to the repaired rename.
+    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     let sidecar_path = parity
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
@@ -1062,6 +1066,30 @@ mod tests {
         let meta = std::fs::symlink_metadata(&sidecar).unwrap();
         assert!(meta.file_type().is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn correct_tools_take_the_vault_lock_only_on_a_vault() {
+        // `correct repair` rewrites the file and `correct gen` its sidecar: on
+        // a vault they must not interleave with a vault writer. On any other
+        // file they take no lock and leave no `.lock` file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = crate::v3::constants::MAGIC.to_vec();
+        bytes.extend_from_slice(&sample(30_000));
+        let vault = write_file(dir.path(), "v.aerovault", &bytes);
+        let held = crate::lock::acquire(Path::new(&vault)).unwrap();
+        let err = correct_generate(&vault, 15, None).unwrap_err();
+        assert!(err.contains("locked by another writer"), "{err}");
+        let err = correct_repair(&vault, None).unwrap_err();
+        assert!(err.contains("locked by another writer"), "{err}");
+        drop(held);
+        correct_generate(&vault, 15, None).unwrap();
+        assert_eq!(correct_repair(&vault, None).unwrap().status, "verified");
+
+        let plain = write_file(dir.path(), "photo.bin", &sample(30_000));
+        correct_generate(&plain, 15, None).unwrap();
+        correct_repair(&plain, None).unwrap();
+        assert!(!dir.path().join("photo.bin.lock").exists());
     }
 
     #[test]

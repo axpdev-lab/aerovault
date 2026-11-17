@@ -17,6 +17,7 @@
 
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::lock::WriteLock;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
@@ -603,6 +604,10 @@ impl VaultV3 {
         // which first needs intact blocks: parity of a damaged block would
         // replace the parity that can still repair it (embedded parity is
         // recomputed on every save, so the same holds without a sidecar).
+        // One lock across the sidecar check, the save and the refresh: no
+        // other writer can save or export in between, so the sidecar that
+        // exists is refreshed and is of this header.
+        let lock = write_lock(&vault.path)?;
         let sidecar = super::ec::default_sidecar_path(&vault.path);
         let refresh = sidecar.exists();
         if (refresh || has_embedded_parity(vault)) && !super::ec::scrub_vault(vault).is_empty() {
@@ -612,7 +617,7 @@ impl VaultV3 {
         }
         let (header, modified) = (vault.header.clone(), vault.manifest.modified.clone());
         change_password_in_place(vault, new_password)?;
-        if let Err(e) = save_open_vault(vault) {
+        if let Err(e) = save_locked(vault, &lock) {
             // The caller is told the change failed: a later save on this
             // handle must not persist the new password.
             vault.header = header;
@@ -620,7 +625,7 @@ impl VaultV3 {
             return Err(e);
         }
         if refresh {
-            refresh_sidecar(vault, &sidecar, new_password)?;
+            refresh_sidecar(vault, &sidecar, new_password, &lock)?;
         }
         Ok(())
     }
@@ -1982,6 +1987,7 @@ fn create_empty_vault(
     )?;
     master_key.zeroize();
     mac_key.zeroize();
+    let _lock = write_lock(path)?;
     atomic_write(path, &bytes)?;
 
     // Detached/both placements seed the sidecar so the file exists from
@@ -2017,6 +2023,21 @@ pub(super) fn run_before_sidecar_publish_hook() {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Test seam: runs once after the generation check, right before the
+    /// rename, the window a second writer would have to race into.
+    static IN_SAVE_WINDOW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_in_save_window_hook() {
+    if let Some(hook) = IN_SAVE_WINDOW.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
 fn run_after_persist_hook() {
     if let Some(hook) = AFTER_PERSIST.with(|h| h.borrow_mut().take()) {
         hook();
@@ -2026,8 +2047,13 @@ fn run_after_persist_hook() {
 /// Re-export the sidecar after a password change. On failure a stale sidecar
 /// would keep the old password working, so it is removed, unless another handle
 /// has changed the vault since: the sidecar then belongs to that change.
-fn refresh_sidecar(vault: &OpenVaultV3, sidecar: &Path, new_password: &str) -> Result<(), String> {
-    let Err(e) = super::ec::export_parity(&vault.path, new_password, None) else {
+fn refresh_sidecar(
+    vault: &OpenVaultV3,
+    sidecar: &Path,
+    new_password: &str,
+    lock: &WriteLock,
+) -> Result<(), String> {
+    let Err(e) = super::ec::export_parity_locked(&vault.path, new_password, None, lock) else {
         return Ok(());
     };
     let outcome = if assert_vault_generation_current(vault).is_err() {
@@ -2278,15 +2304,25 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
 
 /// Persist the in-memory vault back to disk with an atomic single-rename seal.
 ///
-/// Concurrency contract (audit M6): this provides only a *same-open generation
-/// check* via [`assert_vault_generation_current`] (it refuses to seal if the file
-/// length or the on-disk header bytes changed since open). It takes **no cross-process lock**, so
-/// two writers that both opened the same generation can each pass the check and race
-/// the final rename, last-writer-wins. Cross-process safety is the **embedder's
-/// responsibility**: the AeroFTP app serializes all mutations behind an O_EXCL
-/// `.{name}.lock`. Direct crate users that mutate a vault from more than one process
-/// must apply their own external lock.
+/// Concurrency contract (audit M6): the save holds the vault's cross-process write
+/// lock (`<vault>.lock`, see [`crate::lock`]) from the generation check to the
+/// rename, so two writers cannot both pass the check and overwrite each other.
+/// The generation check ([`assert_vault_generation_current`]: file length and
+/// on-disk header bytes unchanged since open) refuses a handle that another
+/// writer has made stale, including writers that do not take the lock.
 pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
+    let lock = write_lock(&vault.path)?;
+    save_locked(vault, &lock)
+}
+
+/// Take the vault's cross-process write lock (see [`crate::lock`]).
+pub(super) fn write_lock(path: &Path) -> Result<WriteLock, String> {
+    crate::lock::acquire(path).map_err(|e| e.to_string())
+}
+
+/// [`save_open_vault`] for a caller that already holds the write lock, from
+/// the generation check to the rename, so no other writer can save between.
+pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<(), String> {
     assert_vault_generation_current(vault)?;
     // Writers refuse damaged blocks before mutating (`write_op`); repair saves
     // only a fully verified reconstruction.
@@ -2386,6 +2422,8 @@ pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
         file.seek(std::io::SeekFrom::Start(0))
             .and_then(|_| file.read_exact(&mut header_bytes))
             .map_err(|e| format!("Read header: {e}"))?;
+        #[cfg(test)]
+        run_in_save_window_hook();
         tmp.persist(&vault.path)
             .map_err(|e| format!("Persist vault: {}", e.error))?;
         fsync_parent_dir(parent);
@@ -2680,7 +2718,8 @@ mod tests {
         VaultV3::change_password(&mut b, PW_B).unwrap();
         let sidecar_b = std::fs::read(&sidecar).unwrap();
 
-        let err = refresh_sidecar(&a, &sidecar, PW_A).unwrap_err();
+        let lock = write_lock(&vp).unwrap();
+        let err = refresh_sidecar(&a, &sidecar, PW_A, &lock).unwrap_err();
         assert!(err.contains("another writer"), "{err}");
         assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_b);
         assert!(VaultV3::open(&vp, PW).is_err());
@@ -2744,60 +2783,164 @@ mod tests {
     }
 
     #[test]
-    fn stale_sidecar_export_does_not_replace_a_newer_one() {
-        // A's refresh has read the vault and is about to publish its sidecar
-        // when B changes the password and publishes its own. A's bytes are
-        // stale (they would rebuild A's header): B's sidecar must survive.
+    fn writer_is_held_off_while_a_password_change_refreshes_the_sidecar() {
+        // A has saved its new header and is about to publish the refreshed
+        // sidecar when B tries to change the password again. B must wait and
+        // give up (A holds the lock across save and refresh), so A's sidecar
+        // is published and is of the header now on disk.
         const PW_A: &str = "password-a-12345";
         const PW_B: &str = "password-b-12345";
         let (vp, sidecar) = vault_with_sidecar();
-        let sidecar_b = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let (path, side, seen) = (vp.clone(), sidecar.clone(), sidecar_b.clone());
+        let b_result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (path, seen) = (vp.clone(), b_result.clone());
         BEFORE_SIDECAR_PUBLISH.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
                 let mut b = VaultV3::open(&path, PW_A).unwrap();
-                VaultV3::change_password(&mut b, PW_B).unwrap();
-                *seen.borrow_mut() = std::fs::read(&side).unwrap();
+                *seen.borrow_mut() = Some(VaultV3::change_password(&mut b, PW_B));
             }));
         });
         let mut a = VaultV3::open(&vp, PW).unwrap();
-        let err = VaultV3::change_password(&mut a, PW_A).unwrap_err();
-        assert!(err.contains("another writer"), "{err}");
-        assert!(!sidecar_b.borrow().is_empty());
-        assert_eq!(std::fs::read(&sidecar).unwrap(), *sidecar_b.borrow());
-        assert!(VaultV3::open(&vp, PW_A).is_err());
-        assert!(VaultV3::open(&vp, PW_B).is_ok());
+        VaultV3::change_password(&mut a, PW_A).unwrap();
+        drop(a);
+        let b_err = b_result.borrow_mut().take().unwrap().unwrap_err();
+        assert!(b_err.contains("locked by another writer"), "{b_err}");
+        assert!(VaultV3::open(&vp, PW_B).is_err());
+
+        // The published sidecar rebuilds A's header: with the header MAC
+        // damaged, PW_A still opens through recovery and PW does not.
+        let mut bytes = std::fs::read(&vp).unwrap();
+        let mac = super::super::constants::HEADER_MAC_OFFSET;
+        bytes[mac] ^= 0xff;
+        std::fs::write(&vp, &bytes).unwrap();
+        let vault = VaultV3::open(&vp, PW_A).unwrap();
+        assert!(vault.header_repaired_on_open);
+        drop(vault);
+        assert!(VaultV3::open(&vp, PW).is_err());
 
         std::fs::remove_file(&vp).ok();
         std::fs::remove_file(&sidecar).ok();
     }
 
     #[test]
-    fn save_baseline_is_the_generation_this_writer_sealed() {
-        // B changes the password right after A's save renames its file, before
-        // A records its baseline. A's baseline must still be A's own header, so
-        // A's sidecar cleanup sees the other writer and leaves B's sidecar.
+    fn sidecar_exported_while_a_password_change_waits_is_refreshed() {
+        // Another writer holds the lock and publishes a sidecar of the current
+        // (old-password) header while A's password change waits for the lock.
+        // A must see that sidecar once it holds the lock and refresh it, or
+        // header recovery would bring the old password back.
         const PW_A: &str = "password-a-12345";
-        const PW_B: &str = "password-b-12345";
         let (vp, sidecar) = vault_with_sidecar();
+        std::fs::remove_file(&sidecar).unwrap();
         let mut a = VaultV3::open(&vp, PW).unwrap();
-        change_password_in_place(&mut a, PW_A).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = vp.clone();
+        let other = std::thread::spawn(move || {
+            let lock = write_lock(&path).unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            super::super::ec::export_parity_locked(&path, PW, None, &lock).unwrap();
+        });
+        rx.recv().unwrap();
+        VaultV3::change_password(&mut a, PW_A).unwrap();
+        other.join().unwrap();
+        drop(a);
+
+        let mut bytes = std::fs::read(&vp).unwrap();
+        bytes[super::super::constants::HEADER_MAC_OFFSET] ^= 0xff;
+        std::fs::write(&vp, &bytes).unwrap();
+        assert!(VaultV3::open(&vp, PW).is_err(), "old password recovered");
+        assert!(VaultV3::open(&vp, PW_A).unwrap().header_repaired_on_open);
+
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&sidecar).ok();
+    }
+
+    #[test]
+    fn create_waits_for_another_writer_then_refuses() {
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        let before = std::fs::read(&vp).unwrap();
+        let held = write_lock(&vp).unwrap();
+        let err = VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap_err();
+        assert!(err.contains("locked by another writer"), "{err}");
+        assert_eq!(std::fs::read(&vp).unwrap(), before);
+        drop(held);
+        std::fs::remove_file(&vp).ok();
+    }
+
+    #[test]
+    fn concurrent_writer_cannot_slip_into_the_save_window() {
+        // A has passed its generation check and is about to rename. Without a
+        // lock, B (same generation) could save an add that A's rename then
+        // overwrites while both report success. B must be refused instead.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        let src = scratch_dir();
+        let (fa, fb) = (src.join("a.txt"), src.join("b.txt"));
+        std::fs::write(&fa, b"from a").unwrap();
+        std::fs::write(&fb, b"from b").unwrap();
+        let b_result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (path, seen, fb2) = (vp.clone(), b_result.clone(), fb.clone());
+        IN_SAVE_WINDOW.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let mut b = VaultV3::open(&path, PW).unwrap();
+                *seen.borrow_mut() =
+                    Some(VaultV3::add_files(&mut b, &[(fb2, "b.txt".to_string())]));
+            }));
+        });
+        let mut a = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(&mut a, &[(fa, "a.txt".to_string())]).unwrap();
+        drop(a);
+
+        let b_result = b_result.borrow_mut().take().unwrap();
+        let vault = VaultV3::open(&vp, PW).unwrap();
+        let paths: Vec<&str> = vault
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+        if b_result.is_ok() {
+            assert!(
+                paths.contains(&"b.txt"),
+                "B's add was reported saved but is lost"
+            );
+        }
+        let b_err = b_result.unwrap_err();
+        assert!(b_err.contains("locked by another writer"), "{b_err}");
+        assert_eq!(paths, ["a.txt"]);
+        drop(vault);
+
+        // Once A is done, B's retry goes through.
+        let mut b = VaultV3::open(&vp, PW).unwrap();
+        VaultV3::add_files(&mut b, &[(fb, "b.txt".to_string())]).unwrap();
+        std::fs::remove_file(&vp).ok();
+        std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[test]
+    fn save_baseline_is_the_generation_this_writer_sealed() {
+        // A writer that does not take the lock (an older version, a manual
+        // copy) replaces the vault right after A's rename, before A records
+        // its baseline. A's baseline must still be A's own header, so A's
+        // next write sees the change instead of overwriting it.
+        let (vp, sidecar) = vault_with_sidecar();
+        let other = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&other, PW)).unwrap();
+        let other_bytes = std::fs::read(&other).unwrap();
+        let mut a = VaultV3::open(&vp, PW).unwrap();
+        change_password_in_place(&mut a, "password-a-12345").unwrap();
         let path = vp.clone();
         AFTER_PERSIST.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
-                let mut b = VaultV3::open(&path, PW_A).unwrap();
-                VaultV3::change_password(&mut b, PW_B).unwrap();
+                std::fs::write(&path, &other_bytes).unwrap();
             }));
         });
         save_open_vault(&mut a).unwrap();
-        let sidecar_b = std::fs::read(&sidecar).unwrap();
-
-        let err = refresh_sidecar(&a, &sidecar, PW_A).unwrap_err();
-        assert!(err.contains("another writer"), "{err}");
-        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_b);
-        assert!(VaultV3::open(&vp, PW_B).is_ok());
+        let err = VaultV3::create_directory(&mut a, "later").unwrap_err();
+        assert!(err.contains("Vault changed"), "{err}");
 
         std::fs::remove_file(&vp).ok();
+        std::fs::remove_file(&other).ok();
         std::fs::remove_file(&sidecar).ok();
     }
 

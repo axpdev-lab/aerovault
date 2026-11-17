@@ -301,7 +301,11 @@ The `.aerocorrect` format is shared byte-for-byte with AeroFTP v4, pinned by a
 cross-implementation fixture: a sidecar produced by either implementation verifies and
 repairs with the other for the same file and overhead level. "v3 + Error Correction = v4".
 
-## 12. Crate Surface
+## 12. Writer Lock
+
+A container is written by replacing the whole file (temp file, then rename), and its `.aerocorrect` sidecar the same way. A writer MUST hold an exclusive OS lock (`flock`, `LockFileEx` on Windows) on the separate file `<container>.lock` (the container's file name with `.lock` appended, in the same directory) from the moment it reads the state it will write until its rename is done. This covers saves, sidecar exports (from the read of the container to the sidecar rename) and container creation. The lock file is never read, written or renamed, and is not removed after use. Readers do not take it. Before the rename, a writer still checks that the container's length and header bytes are those it read, which also refuses writers that do not take the lock.
+
+## 13. Crate Surface
 
 The standalone `aerovault` crate (0.5.0+) exposes the v3 container and the `.aerocorrect`
 sidecar through both a library API and the `aerovault` CLI:

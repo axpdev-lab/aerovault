@@ -6,9 +6,8 @@
 //!
 //! A faithful, byte-for-byte port of the AeroFTP application's AEROVAULT3 Error
 //! Correction operations (`src-tauri/src/aerovault_v3.rs`), minus the Tauri
-//! command layer, async, telemetry, and the cross-process file lock (the crate's
-//! `save_open_vault` already guards concurrent seals with an in-process
-//! generation check; `export_parity` only reads).
+//! command layer, async and telemetry. Saves and `export_parity` take the
+//! crate's cross-process write lock (`<vault>.lock`, see `crate::lock`).
 //!
 //! Error Correction is NON-CRITICAL: the embedded extension and the
 //! metadata-parity extension are both `critical=false`, so a rev. 3 reader still
@@ -341,6 +340,19 @@ pub(super) fn export_parity(
     password: &str,
     out_path: Option<&Path>,
 ) -> Result<ExportParityResult, String> {
+    let lock = super::vault::write_lock(vault_path)?;
+    export_parity_locked(vault_path, password, out_path, &lock)
+}
+
+/// [`export_parity`] under the caller's write lock, held from the read of the
+/// vault to the publication of the sidecar: no writer can save in between, so
+/// the sidecar always matches the vault it was built from.
+pub(super) fn export_parity_locked(
+    vault_path: &Path,
+    password: &str,
+    out_path: Option<&Path>,
+    _lock: &crate::lock::WriteLock,
+) -> Result<ExportParityResult, String> {
     let vault = open_vault(vault_path, password)?;
     // QR-style overhead level (#276): the grid recorded on the vault drives every
     // parity section so a detached sidecar matches the user's chosen overhead.
@@ -373,8 +385,8 @@ pub(super) fn export_parity(
     let out = out_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| default_sidecar_path(vault_path));
-    // A save by another writer since this export opened the vault makes these
-    // bytes stale: publishing them would replace that writer's newer sidecar.
+    // Lock-aware writers are held off by the lock; this check still catches a
+    // writer that does not take it (an older version, a manual copy).
     #[cfg(test)]
     super::vault::run_before_sidecar_publish_hook();
     assert_vault_generation_current(&vault)?;

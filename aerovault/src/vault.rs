@@ -185,7 +185,9 @@ impl Vault {
         writer.get_ref().sync_all()?;
         drop(writer);
 
+        let lock = crate::lock::acquire(&opts.path)?;
         atomic_rename(tmp.path(), &opts.path)?;
+        drop(lock);
 
         let master_key = SecretVec::new(master_key_raw.to_vec());
         let mac_key = SecretVec::new(mac_key_raw.to_vec());
@@ -343,6 +345,8 @@ impl Vault {
         file_paths: &[impl AsRef<Path>],
         target_dir: &str,
     ) -> crate::Result<u32> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let target_dir = target_dir.trim().trim_matches('/');
         if target_dir.contains("..") {
             return Err(crate::Error::InvalidPath(
@@ -533,6 +537,8 @@ impl Vault {
     ///
     /// Intermediate directories are created automatically (like `mkdir -p`).
     pub fn create_directory(&self, dir_name: &str) -> crate::Result<u32> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let dir_name = dir_name.trim().trim_matches('/');
         if dir_name.is_empty() {
             return Err(crate::Error::InvalidPath(
@@ -754,6 +760,8 @@ impl Vault {
     /// The encrypted data remains in the file but becomes orphaned.
     /// Use [`Vault::compact`] (future) to reclaim space.
     pub fn delete_entry(&self, entry_name: &str) -> crate::Result<()> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
 
@@ -799,6 +807,8 @@ impl Vault {
     /// under it (e.g., deleting "docs" also removes "docs/file.txt").
     /// Returns the number of entries removed.
     pub fn delete_entries(&self, names: &[&str], recursive: bool) -> crate::Result<u32> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
 
@@ -856,6 +866,8 @@ impl Vault {
     /// Supports both file and directory moves. When moving a directory, all
     /// descendant entries are moved as a single atomic manifest update.
     pub fn move_entry(&self, from: &str, to: &str) -> crate::Result<()> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let from = from.trim().trim_matches('/');
         let to = to.trim().trim_matches('/');
 
@@ -1008,6 +1020,8 @@ impl Vault {
     /// The copied entries reuse the existing encrypted data chunk references;
     /// only manifest metadata is duplicated and re-encrypted names are written.
     pub fn copy_entry(&self, from: &str, to: &str) -> crate::Result<()> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let from = from.trim().trim_matches('/');
         let to = to.trim().trim_matches('/');
 
@@ -1136,6 +1150,8 @@ impl Vault {
     ///
     /// Returns a [`CompactResult`] with size savings information.
     pub fn compact(&self) -> crate::Result<CompactResult> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         use std::io::Seek;
 
         let original_size = std::fs::metadata(&self.path)?.len();
@@ -1291,6 +1307,8 @@ impl Vault {
     /// Re-wraps the master and MAC keys with a new KEK. The encrypted content
     /// remains unchanged — only the 512-byte header is modified.
     pub fn change_password(&mut self, new_password: impl Into<String>) -> crate::Result<()> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let new_pwd = SecretString::from(new_password.into());
         if new_pwd.expose_secret().len() < MIN_PASSWORD_LENGTH {
             return Err(crate::Error::PasswordPolicy(format!(
@@ -1692,6 +1710,32 @@ mod tests {
             rand::random::<u64>()
         ));
         path
+    }
+
+    #[test]
+    fn write_waits_for_another_writer_then_refuses() {
+        // Each write holds the vault lock from its read to its rename; while
+        // another writer holds it, a write must give up, not interleave.
+        let path = temp_vault_path();
+        let vault = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let held = crate::lock::acquire(&path).unwrap();
+        let err = vault.create_directory("blocked").unwrap_err();
+        assert!(
+            err.to_string().contains("locked by another writer"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let err = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap_err();
+        assert!(
+            err.to_string().contains("locked by another writer"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(held);
+        vault.create_directory("after").unwrap();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(crate::lock::lock_path(&path)).ok();
     }
 
     #[test]

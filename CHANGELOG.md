@@ -10,7 +10,8 @@ All notable changes to the `aerovault` crate are documented here.
 
 - **Changing the password refreshes the `.aerocorrect` sidecar.** A sidecar exported before the change kept parity of the old header; header recovery rebuilt that header, so the old password still opened the vault. `VaultV3::change_password` now re-exports `<vault>.aerocorrect` when it exists, and first refuses the change if any block is damaged, so the parity that can still repair it is not replaced (run `repair` first). If the refresh itself fails, the old sidecar is removed, unless another handle has changed the vault in the meantime, and the error says to run `export-parity`; if the old sidecar cannot be removed either, the error says so, since it still accepts the old password. A sidecar kept at a custom path must be re-exported by hand.
 - **A vault whose header was recovered from the sidecar can be saved and exported.** The check that the vault has not changed since it was opened compared the recovered header's MAC with the damaged header still on disk, so damage to the MAC made `repair` and `export-parity` report a change by another writer. The check now compares the header bytes read at open with those on disk.
-- **`export-parity` no longer publishes a stale sidecar.** The export reads the vault, builds the sidecar, then checks that the vault has not been saved by another writer meanwhile before replacing `<vault>.aerocorrect`; otherwise it fails and the newer writer's sidecar stays. A password-change refresh that loses this race reports that another writer changed the vault.
+- **Concurrent writers no longer lose updates.** Every write (v3 save, `export-parity`, a password change with its sidecar refresh, vault creation, and every legacy v2 write) now takes an exclusive OS lock (`flock`, `LockFileEx` on Windows) on a separate `<vault>.lock` file, held from the read of the state it writes to the rename. Before, two writers could both pass the check that the vault had not changed and both report success while one change was overwritten; an export could publish a sidecar of an older header, which header recovery could later restore, together with the old password. A writer that finds the vault locked waits up to 30 seconds, then fails with `vault is locked by another writer`; a failure to create or take the lock reports its cause instead. Readers never take the lock. The OS releases it when the holder exits or crashes, and the empty `<vault>.lock` file is left in place on purpose. Measured with RACE_RESULTS.
+- **`export-parity` checks the vault before publishing.** Even without the lock (a writer that does not take it, such as an older version), the export now checks that the vault was not saved since it was read and fails instead of publishing a stale sidecar.
 - **`correct gen` no longer writes through a symlink.** The sidecar is written with a temp file and rename, like every vault write, so a symlink planted at the sidecar path is replaced instead of followed. The new sidecar is created private (0600 on Unix) instead of with the default umask, since its parity can rebuild small files.
 - **Repair bounds chunk records.** `repair` refuses chunk records above the 64 MiB block limit, or larger in total than the data section, before sizing its buffers. On the plaintext lane those lengths come from an unauthenticated manifest.
 
@@ -27,15 +28,20 @@ All notable changes to the `aerovault` crate are documented here.
 - **A save records the generation it wrote.** The baseline that later saves compare against is taken from the sealed file before it replaces the vault, not by re-reading the path afterwards, which could already show another writer's change.
 - **Extract progress no longer overflows** on manifest sizes whose sum exceeds `u64`.
 
+### Changed
+
+- **Minimum supported Rust version is now 1.89**, declared as `rust-version`, for the standard library file locks used by the write lock.
+
 ### Documentation
 
+- The v3 spec now defines the writer lock on `<container>.lock` (section 12).
 - The v3 spec now defines header flag `0x01` (`FLAG_PLAINTEXT_CONTENT`) and requires password readers to reject it.
 - The v3 spec no longer claims a per-file `file_id` binding, AES-SIV filename encryption or a ChaCha20-Poly1305 cascade for AEROVAULT3; those belong to AEROVAULT2. It now states the actual block and manifest AAD.
 - The `fast-kdf-for-tests` guard is described as what it is: it refuses the feature when debug assertions are off.
 
 ### Known limits
 
-- **Concurrent writers can lose an update.** Each save checks that the vault has not changed since it was opened, but the check runs before the write and nothing locks the file across handles or processes. Two writers saving the same vault at once can both succeed while only one change survives. Measured with two writers adding files concurrently, 40 trials of 10 adds: 180 of 381 successful adds were lost. An advisory lock on the vault file itself does not close this, because every save replaces the file (17 lost); a lock on a separate, stable lock file does (0 lost). The `.aerocorrect` export now re-checks the vault just before publishing, which leaves only the window between that check and its rename. Until a release adds that lock, serialize writes to one vault in the embedder.
+- **The write lock only coordinates writers that take it.** Versions before 0.6.9, and tools that write the file directly, do not; the check that the vault has not changed since it was opened still refuses most of their interleavings, but not all. On network file systems (SMB, NFS) the lock is only as reliable as the server's lock support; do not share one vault between machines for concurrent writing.
 
 No container-format, encryption-algorithm or key-derivation change.
 
