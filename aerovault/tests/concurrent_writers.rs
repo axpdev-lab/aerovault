@@ -80,5 +80,6 @@ fn concurrent_writers_lose_no_update() {
         "{TRIALS} trials x {WRITERS} writers x {ADDS} adds: ok={ok} refused={refused} lost={lost}"
     );
     assert_eq!(ok + refused, TRIALS * WRITERS * ADDS);
+    assert!(ok > 0, "every add was refused: the test proved nothing");
     assert_eq!(lost, 0, "an add reported success but is not in the vault");
 }

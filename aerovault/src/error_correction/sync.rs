@@ -400,6 +400,8 @@ pub fn verify_repair_sync_file(
     path: &Path,
     sidecar_bytes: &[u8],
 ) -> Result<SyncEcRepairResult, String> {
+    // On a vault, hold its write lock from the read to the repaired rename.
+    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
         .len();
@@ -453,16 +455,16 @@ pub fn verify_repair_sync_file(
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
     }
-    // On a persist failure, recover the NamedTempFile from the error and delete it so a
-    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
-    tmp.persist(path).map_err(|e| {
-        let msg = format!(
-            "persist repaired AeroSync EC target {}: {}",
-            path.display(),
-            e.error
-        );
-        let _ = e.file.close();
-        msg
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
+    // On a persist failure the temp file is removed, so a decrypted-plaintext
+    // `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
+    crate::v3::vault::persist_over(tmp, path).map_err(|e| {
+        format!(
+            "persist repaired AeroSync EC target {}: {e}",
+            path.display()
+        )
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
@@ -499,6 +501,8 @@ pub fn verify_repair_sync_file_streamed_with_progress(
     sidecar_path: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcRepairResult, String> {
+    // On a vault, hold its write lock from the read to the repaired rename.
+    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
         .len();
@@ -578,16 +582,16 @@ pub fn verify_repair_sync_file_streamed_with_progress(
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
     }
-    // On a persist failure, recover the NamedTempFile from the error and delete it so a
-    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
-    tmp.persist(path).map_err(|e| {
-        let msg = format!(
-            "persist repaired AeroSync EC target {}: {}",
-            path.display(),
-            e.error
-        );
-        let _ = e.file.close();
-        msg
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
+    // On a persist failure the temp file is removed, so a decrypted-plaintext
+    // `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
+    crate::v3::vault::persist_over(tmp, path).map_err(|e| {
+        format!(
+            "persist repaired AeroSync EC target {}: {e}",
+            path.display()
+        )
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }

@@ -418,6 +418,10 @@ pub(super) fn strip_parity(
     password: &str,
     force: bool,
 ) -> Result<StripParityResult, String> {
+    // Under the lock from the sidecar check to the save, so a writer that
+    // removes the sidecar meanwhile (a failed password-change refresh) cannot
+    // leave the vault with no recovery at all.
+    let lock = super::vault::write_lock(vault_path)?;
     let mut vault = open_vault(vault_path, password)?;
     let had_embedded = vault
         .extensions
@@ -437,7 +441,7 @@ pub(super) fn strip_parity(
     vault
         .extensions
         .retain(|e| e.extension_id != ERROR_CORRECTION_EXTENSION_ID);
-    save_open_vault(&mut vault)?;
+    super::vault::save_locked(&mut vault, &lock)?;
     Ok(StripParityResult {
         sidecar_present: has_sidecar,
         sidecar_path: sidecar,
@@ -1005,7 +1009,7 @@ mod tests {
             b"a small note in the vault"
         );
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&good_out);
@@ -1060,7 +1064,7 @@ mod tests {
             std::fs::read(good_out.join("big.bin")).unwrap(),
         );
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&good_out);
         let _ = std::fs::remove_dir_all(&after_out);
@@ -1111,7 +1115,7 @@ mod tests {
             std::fs::read(good_out.join("big.bin")).unwrap(),
         );
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&good_out);
         let _ = std::fs::remove_dir_all(&after_out);
@@ -1180,7 +1184,7 @@ mod tests {
         // The container is left byte-for-byte untouched (all-or-nothing).
         assert_eq!(std::fs::read(&vp).unwrap(), corrupt_bytes);
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
     }
@@ -1213,7 +1217,7 @@ mod tests {
         assert_eq!(repaired, 0);
         assert_eq!(source, ParitySource::None);
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -1245,7 +1249,7 @@ mod tests {
         assert!(vault.header_repaired_on_open);
         drop(vault);
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
     }
@@ -1289,7 +1293,7 @@ mod tests {
         );
         drop(vault);
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_file(&other);
         let _ = std::fs::remove_dir_all(&src);
@@ -1321,7 +1325,7 @@ mod tests {
         assert!(VaultV3::open(&vp, PW).is_err());
         assert!(VaultV3::open(&vp, NEW_PW).is_ok());
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
     }
@@ -1355,7 +1359,7 @@ mod tests {
             assert_eq!(std::fs::read(&vp).unwrap(), before);
         }
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_dir_all(&src);
     }
 
@@ -1393,7 +1397,7 @@ mod tests {
         let vault = VaultV3::open(&vp, PW).unwrap();
         assert!(VaultV3::scrub(&vault).is_empty());
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_dir_all(&src);
     }
 
@@ -1455,7 +1459,7 @@ mod tests {
         let got = VaultV3::extract_entry(&vault, "b.txt", &out).unwrap();
         assert_eq!(std::fs::read(got).unwrap(), b"second small file");
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -1488,7 +1492,7 @@ mod tests {
         let mut vault = VaultV3::open(&vp, PW).unwrap();
         assert!(VaultV3::repair(&mut vault, false, None).is_ok());
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
     }
@@ -1521,7 +1525,7 @@ mod tests {
         assert!(VaultV3::scrub(&vault).is_empty());
         drop(vault);
 
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
     }
@@ -1585,7 +1589,7 @@ mod tests {
         );
 
         drop(vault);
-        let _ = std::fs::remove_file(&vp);
+        crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_dir_all(&src);
     }
 }

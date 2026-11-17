@@ -142,11 +142,11 @@ impl CreateOptionsV3 {
 pub struct OpenVaultV3 {
     pub(super) path: PathBuf,
     pub(super) header: VaultHeaderV3,
+    /// Length and BLAKE3 hash of the whole file as read at open (or as written
+    /// by the last save): the generation baseline. Taken from the bytes on
+    /// disk, so a header recovered from the sidecar does not count as a change.
     pub(super) opened_file_len: u64,
-    /// Header bytes as read from disk at open (or written by the last save):
-    /// the generation baseline. Kept apart from `header`, which may have been
-    /// recovered from a sidecar while the disk still holds the damaged bytes.
-    pub(super) opened_header: [u8; HEADER_SIZE],
+    pub(super) opened_hash: [u8; 32],
     pub(super) master_key: [u8; KEY_SIZE],
     pub(super) mac_key: [u8; KEY_SIZE],
     pub(super) manifest: VaultManifestV3,
@@ -1791,10 +1791,22 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     tmp.as_file_mut()
         .sync_all()
         .map_err(|e| format!("Sync temp file: {e}"))?;
-    tmp.persist(target)
-        .map_err(|e| format!("Persist vault: {}", e.error))?;
+    persist_over(tmp, target).map_err(|e| format!("Persist vault: {e}"))?;
     fsync_parent_dir(parent);
     Ok(())
+}
+
+/// Rename a finished temp file over `dest`. `NamedTempFile::persist` uses
+/// `MoveFileExW` alone on Windows, which fails while another process (a
+/// reader) has `dest` open; `std::fs::rename` then retries with a
+/// POSIX-semantics rename. On error the temp file is removed.
+pub(crate) fn persist_over(tmp: tempfile::NamedTempFile, dest: &Path) -> std::io::Result<()> {
+    // `keep` clears the Windows temporary attribute and the delete-on-drop.
+    let (file, kept) = tmp.keep().map_err(|e| e.error)?;
+    drop(file);
+    std::fs::rename(&kept, dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&kept);
+    })
 }
 
 pub(super) fn read_capped(
@@ -1987,6 +1999,10 @@ fn create_empty_vault(
     )?;
     master_key.zeroize();
     mac_key.zeroize();
+    // The lock file lives next to the vault: create the folder first, as
+    // `atomic_write` would.
+    std::fs::create_dir_all(output_parent_dir(path))
+        .map_err(|e| format!("Create parent dir: {e}"))?;
     let _lock = write_lock(path)?;
     atomic_write(path, &bytes)?;
 
@@ -2240,10 +2256,12 @@ fn open_vault_with(
         .filter(|e| e.extension_id != super::constants::ERROR_CORRECTION_META_EXTENSION_ID)
         .collect();
 
+    // Same handle as every read above: the file it hashes is the one decoded.
+    let (opened_file_len, opened_hash) = file_generation(&mut file)?;
     Ok(OpenVaultV3 {
         path,
-        opened_file_len: file_len,
-        opened_header: header_bytes,
+        opened_file_len,
+        opened_hash,
         header,
         master_key,
         mac_key,
@@ -2289,17 +2307,22 @@ fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<(), String> 
 /// (concurrent writer), keyed on file length + header MAC.
 pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
     let mut file = std::fs::File::open(&vault.path).map_err(|e| format!("Open vault: {e}"))?;
-    let file_len = file
-        .metadata()
-        .map_err(|e| format!("Vault metadata: {e}"))?
-        .len();
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    file.read_exact(&mut header_bytes)
-        .map_err(|e| format!("Read header: {e}"))?;
-    if file_len != vault.opened_file_len || header_bytes != vault.opened_header {
+    if file_generation(&mut file)? != (vault.opened_file_len, vault.opened_hash) {
         return Err("Vault changed while this write was in progress; retry operation".to_string());
     }
     Ok(())
+}
+
+/// Length and BLAKE3 hash of the whole file behind `file`, read from its start.
+/// The whole file, not the header: a write can leave the header identical
+/// (a rename to a name of the same length changes only the manifest bytes).
+fn file_generation(file: &mut std::fs::File) -> Result<(u64, [u8; 32]), String> {
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("Read vault: {e}"))?;
+    let mut hasher = blake3::Hasher::new();
+    let len = std::io::copy(file, &mut hasher).map_err(|e| format!("Read vault: {e}"))?;
+    Ok((len, *hasher.finalize().as_bytes()))
 }
 
 /// Persist the in-memory vault back to disk with an atomic single-rename seal.
@@ -2307,9 +2330,10 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
 /// Concurrency contract (audit M6): the save holds the vault's cross-process write
 /// lock (`<vault>.lock`, see [`crate::lock`]) from the generation check to the
 /// rename, so two writers cannot both pass the check and overwrite each other.
-/// The generation check ([`assert_vault_generation_current`]: file length and
-/// on-disk header bytes unchanged since open) refuses a handle that another
-/// writer has made stale, including writers that do not take the lock.
+/// The generation check ([`assert_vault_generation_current`]: the file is byte
+/// for byte the one this handle read or last wrote) refuses a handle that
+/// another writer has made stale, including a writer that does not take the
+/// lock when its change landed before the check.
 pub(super) fn save_open_vault(vault: &mut OpenVaultV3) -> Result<(), String> {
     let lock = write_lock(&vault.path)?;
     save_locked(vault, &lock)
@@ -2385,7 +2409,7 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
     // second whole-file buffer, so the seal no longer doubles peak memory
     // (T5 sub-task #2). Same atomic temp + sync + persist + dir-fsync discipline
     // as `atomic_write`, via the shared helpers.
-    let (file_len, header_bytes) = {
+    let ((file_len, file_hash), header_bytes) = {
         use std::io::{Seek, Write};
         let parent = output_parent_dir(&vault.path);
         std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
@@ -2414,29 +2438,25 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
         // from a later read of the path, which may already show another
         // writer's generation.
         let file = tmp.as_file_mut();
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("Vault metadata: {e}"))?
-            .len();
+        let generation = file_generation(file)?;
         let mut header_bytes = [0u8; HEADER_SIZE];
         file.seek(std::io::SeekFrom::Start(0))
             .and_then(|_| file.read_exact(&mut header_bytes))
             .map_err(|e| format!("Read header: {e}"))?;
         #[cfg(test)]
         run_in_save_window_hook();
-        tmp.persist(&vault.path)
-            .map_err(|e| format!("Persist vault: {}", e.error))?;
+        persist_over(tmp, &vault.path).map_err(|e| format!("Persist vault: {e}"))?;
         fsync_parent_dir(parent);
         #[cfg(test)]
         run_after_persist_hook();
-        (file_len, header_bytes)
+        (generation, header_bytes)
     };
 
     // Refresh the staleness baseline so a second save in the same session does
     // not trip the generation guard against the bytes we just wrote.
     let header = VaultHeaderV3::from_bytes(&header_bytes)?;
     vault.opened_file_len = file_len;
-    vault.opened_header = header_bytes;
+    vault.opened_hash = file_hash;
     vault.header = header;
     Ok(())
 }
@@ -2726,7 +2746,7 @@ mod tests {
         assert!(VaultV3::open(&vp, PW_A).is_err());
         assert!(VaultV3::open(&vp, PW_B).is_ok());
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_file(&sidecar).ok();
     }
 
@@ -2784,6 +2804,8 @@ mod tests {
 
     #[test]
     fn writer_is_held_off_while_a_password_change_refreshes_the_sidecar() {
+        // B runs inside A's lock on this thread and must give up.
+        crate::lock::set_short_wait_for_this_thread();
         // A has saved its new header and is about to publish the refreshed
         // sidecar when B tries to change the password again. B must wait and
         // give up (A holds the lock across save and refresh), so A's sidecar
@@ -2817,7 +2839,7 @@ mod tests {
         drop(vault);
         assert!(VaultV3::open(&vp, PW).is_err());
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_file(&sidecar).ok();
     }
 
@@ -2850,12 +2872,13 @@ mod tests {
         assert!(VaultV3::open(&vp, PW).is_err(), "old password recovered");
         assert!(VaultV3::open(&vp, PW_A).unwrap().header_repaired_on_open);
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_file(&sidecar).ok();
     }
 
     #[test]
     fn create_waits_for_another_writer_then_refuses() {
+        crate::lock::set_short_wait_for_this_thread();
         let vp = vault_path();
         VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
         let before = std::fs::read(&vp).unwrap();
@@ -2864,11 +2887,13 @@ mod tests {
         assert!(err.contains("locked by another writer"), "{err}");
         assert_eq!(std::fs::read(&vp).unwrap(), before);
         drop(held);
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
     }
 
     #[test]
     fn concurrent_writer_cannot_slip_into_the_save_window() {
+        // B runs inside A's lock on this thread and must give up.
+        crate::lock::set_short_wait_for_this_thread();
         // A has passed its generation check and is about to rename. Without a
         // lock, B (same generation) could save an add that A's rename then
         // overwrites while both report success. B must be refused instead.
@@ -2913,8 +2938,119 @@ mod tests {
         // Once A is done, B's retry goes through.
         let mut b = VaultV3::open(&vp, PW).unwrap();
         VaultV3::add_files(&mut b, &[(fb, "b.txt".to_string())]).unwrap();
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[test]
+    fn stale_handle_is_refused_when_only_the_body_changed() {
+        // A rename to a name of the same length leaves the file length and
+        // header bytes as they were; only the body differs. A handle opened
+        // before such a change must still be refused, not overwrite it.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let src = scratch_dir();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        let mut a = VaultV3::open_plaintext(&vp).unwrap();
+        let mut bytes = std::fs::read(&vp).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&vp, &bytes).unwrap();
+        let err =
+            VaultV3::add_files(&mut a, &[(src.join("a.txt"), "a.txt".to_string())]).unwrap_err();
+        assert!(err.contains("Vault changed"), "{err}");
+        assert_eq!(std::fs::read(&vp).unwrap(), bytes);
+        crate::lock::remove_vault_and_lock(&vp);
+        std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[test]
+    fn create_makes_a_missing_parent_folder() {
+        let root = scratch_dir();
+        let vp = root.join("new").join("sub").join("v.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        VaultV3::open_plaintext(&vp).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn save_succeeds_while_a_reader_has_the_vault_open() {
+        // On Windows a plain MoveFileExW replace fails while another handle
+        // has the destination open; readers take no lock, so a save must not.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let src = scratch_dir();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        let reader = std::fs::File::open(&vp).unwrap();
+        let mut v = VaultV3::open_plaintext(&vp).unwrap();
+        VaultV3::add_files(&mut v, &[(src.join("a.txt"), "a.txt".to_string())]).unwrap();
+        drop(reader);
+        drop(v);
+        assert_eq!(
+            VaultV3::summary(&VaultV3::open_plaintext(&vp).unwrap())
+                .entries
+                .len(),
+            1
+        );
+        crate::lock::remove_vault_and_lock(&vp);
+        std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[test]
+    fn strip_parity_checks_the_sidecar_under_the_lock() {
+        // Another writer holds the lock and removes the sidecar (as a failed
+        // password-change refresh does) while strip-parity waits. Once it holds
+        // the lock, strip-parity must see the sidecar gone and keep the parity.
+        use super::super::ec::{default_sidecar_path, RecoveryPlacement};
+        let vp = vault_path();
+        let opts = CreateOptionsV3::new(&vp, PW);
+        VaultV3::create_with_error_correction(&opts, RecoveryPlacement::Both, 20).unwrap();
+        let sidecar = default_sidecar_path(&vp);
+        assert!(sidecar.exists());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (path, side) = (vp.clone(), sidecar.clone());
+        let other = std::thread::spawn(move || {
+            let _lock = write_lock(&path).unwrap();
+            tx.send(()).unwrap();
+            // Longer than the key derivation strip-parity runs before its check.
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::fs::remove_file(&side).unwrap();
+        });
+        rx.recv().unwrap();
+        let res = VaultV3::strip_parity(&vp, PW, false);
+        other.join().unwrap();
+        let err = res.unwrap_err();
+        assert!(err.contains("no detached recovery file"), "{err}");
+        assert!(has_embedded_parity(&VaultV3::open(&vp, PW).unwrap()));
+        crate::lock::remove_vault_and_lock(&vp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_to_another_folder_works_from_a_read_only_folder() {
+        // A vault on read-only media (no lock file, none can be created) can
+        // still be read to export its parity elsewhere.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir();
+        let vp = dir.join("v.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        std::fs::remove_file(crate::lock::lock_path(&vp)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            // Running as root: the folder is writable anyway.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        let out_dir = scratch_dir();
+        let out = out_dir.join("v.aerocorrect");
+        let res = VaultV3::export_parity(&vp, PW, Some(&out));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        res.unwrap();
+        assert!(out.exists());
+        assert!(!crate::lock::lock_path(&vp).exists());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&out_dir).ok();
     }
 
     #[test]
@@ -2939,8 +3075,8 @@ mod tests {
         let err = VaultV3::create_directory(&mut a, "later").unwrap_err();
         assert!(err.contains("Vault changed"), "{err}");
 
-        std::fs::remove_file(&vp).ok();
-        std::fs::remove_file(&other).ok();
+        crate::lock::remove_vault_and_lock(&vp);
+        crate::lock::remove_vault_and_lock(&other);
         std::fs::remove_file(&sidecar).ok();
     }
 
@@ -2964,7 +3100,7 @@ mod tests {
         assert!(VaultV3::open(&vp, NEW_PW).is_ok());
         assert!(VaultV3::open(&vp, PW).is_err());
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&sidecar).ok();
     }
 
@@ -3039,7 +3175,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(out.join("big.bin")).unwrap(), payload);
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -3115,7 +3251,7 @@ mod tests {
             "compressible multi-chunk file must round-trip byte-identically"
         );
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -3182,7 +3318,7 @@ mod tests {
             );
         }
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -3296,7 +3432,7 @@ mod tests {
         assert_eq!(std::fs::read(out.join("text.txt")).unwrap(), text_payload);
         assert_eq!(std::fs::read(out.join("noise.bin")).unwrap(), noise_payload);
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -3367,7 +3503,7 @@ mod tests {
         let mut vault = VaultV3::open_plaintext(&vp).unwrap();
         assert!(VaultV3::change_password(&mut vault, "irrelevant-pw-123").is_err());
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -3383,7 +3519,7 @@ mod tests {
         bytes[HEADER_SIZE..].fill(0xA5);
         std::fs::write(&vp, &bytes).unwrap();
         assert_eq!(VaultV3::open(&vp, PW).unwrap_err(), PLAINTEXT_NOT_A_VAULT);
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
     }
 
     #[test]
@@ -3411,7 +3547,7 @@ mod tests {
         assert!(VaultV3::open(&enc, "wrong-password-123").is_err());
         assert!(VaultV3::open_plaintext(&enc).is_err());
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_file(&enc).ok();
     }
 
@@ -3457,7 +3593,7 @@ mod tests {
         let out = VaultV3::extract_entry(&vault, "big.bin", &src.join("out")).unwrap();
         assert_eq!(std::fs::read(out).unwrap(), b"original");
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
     }
 
@@ -3477,7 +3613,7 @@ mod tests {
         assert_eq!(bounds.avg, defaults.avg);
         assert_eq!(bounds.max, defaults.max);
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
     }
 
     #[test]
@@ -3508,7 +3644,7 @@ mod tests {
         VaultV3::extract_all(&vault, &out).unwrap();
         assert_eq!(std::fs::read(out.join("noise.bin")).unwrap(), noise_payload);
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -3533,8 +3669,8 @@ mod tests {
                 .to_string(),
             "empty plaintext archive must be byte-deterministic"
         );
-        std::fs::remove_file(&vp).ok();
-        std::fs::remove_file(&vp2).ok();
+        crate::lock::remove_vault_and_lock(&vp);
+        crate::lock::remove_vault_and_lock(&vp2);
     }
 
     #[derive(Default)]
@@ -3634,7 +3770,7 @@ mod tests {
         );
         assert!(g.plaintext > 0);
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
     }
 
@@ -3689,7 +3825,7 @@ mod tests {
             .collect();
         assert_eq!(c1, c2);
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
     }
 
@@ -3737,7 +3873,7 @@ mod tests {
         let reopened = VaultV3::open(&vp, PW).unwrap();
         assert!(VaultV3::list(&reopened).is_empty());
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
     }
 
@@ -3757,7 +3893,7 @@ mod tests {
         let v2 = VaultV3::open(&vp, "new-password-456").unwrap();
         assert!(VaultV3::list(&v2).iter().any(|e| e.path == "x.txt"));
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
     }
 
@@ -3786,7 +3922,7 @@ mod tests {
             b"bottom file"
         );
 
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&tree).ok();
         std::fs::remove_dir_all(&out).ok();
     }
@@ -3840,7 +3976,7 @@ mod tests {
                 header_mac: [0u8; MAC_SIZE],
             },
             opened_file_len: 0,
-            opened_header: [0u8; HEADER_SIZE],
+            opened_hash: [0u8; 32],
             master_key: [0u8; KEY_SIZE],
             mac_key: [0u8; KEY_SIZE],
             manifest,
@@ -3889,7 +4025,7 @@ mod tests {
             eprintln!("skipping extract_refuses_planted_reparse_point_parent: no reparse support");
             std::fs::remove_dir_all(&dest).ok();
             std::fs::remove_dir_all(&victim).ok();
-            std::fs::remove_file(&vp).ok();
+            crate::lock::remove_vault_and_lock(&vp);
             return;
         }
 
@@ -3907,7 +4043,7 @@ mod tests {
         std::fs::remove_dir_all(&dest).ok();
         std::fs::remove_dir_all(&victim).ok();
         std::fs::remove_dir_all(&src).ok();
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
     }
 
     /// Audit M4: a forged extension directory (duplicate id, or a payload slice that
@@ -3971,7 +4107,7 @@ mod tests {
             eprintln!("skipping extract_entry_dir_refuses_planted_output_root_junction: no reparse support");
             std::fs::remove_dir_all(&dest).ok();
             std::fs::remove_dir_all(&victim).ok();
-            std::fs::remove_file(&vp).ok();
+            crate::lock::remove_vault_and_lock(&vp);
             return;
         }
 
@@ -3988,7 +4124,7 @@ mod tests {
         std::fs::remove_dir_all(&dest).ok();
         std::fs::remove_dir_all(&victim).ok();
         std::fs::remove_dir_all(&src).ok();
-        std::fs::remove_file(&vp).ok();
+        crate::lock::remove_vault_and_lock(&vp);
     }
 
     /// Plant `link` as a directory reparse point targeting `target`. Returns false

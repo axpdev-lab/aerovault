@@ -808,8 +808,7 @@ pub fn correct_repair_anchored_with_progress(
 ) -> Result<CorrectRepairReport, String> {
     let path = Path::new(file);
     let rel = rel_name(file);
-    // On a vault, hold its write lock from the read to the repaired rename.
-    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
+    // The vault lock (on a container) is taken by the sync repair below.
     let sidecar_path = parity
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
@@ -1073,6 +1072,7 @@ mod tests {
         // `correct repair` rewrites the file and `correct gen` its sidecar: on
         // a vault they must not interleave with a vault writer. On any other
         // file they take no lock and leave no `.lock` file.
+        crate::lock::set_short_wait_for_this_thread();
         let dir = tempfile::tempdir().unwrap();
         let mut bytes = crate::v3::constants::MAGIC.to_vec();
         bytes.extend_from_slice(&sample(30_000));
@@ -1085,6 +1085,25 @@ mod tests {
         drop(held);
         correct_generate(&vault, 15, None).unwrap();
         assert_eq!(correct_repair(&vault, None).unwrap().status, "verified");
+
+        // The public repair functions an embedder calls directly lock too.
+        use sha2::Digest;
+        let sidecar_path = sidecar::aerocorrect_sidecar_path(&vault);
+        let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+        let sha: [u8; 32] = sha2::Sha256::digest(std::fs::read(&vault).unwrap()).into();
+        let held = crate::lock::acquire(Path::new(&vault)).unwrap();
+        let err = sync::verify_repair_sync_file("v", &sha, Path::new(&vault), &sidecar_bytes)
+            .unwrap_err();
+        assert!(err.contains("locked by another writer"), "{err}");
+        let err = sync::verify_repair_sync_file_streamed(
+            "v",
+            &sha,
+            Path::new(&vault),
+            Path::new(&sidecar_path),
+        )
+        .unwrap_err();
+        assert!(err.contains("locked by another writer"), "{err}");
+        drop(held);
 
         let plain = write_file(dir.path(), "photo.bin", &sample(30_000));
         correct_generate(&plain, 15, None).unwrap();

@@ -1714,6 +1714,7 @@ mod tests {
 
     #[test]
     fn write_waits_for_another_writer_then_refuses() {
+        crate::lock::set_short_wait_for_this_thread();
         // Each write holds the vault lock from its read to its rename; while
         // another writer holds it, a write must give up, not interleave.
         let path = temp_vault_path();
@@ -1736,8 +1737,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         drop(held);
         vault.create_directory("after").unwrap();
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(crate::lock::lock_path(&path)).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1763,7 +1763,7 @@ mod tests {
 
         let vault = Vault::open(&path, "test-password-123").unwrap();
         assert_eq!(vault.list().unwrap().len(), 1);
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&input).ok();
     }
 
@@ -1779,7 +1779,7 @@ mod tests {
         let entries = vault.list().unwrap();
         assert!(entries.is_empty());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1791,7 +1791,7 @@ mod tests {
         let result = Vault::open(&path, "wrong-password");
         assert!(result.is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1800,7 +1800,7 @@ mod tests {
         let opts = CreateOptions::new(&path, "short");
         let result = Vault::create(opts);
         assert!(result.is_err());
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1812,7 +1812,7 @@ mod tests {
         let opts = CreateOptions::new(&path, "test-password-123").with_chunk_size(32 * 1024 * 1024); // too large
         assert!(Vault::create(opts).is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1845,7 +1845,7 @@ mod tests {
         assert_eq!(content, "Hello from AeroVault!");
 
         // Cleanup
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -1903,8 +1903,8 @@ mod tests {
         )
         .is_err());
 
-        std::fs::remove_file(&v2_path).ok();
-        std::fs::remove_file(&v3_path).ok();
+        crate::lock::remove_vault_and_lock(&v2_path);
+        crate::lock::remove_vault_and_lock(&v3_path);
         std::fs::remove_file(&input).ok();
         std::fs::remove_dir_all(&out2).ok();
         std::fs::remove_dir_all(&out3).ok();
@@ -1935,7 +1935,7 @@ mod tests {
         let content = std::fs::read_to_string(&extracted).unwrap();
         assert_eq!(content, "Cascade mode test");
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -1958,7 +1958,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.is_dir));
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1980,7 +1980,7 @@ mod tests {
         // Deleting again should fail
         assert!(vault.delete_entry("aerovault-delete-input.txt").is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
     }
 
@@ -2005,7 +2005,7 @@ mod tests {
         let entries = vault2.list().unwrap();
         assert_eq!(entries.len(), 1);
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
     }
 
@@ -2014,7 +2014,7 @@ mod tests {
         let path = std::env::temp_dir().join("not-a-vault.txt");
         std::fs::write(&path, b"just text").ok();
         assert!(!Vault::is_vault(&path));
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
 
         assert!(!Vault::is_vault("/nonexistent/path"));
     }
@@ -2028,7 +2028,7 @@ mod tests {
         let display = format!("{info}");
         assert!(display.contains("AES-256-GCM-SIV"));
         assert!(display.contains("128 MiB"));
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -2062,7 +2062,7 @@ mod tests {
         let extracted = vault.extract("renamed.txt", &out_dir).unwrap();
         assert!(extracted.ends_with("renamed.txt"));
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -2098,7 +2098,7 @@ mod tests {
         let content = std::fs::read_to_string(extracted).unwrap();
         assert_eq!(content, "move me");
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -2112,7 +2112,7 @@ mod tests {
         vault.create_directory("docs/old").unwrap();
         assert!(vault.move_entry("docs", "docs/archive").is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -2141,7 +2141,7 @@ mod tests {
         let content = std::fs::read_to_string(extracted).unwrap();
         assert_eq!(content, "copy me");
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -2172,7 +2172,7 @@ mod tests {
             .iter()
             .any(|n| n == "archive/original-copy/aerovault-copy-tree-input.txt"));
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
     }
 
@@ -2185,7 +2185,7 @@ mod tests {
         vault.create_directory("docs/original").unwrap();
         assert!(vault.copy_entry("docs", "docs/archive").is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[cfg(unix)]
