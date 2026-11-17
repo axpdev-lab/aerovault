@@ -1399,11 +1399,14 @@ impl Vault {
     // --- Internal Helpers ---
 
     /// True if `body` (the bytes after the header) starts with a manifest that
-    /// decrypts under this handle's master key.
+    /// decrypts under this handle's master key. The decrypted manifest is only
+    /// a proof and is wiped at once.
     fn manifest_decrypts(&self, mut body: &[u8]) -> bool {
         crypto::read_manifest_bounded(&mut body).is_ok_and(|(_, encrypted)| {
             std::str::from_utf8(&encrypted).is_ok_and(|text| {
-                crypto::decrypt_filename(self.master_key.expose_secret(), text).is_ok()
+                crypto::decrypt_filename(self.master_key.expose_secret(), text)
+                    .map(|mut plain| plain.zeroize())
+                    .is_ok()
             })
         })
     }

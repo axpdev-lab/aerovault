@@ -391,6 +391,14 @@ pub(super) fn export_parity_locked(
     #[cfg(test)]
     super::vault::run_before_sidecar_publish_hook();
     assert_vault_generation_current(&vault)?;
+    // A chosen output path may be another vault: replace it only under its
+    // own lock too (the default sidecar is covered by the vault's lock).
+    let _out_lock = match out_path {
+        Some(p) if p != default_sidecar_path(vault_path) => {
+            crate::lock::acquire_destination(p, vault_path).map_err(|e| e.to_string())?
+        }
+        _ => None,
+    };
     atomic_write(&out, &bytes)?;
     Ok(ExportParityResult {
         path: out,

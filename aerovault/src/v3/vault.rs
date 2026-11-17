@@ -2895,6 +2895,9 @@ mod tests {
         assert!(VaultV3::open(&vp, PW_A).is_err());
         assert!(VaultV3::open(&vp, PW_B).is_ok());
 
+        // Released before the cleanup: on Windows a held lock file cannot be
+        // deleted (it is opened without delete sharing).
+        drop(lock);
         crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_file(&sidecar).ok();
     }
@@ -3295,6 +3298,44 @@ mod tests {
         drop(v);
         crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[test]
+    fn a_chosen_output_is_replaced_only_under_its_own_lock() {
+        // `export-parity --out` and `correct gen --out` name a path that may be
+        // another vault (B): while a writer of B holds B's lock, B is kept.
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = scratch_dir();
+        let b = dir.join("b.aerozip");
+        let c = dir.join("c.aerovault");
+        let plain = dir.join("plain.bin");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&b)).unwrap();
+        VaultV3::create(&CreateOptionsV3::new(&c, PW)).unwrap();
+        std::fs::write(&plain, vec![9u8; 20_000]).unwrap();
+        let b_before = std::fs::read(&b).unwrap();
+        let held = write_lock(&b).unwrap();
+        let err =
+            crate::error_correction::correct_generate(plain.to_str().unwrap(), 10, b.to_str())
+                .map(drop)
+                .unwrap_err();
+        assert!(err.contains("locked by another writer"), "gen: {err}");
+        let err = VaultV3::export_parity(&c, PW, Some(&b))
+            .map(drop)
+            .unwrap_err();
+        assert!(err.contains("locked by another writer"), "export: {err}");
+        assert_eq!(std::fs::read(&b).unwrap(), b_before);
+        drop(held);
+        // Without another writer the chosen output is written, as before.
+        VaultV3::export_parity(&c, PW, Some(&b)).unwrap();
+        assert_ne!(std::fs::read(&b).unwrap(), b_before);
+        // An output that is the file it is built from is refused at once.
+        let err =
+            crate::error_correction::correct_generate(plain.to_str().unwrap(), 10, plain.to_str())
+                .map(drop)
+                .unwrap_err();
+        assert!(err.contains("the file it is built from"), "{err}");
+        assert_eq!(std::fs::read(&plain).unwrap(), vec![9u8; 20_000]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -259,6 +259,29 @@ pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
     }
 }
 
+/// Take the write lock of `out`, a destination the caller named for a file
+/// built from `held` (already locked by the caller): `export-parity --out`,
+/// `correct gen --out`. A vault at `out` is then replaced only while none of
+/// its writers holds its lock. `None` when `out` is a symbolic link: the rename
+/// replaces the link itself, never the file it names, so there is nothing of
+/// a writer's to protect. Refused when `out` is `held` itself: the output would
+/// replace the file it was built from (and this process would wait for its own
+/// lock).
+pub(crate) fn acquire_destination(out: &Path, held: &Path) -> io::Result<Option<WriteLock>> {
+    if std::fs::symlink_metadata(out).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Ok(None);
+    }
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(out), std::fs::canonicalize(held)) {
+        if a == b {
+            return Err(io::Error::other(format!(
+                "{}: the output is the file it is built from; choose another output path",
+                out.display()
+            )));
+        }
+    }
+    acquire(out).map(Some)
+}
+
 /// Open (or create) the lock file without following a symbolic link (or, on
 /// Windows, a reparse point) at its path, and refuse anything that is not a
 /// regular file (a link, a directory, a FIFO, a device). The check is on the

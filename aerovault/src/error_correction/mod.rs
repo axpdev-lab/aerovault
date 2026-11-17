@@ -735,6 +735,15 @@ pub fn correct_generate_with_progress(
         path.to_path_buf()
     };
     sync::write_if_unchanged(&locked, &generated.file_sha256, || {
+        // A chosen output path may be a vault: replace it only under its own
+        // lock too (the default sidecar is covered by the file's lock).
+        let _out_lock = match out {
+            Some(o) if o != sidecar::aerocorrect_sidecar_path(file) => {
+                crate::lock::acquire_destination(Path::new(o), &locked)
+                    .map_err(|e| e.to_string())?
+            }
+            _ => None,
+        };
         crate::v3::vault::atomic_write(Path::new(&sidecar_path), &generated.sidecar_bytes)
             .map_err(|e| format!("write sidecar {sidecar_path}: {e}"))
     })?;
