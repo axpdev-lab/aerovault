@@ -1,0 +1,4 @@
+# Test fixtures are byte-exact inputs (golden files, cross-implementation
+# payloads). Never convert their line endings on checkout, or Windows builds
+# see different bytes than the sidecars were generated from.
+aerovault/tests/fixtures/** binary
