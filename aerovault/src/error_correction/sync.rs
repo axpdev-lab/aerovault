@@ -503,6 +503,17 @@ pub fn verify_repair_sync_file_streamed_with_progress(
 ) -> Result<SyncEcRepairResult, String> {
     // On a vault, hold its write lock from the read to the repaired rename.
     let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
+    repair_streamed(rel_path, expected_sha256, path, sidecar_path, progress)
+}
+
+/// The streamed verify/repair; the caller holds the vault lock on a container.
+fn repair_streamed(
+    rel_path: &str,
+    expected_sha256: &[u8; 32],
+    path: &Path,
+    sidecar_path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<SyncEcRepairResult, String> {
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
         .len();
@@ -735,6 +746,8 @@ pub fn verify_repair_standalone_file_streamed_with_progress(
     expect_sha256: Option<&[u8; 32]>,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcRepairResult, String> {
+    // On a vault, hold its write lock from the sidecar read to the repaired rename.
+    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     let reader = AeroCorrectSidecarReader::open(sidecar_path)?;
     let expected = reader.content_sha256;
     drop(reader);
@@ -745,13 +758,7 @@ pub fn verify_repair_standalone_file_streamed_with_progress(
             ));
         }
     }
-    verify_repair_sync_file_streamed_with_progress(
-        rel_path,
-        &expected,
-        path,
-        sidecar_path,
-        progress,
-    )
+    repair_streamed(rel_path, &expected, path, sidecar_path, progress)
 }
 
 #[cfg(test)]
