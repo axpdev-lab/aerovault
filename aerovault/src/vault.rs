@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString, SecretVec};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::constants::*;
 use crate::crypto;
@@ -106,7 +106,9 @@ impl Vault {
     /// # Errors
     ///
     /// Returns an error if the password is too short (< 8 chars), the chunk
-    /// size is out of range, or the file cannot be written.
+    /// size is out of range, the file cannot be written, or the write lock is
+    /// refused (another writer keeps it, the path is a symbolic link or names
+    /// a lock file; see `crate::lock`).
     pub fn create(opts: CreateOptions) -> crate::Result<Self> {
         if opts.password.expose_secret().len() < MIN_PASSWORD_LENGTH {
             return Err(crate::Error::PasswordPolicy(format!(
@@ -122,6 +124,11 @@ impl Vault {
             return Err(FormatError::UnsupportedVersion(opts.version).into());
         }
 
+        // The lock first: the mode of an existing vault at this path is read
+        // (for the replacement) only while no other writer can change it, and
+        // a refused lock returns before any key exists.
+        let lock = crate::lock::acquire(&opts.path)?;
+
         // Generate random salt
         let mut salt = [0u8; SALT_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -130,15 +137,15 @@ impl Vault {
         let base_kek = crypto::derive_key(&opts.password, &salt)?;
         let (kek_master, kek_mac) = crypto::derive_kek_pair(base_kek.expose_secret());
 
-        // Generate random master and MAC keys
-        let mut master_key_raw = [0u8; KEY_SIZE];
-        let mut mac_key_raw = [0u8; KEY_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut master_key_raw);
-        rand::rngs::OsRng.fill_bytes(&mut mac_key_raw);
+        // Generate random master and MAC keys (zeroized on every return)
+        let mut master_key_raw = Zeroizing::new([0u8; KEY_SIZE]);
+        let mut mac_key_raw = Zeroizing::new([0u8; KEY_SIZE]);
+        rand::rngs::OsRng.fill_bytes(&mut master_key_raw[..]);
+        rand::rngs::OsRng.fill_bytes(&mut mac_key_raw[..]);
 
         // Wrap keys
-        let wrapped_master = crypto::wrap_key(&kek_master, &master_key_raw)?;
-        let wrapped_mac = crypto::wrap_key(&kek_mac, &mac_key_raw)?;
+        let wrapped_master = crypto::wrap_key(&kek_master, &master_key_raw[..])?;
+        let wrapped_mac = crypto::wrap_key(&kek_mac, &mac_key_raw[..])?;
 
         // kek_master and kek_mac are Zeroizing — auto-dropped
 
@@ -158,7 +165,7 @@ impl Vault {
             reserved: [0u8; 320],
             header_mac: [0u8; MAC_SIZE],
         };
-        header.header_mac = header.compute_mac(&mac_key_raw);
+        header.header_mac = header.compute_mac(&mac_key_raw[..]);
 
         // Create empty manifest
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -171,7 +178,7 @@ impl Vault {
 
         let manifest_json =
             serde_json::to_string(&manifest).map_err(|e| crate::Error::Manifest(e.to_string()))?;
-        let encrypted_manifest = crypto::encrypt_filename(&master_key_raw, &manifest_json)?;
+        let encrypted_manifest = crypto::encrypt_filename(&master_key_raw[..], &manifest_json)?;
         let manifest_bytes = encrypted_manifest.as_bytes();
 
         // Write vault file atomically via temp + fsync + rename
@@ -185,15 +192,11 @@ impl Vault {
         writer.get_ref().sync_all()?;
         drop(writer);
 
-        let lock = crate::lock::acquire(&opts.path)?;
         atomic_rename(tmp.path(), &opts.path)?;
         drop(lock);
 
         let master_key = SecretVec::new(master_key_raw.to_vec());
         let mac_key = SecretVec::new(mac_key_raw.to_vec());
-
-        master_key_raw.zeroize();
-        mac_key_raw.zeroize();
 
         Ok(Self {
             path: opts.path,
@@ -642,6 +645,15 @@ impl Vault {
         if entry.is_dir {
             let dir_path = output_dir.join(entry_name);
             validate_output_path(&dir_path, output_dir)?;
+            // Every folder this creates is named by the vault: none may take a
+            // lock file name.
+            let mut current = output_dir.to_path_buf();
+            for part in Path::new(entry_name).components() {
+                current.push(part);
+                if !current.exists() {
+                    crate::lock::refuse_lock_named_dir(&current)?;
+                }
+            }
             std::fs::create_dir_all(&dir_path)?;
             return Ok(dir_path);
         }
@@ -1326,6 +1338,22 @@ impl Vault {
             .into());
         }
 
+        // The new header wraps this handle's keys over the content on disk, so
+        // that content must be under these keys: `Vault::create` may have
+        // replaced the vault since this handle opened it. The other writes find
+        // out when the manifest does not decrypt; this one decrypts it here.
+        // Only the content is checked, not the header on disk, which this
+        // write replaces (a damaged header is rewritten, as before).
+        if !self.manifest_decrypts(&vault_data[HEADER_SIZE..]) {
+            vault_data.zeroize();
+            return Err(crate::Error::Io(std::io::Error::other(format!(
+                "{}: its manifest does not decrypt under this handle's key, so it is \
+                 not the vault this handle opened (it was replaced since: open it \
+                 again) or its manifest is damaged",
+                self.path.display()
+            ))));
+        }
+
         // Generate new salt
         let mut new_salt = [0u8; SALT_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut new_salt);
@@ -1369,6 +1397,16 @@ impl Vault {
     }
 
     // --- Internal Helpers ---
+
+    /// True if `body` (the bytes after the header) starts with a manifest that
+    /// decrypts under this handle's master key.
+    fn manifest_decrypts(&self, mut body: &[u8]) -> bool {
+        crypto::read_manifest_bounded(&mut body).is_ok_and(|(_, encrypted)| {
+            std::str::from_utf8(&encrypted).is_ok_and(|text| {
+                crypto::decrypt_filename(self.master_key.expose_secret(), text).is_ok()
+            })
+        })
+    }
 
     /// Read and decrypt the vault manifest.
     fn read_manifest(&self) -> crate::Result<VaultManifest> {
@@ -1657,6 +1695,8 @@ fn temporary_vault_file(path: &Path, suffix: &str) -> crate::Result<tempfile::Na
                 ))?;
         }
     }
+    #[cfg(test)]
+    crate::lock::trace("temp");
     Ok(tmp)
 }
 
@@ -1671,6 +1711,7 @@ fn atomic_rename(tmp_path: &Path, final_path: &Path) -> crate::Result<()> {
 /// existing file on Windows too, so the vault is never deleted before its
 /// replacement is in place: if the rename fails, the old vault is untouched.
 fn rename_into_place(tmp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    crate::lock::refuse_lock_file_name(final_path)?;
     #[cfg(test)]
     if FAIL_NEXT_RENAME.with(|f| f.replace(false)) {
         return Err(std::io::Error::other("injected rename failure"));
@@ -1727,6 +1768,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        crate::lock::take_trace();
         let Err(err) = Vault::create(CreateOptions::new(&path, "test-password-123")) else {
             panic!("create must refuse while another writer holds the lock");
         };
@@ -1734,10 +1776,82 @@ mod tests {
             err.to_string().contains("locked by another writer"),
             "{err}"
         );
+        // Refused before any key was derived or any temp file made.
+        assert_eq!(crate::lock::take_trace(), Vec::<&str>::new());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         drop(held);
         vault.create_directory("after").unwrap();
         crate::lock::remove_vault_and_lock(&path);
+    }
+
+    #[test]
+    fn create_takes_the_lock_before_any_key_or_temp_file() {
+        // The lock comes first, so a refused create derives no key, and the
+        // mode of the vault it replaces is read (with the temp file) only while
+        // no other writer can change it. Checked for a new vault and for a
+        // replacement.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        for _ in 0..2 {
+            crate::lock::take_trace();
+            Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+            assert_eq!(crate::lock::take_trace(), ["lock", "derive", "temp"]);
+        }
+    }
+
+    #[test]
+    fn change_password_refuses_a_vault_replaced_since_the_open() {
+        // `Vault::create` replaces the vault while an old handle is open. The
+        // old handle's password change must not wrap its keys over the new
+        // vault's content: refused, the new vault unchanged and readable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        let mut old = Vault::create(CreateOptions::new(&path, "first-password-1")).unwrap();
+        let input = dir.path().join("a.txt");
+        std::fs::write(&input, b"second vault's file").unwrap();
+        let new = Vault::create(CreateOptions::new(&path, "second-password-2")).unwrap();
+        new.add_files(&[&input]).unwrap();
+        let replaced = std::fs::read(&path).unwrap();
+
+        let err = old.change_password("third-password-3").unwrap_err();
+        assert!(
+            err.to_string().contains("not the vault this handle opened"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), replaced);
+        let reopened = Vault::open(&path, "second-password-2").unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let got = reopened.extract("a.txt", &out).unwrap();
+        assert_eq!(std::fs::read(got).unwrap(), b"second vault's file");
+
+        // A handle of the same vault (same keys) still changes the password.
+        let mut again = Vault::open(&path, "second-password-2").unwrap();
+        again.change_password("fourth-password-4").unwrap();
+        assert!(Vault::open(&path, "fourth-password-4").is_ok());
+    }
+
+    #[test]
+    fn change_password_rewrites_a_damaged_header_of_its_own_vault() {
+        // The check is on the content, not the header: an open handle whose
+        // vault header was damaged on disk still writes a new, valid header.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        let mut vault = Vault::create(CreateOptions::new(&path, "first-password-1")).unwrap();
+        let input = dir.path().join("a.txt");
+        std::fs::write(&input, b"kept").unwrap();
+        vault.add_files(&[&input]).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_SIZE - 1] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(Vault::open(&path, "first-password-1").is_err());
+
+        vault.change_password("second-password-2").unwrap();
+        let reopened = Vault::open(&path, "second-password-2").unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let got = reopened.extract("a.txt", &out).unwrap();
+        assert_eq!(std::fs::read(got).unwrap(), b"kept");
     }
 
     #[test]

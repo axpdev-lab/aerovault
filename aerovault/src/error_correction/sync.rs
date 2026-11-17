@@ -1280,9 +1280,11 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                // `payload.bin.lock`: the repair's write lock, left in place on purpose.
+                // `payload.bin.aerolock`: the repair's write lock, left in place on purpose.
                 .filter(|n| {
-                    n != "payload.bin" && n != "payload.bin.aerocorrect" && n != "payload.bin.lock"
+                    n != "payload.bin"
+                        && n != "payload.bin.aerocorrect"
+                        && n != "payload.bin.aerolock"
                 })
                 .collect();
             assert!(

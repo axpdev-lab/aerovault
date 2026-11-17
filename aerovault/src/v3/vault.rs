@@ -20,7 +20,7 @@
 use crate::lock::WriteLock;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use zeroize::{Zeroize, Zeroizing};
@@ -1472,11 +1472,11 @@ fn change_password_in_place(vault: &mut OpenVaultV3, new_password: &str) -> Resu
         return Err("Password must be at least 8 characters".to_string());
     }
     let salt = random_array::<SALT_SIZE>();
-    let mut base_kek = derive_base_kek(new_password, &salt)?;
+    let base_kek = Zeroizing::new(derive_base_kek(new_password, &salt)?);
     let (kek_master, kek_mac) = derive_keks(&base_kek)?;
     let kek_master = Zeroizing::new(kek_master);
     let kek_mac = Zeroizing::new(kek_mac);
-    base_kek.zeroize();
+    drop(base_kek);
     vault.header.salt = salt;
     vault.header.wrapped_master_key = wrap_key(&kek_master, &vault.master_key)?;
     vault.header.wrapped_mac_key = wrap_key(&kek_mac, &vault.mac_key)?;
@@ -1542,6 +1542,8 @@ fn create_contained_dirs(root: &Path, rel: &Path) -> Result<(), String> {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::lock::refuse_lock_named_dir(&current)
+                    .map_err(|e| format!("Refusing extraction: {e}"))?;
                 std::fs::create_dir(&current)
                     .map_err(|e| format!("Create output dir {}: {e}", current.display()))?;
             }
@@ -1746,8 +1748,28 @@ fn extract_file_entry(
     tmp.as_file_mut()
         .sync_all()
         .map_err(|e| format!("Sync temp file: {e}"))?;
-    tmp.persist(output_path)
-        .map_err(|e| format!("Persist vault: {}", e.error))?;
+    // An entry named like a lock file is extracted only where no file is:
+    // replacing an existing one could replace a vault's lock file. A lock file
+    // is empty, so an empty entry over an empty file (extracting the same
+    // folder again) has nothing to write and keeps the file that is there.
+    if crate::lock::refuse_lock_file_name(output_path).is_err() {
+        if let Err(e) = tmp.persist_noclobber(output_path) {
+            let both_empty = e.file.as_file().metadata().is_ok_and(|m| m.len() == 0)
+                && std::fs::symlink_metadata(output_path)
+                    .is_ok_and(|m| m.is_file() && m.len() == 0);
+            if !both_empty {
+                return Err(format!(
+                    "{}: a file is there and its name is a vault lock file name, \
+                     so it is not written over ({})",
+                    output_path.display(),
+                    e.error
+                ));
+            }
+        }
+    } else {
+        tmp.persist(output_path)
+            .map_err(|e| format!("Persist vault: {}", e.error))?;
+    }
     fsync_parent_dir(parent);
     Ok(output_path.to_path_buf())
 }
@@ -1801,6 +1823,7 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
 /// reader) has `dest` open; `std::fs::rename` then retries with a
 /// POSIX-semantics rename. On error the temp file is removed.
 pub(crate) fn persist_over(tmp: tempfile::NamedTempFile, dest: &Path) -> std::io::Result<()> {
+    crate::lock::refuse_lock_file_name(dest)?;
     // `keep` clears the Windows temporary attribute and the delete-on-drop.
     let (file, kept) = tmp.keep().map_err(|e| e.error)?;
     drop(file);
@@ -1816,7 +1839,6 @@ pub(super) fn read_capped(
     cap: u64,
     label: &str,
 ) -> Result<Vec<u8>, String> {
-    use std::io::Seek;
     if len > cap {
         return Err(format!("{label} too large: {len} bytes"));
     }
@@ -1863,19 +1885,26 @@ fn validate_supported_wrappers(w: &WrapperManifest) -> Result<(), String> {
     Ok(())
 }
 
+/// A parsed, MAC-verified header with its unwrapped MAC and master keys.
+pub(super) type UnlockedHeader = (
+    VaultHeaderV3,
+    Zeroizing<[u8; KEY_SIZE]>,
+    Zeroizing<[u8; KEY_SIZE]>,
+);
+
 pub(super) fn open_header_bytes(
     header_bytes: &[u8],
     password: &str,
-) -> Result<(VaultHeaderV3, [u8; KEY_SIZE], [u8; KEY_SIZE]), String> {
+) -> Result<UnlockedHeader, String> {
     let header = VaultHeaderV3::from_bytes(header_bytes)?;
-    let mut base_kek = derive_base_kek(password, &header.salt)?;
-    // Wrap the transient KEKs so they are wiped on every exit path (including the
-    // `?` early returns below), not just left in freed memory after use.
+    // Every key here is wiped on every exit path, the `?` early returns
+    // included; the unwrapped keys stay wrapped until they move into the handle.
+    let base_kek = Zeroizing::new(derive_base_kek(password, &header.salt)?);
     let (kek_master, kek_mac) = derive_keks(&base_kek)?;
     let kek_master = Zeroizing::new(kek_master);
     let kek_mac = Zeroizing::new(kek_mac);
-    base_kek.zeroize();
-    let mac_key = unwrap_key(&kek_mac, &header.wrapped_mac_key)?;
+    drop(base_kek);
+    let mac_key = Zeroizing::new(unwrap_key(&kek_mac, &header.wrapped_mac_key)?);
     header.verify_mac(&mac_key)?;
     if header.wrapper_header_version != SUPPORTED_WRAPPER_HEADER_VERSION {
         return Err(format!(
@@ -1883,7 +1912,7 @@ pub(super) fn open_header_bytes(
             header.wrapper_header_version, SUPPORTED_WRAPPER_HEADER_VERSION
         ));
     }
-    let master_key = unwrap_key(&kek_master, &header.wrapped_master_key)?;
+    let master_key = Zeroizing::new(unwrap_key(&kek_master, &header.wrapped_master_key)?);
     Ok((header, mac_key, master_key))
 }
 
@@ -1902,39 +1931,47 @@ fn create_empty_vault(
     // lane derives everything from the password exactly as before.
     let plaintext = lane == VaultLane::Plaintext;
 
-    let (salt, wrapped_master_key, wrapped_mac_key, mut master_key, mut mac_key, flags) =
-        if plaintext {
-            (
-                [0u8; SALT_SIZE],
-                [0u8; WRAPPED_KEY_SIZE],
-                [0u8; WRAPPED_KEY_SIZE],
-                [0u8; KEY_SIZE],
-                aerovz_mac_key()?,
-                FLAG_PLAINTEXT_CONTENT,
-            )
-        } else {
-            if password.len() < MIN_PASSWORD_LEN {
-                return Err("Password must be at least 8 characters".to_string());
-            }
-            let salt = random_array::<SALT_SIZE>();
-            let mut base_kek = derive_base_kek(password, &salt)?;
-            let (kek_master, kek_mac) = derive_keks(&base_kek)?;
-            let kek_master = Zeroizing::new(kek_master);
-            let kek_mac = Zeroizing::new(kek_mac);
-            base_kek.zeroize();
-            let master_key = random_array::<KEY_SIZE>();
-            let mac_key = random_array::<KEY_SIZE>();
-            let wrapped_master_key = wrap_key(&kek_master, &master_key)?;
-            let wrapped_mac_key = wrap_key(&kek_mac, &mac_key)?;
-            (
-                salt,
-                wrapped_master_key,
-                wrapped_mac_key,
-                master_key,
-                mac_key,
-                0u8,
-            )
-        };
+    // The lock first, as for every write, so a create refused by it derives no
+    // key. The lock file lives next to the vault: create the folder first, as
+    // `atomic_write` would, unless the vault path names a lock file.
+    crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(output_parent_dir(path))
+        .map_err(|e| format!("Create parent dir: {e}"))?;
+    let _lock = write_lock(path)?;
+
+    // Keys are zeroized on every return, the early ones included.
+    let (salt, wrapped_master_key, wrapped_mac_key, master_key, mac_key, flags) = if plaintext {
+        (
+            [0u8; SALT_SIZE],
+            [0u8; WRAPPED_KEY_SIZE],
+            [0u8; WRAPPED_KEY_SIZE],
+            Zeroizing::new([0u8; KEY_SIZE]),
+            Zeroizing::new(aerovz_mac_key()?),
+            FLAG_PLAINTEXT_CONTENT,
+        )
+    } else {
+        if password.len() < MIN_PASSWORD_LEN {
+            return Err("Password must be at least 8 characters".to_string());
+        }
+        let salt = random_array::<SALT_SIZE>();
+        let base_kek = Zeroizing::new(derive_base_kek(password, &salt)?);
+        let (kek_master, kek_mac) = derive_keks(&base_kek)?;
+        let kek_master = Zeroizing::new(kek_master);
+        let kek_mac = Zeroizing::new(kek_mac);
+        drop(base_kek);
+        let master_key = Zeroizing::new(random_array::<KEY_SIZE>());
+        let mac_key = Zeroizing::new(random_array::<KEY_SIZE>());
+        let wrapped_master_key = wrap_key(&kek_master, &master_key)?;
+        let wrapped_mac_key = wrap_key(&kek_mac, &mac_key)?;
+        (
+            salt,
+            wrapped_master_key,
+            wrapped_mac_key,
+            master_key,
+            mac_key,
+            0u8,
+        )
+    };
 
     let header = VaultHeaderV3 {
         flags,
@@ -1997,13 +2034,7 @@ fn create_empty_vault(
         &ext_payloads,
         &[],
     )?;
-    master_key.zeroize();
-    mac_key.zeroize();
-    // The lock file lives next to the vault: create the folder first, as
-    // `atomic_write` would.
-    std::fs::create_dir_all(output_parent_dir(path))
-        .map_err(|e| format!("Create parent dir: {e}"))?;
-    let _lock = write_lock(path)?;
+    drop((master_key, mac_key));
     atomic_write(path, &bytes)?;
 
     // Detached/both placements seed the sidecar so the file exists from
@@ -2020,6 +2051,21 @@ thread_local! {
     /// Test seam: runs once right after a save renames its file into place,
     /// so a test can let another writer change the vault in that window.
     static AFTER_PERSIST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once in an open, after the header is checked and right
+    /// before the file is hashed.
+    static BEFORE_OPEN_GENERATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs once at the end of an open, after everything is decoded.
+    static AFTER_OPEN_DECODE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2098,7 +2144,7 @@ pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<Ope
 }
 
 /// `encrypted_only` refuses a plaintext-lane container from its header, read
-/// from the same handle as the payload, before the payload is read.
+/// from the same handle as the payload, before the payload is decoded.
 fn open_vault_with(
     path: impl Into<PathBuf>,
     password: &str,
@@ -2144,7 +2190,7 @@ fn open_vault_with(
     // original error. The MAC verify inside `open_header_bytes` is the proof.
     let (header, mac_key, master_key, header_repaired_on_open) = if plaintext_header {
         let header = VaultHeaderV3::from_bytes(&header_bytes)?;
-        let mac_key = aerovz_mac_key()?;
+        let mac_key = Zeroizing::new(aerovz_mac_key()?);
         header.verify_mac(&mac_key)?;
         if header.wrapper_header_version != SUPPORTED_WRAPPER_HEADER_VERSION {
             return Err(format!(
@@ -2152,7 +2198,7 @@ fn open_vault_with(
                 header.wrapper_header_version, SUPPORTED_WRAPPER_HEADER_VERSION
             ));
         }
-        (header, mac_key, [0u8; KEY_SIZE], false)
+        (header, mac_key, Zeroizing::new([0u8; KEY_SIZE]), false)
     } else {
         match open_header_bytes(&header_bytes, password) {
             Ok((h, mac, master)) => (h, mac, master, false),
@@ -2164,6 +2210,26 @@ fn open_vault_with(
             }
         }
     };
+
+    // The generation is taken once the header is checked, so a wrong password
+    // or a file that is not a vault costs no extra read, and before the
+    // payload is decoded. A writer that rewrites the file in place while it is
+    // decoded (one that does not take the lock) then leaves a baseline older
+    // than the file, and the next save is refused; taken after the decoding,
+    // the baseline could be that writer's file, which the save would then
+    // overwrite with this state. The hashed file must still start with the
+    // header checked above and have the length measured above.
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_OPEN_GENERATION.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    let (opened_file_len, opened_hash) = file_generation_starting_with(&mut file, &header_bytes)?;
+    if opened_file_len != file_len {
+        return Err(format!(
+            "{} changed while it was being opened; open it again",
+            path.display()
+        ));
+    }
 
     validate_ranges(&header, file_len)?;
 
@@ -2247,6 +2313,8 @@ fn open_vault_with(
         return Err("AeroVault v3 header/manifest encryption-lane mismatch".to_string());
     }
     validate_manifest_paths(&manifest)?;
+    #[cfg(test)]
+    crate::lock::trace("decode");
 
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
     // its sole author and recomputes it on every seal from the freshly
@@ -2256,15 +2324,19 @@ fn open_vault_with(
         .filter(|e| e.extension_id != super::constants::ERROR_CORRECTION_META_EXTENSION_ID)
         .collect();
 
-    // Same handle as every read above: the file it hashes is the one decoded.
-    let (opened_file_len, opened_hash) = file_generation(&mut file)?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_OPEN_DECODE.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
     Ok(OpenVaultV3 {
         path,
         opened_file_len,
         opened_hash,
         header,
-        master_key,
-        mac_key,
+        // Copied into the handle, whose Drop wipes them; the wrapped copies
+        // are wiped here.
+        master_key: *master_key,
+        mac_key: *mac_key,
         manifest,
         extensions,
         data,
@@ -2360,20 +2432,37 @@ thread_local! {
 /// The whole file, not the header: a write can leave the header identical
 /// (a rename to a name of the same length changes only the manifest bytes).
 fn file_generation(file: &mut std::fs::File) -> Result<(u64, [u8; 32]), String> {
-    use std::io::Seek;
+    file_generation_starting_with(file, &[])
+}
+
+/// [`file_generation`] of a file that must start with `prefix`: an error if it
+/// does not, so the hash is known to cover those bytes.
+fn file_generation_starting_with(
+    file: &mut std::fs::File,
+    prefix: &[u8],
+) -> Result<(u64, [u8; 32]), String> {
     #[cfg(test)]
     GENERATION_READS.with(|n| n.set(n.get() + 1));
+    #[cfg(test)]
+    crate::lock::trace("generation");
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(|e| format!("Read vault: {e}"))?;
+    let mut head = vec![0u8; prefix.len()];
+    file.read_exact(&mut head)
+        .map_err(|e| format!("Read vault: {e}"))?;
+    if head != prefix {
+        return Err("vault changed while it was being read; open it again".to_string());
+    }
     let mut hasher = blake3::Hasher::new();
-    let len = std::io::copy(file, &mut hasher).map_err(|e| format!("Read vault: {e}"))?;
-    Ok((len, *hasher.finalize().as_bytes()))
+    hasher.update(&head);
+    let rest = std::io::copy(file, &mut hasher).map_err(|e| format!("Read vault: {e}"))?;
+    Ok((prefix.len() as u64 + rest, *hasher.finalize().as_bytes()))
 }
 
 /// Persist the in-memory vault back to disk with an atomic single-rename seal.
 ///
 /// Concurrency contract (audit M6): the save holds the vault's cross-process write
-/// lock (`<vault>.lock`, see [`crate::lock`]) from the generation check to the
+/// lock (`<vault>.aerolock`, see [`crate::lock`]) from the generation check to the
 /// rename, so two writers cannot both pass the check and overwrite each other.
 /// The generation check ([`assert_vault_generation_current`]: the file is byte
 /// for byte the one this handle read or last wrote) refuses a handle that
@@ -2455,7 +2544,7 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
     // (T5 sub-task #2). Same atomic temp + sync + persist + dir-fsync discipline
     // as `atomic_write`, via the shared helpers.
     let ((file_len, file_hash), header_bytes) = {
-        use std::io::{Seek, Write};
+        use std::io::Write;
         let parent = output_parent_dir(&vault.path);
         std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
         let mut tmp = tempfile::Builder::new()
@@ -2529,7 +2618,8 @@ fn extract_entry(
                 extract_file_entry(vault, entry, &output_path, dest_path)
             } else {
                 // Caller named an EXACT output file path (not manifest-derived); the
-                // single leaf is replaced by atomic_write's rename. The destination is
+                // single leaf is replaced by the temp file's rename (never when it
+                // names a lock file, see `extract_file_entry`). The destination is
                 // the caller's own choice, so its parent is a trust boundary the caller
                 // owns (no manifest-controlled component is appended here).
                 let parent = dest_path
@@ -2931,11 +3021,92 @@ mod tests {
         VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
         let before = std::fs::read(&vp).unwrap();
         let held = write_lock(&vp).unwrap();
+        crate::lock::take_trace();
         let err = VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap_err();
         assert!(err.contains("locked by another writer"), "{err}");
+        // Refused before any key was derived.
+        assert!(!crate::lock::take_trace().contains(&"derive"));
         assert_eq!(std::fs::read(&vp).unwrap(), before);
         drop(held);
         crate::lock::remove_vault_and_lock(&vp);
+    }
+
+    #[test]
+    fn create_takes_the_lock_before_it_derives_a_key() {
+        let vp = vault_path();
+        for _ in 0..2 {
+            crate::lock::take_trace();
+            VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+            let trace = crate::lock::take_trace();
+            assert_eq!(trace.first(), Some(&"lock"), "{trace:?}");
+            assert!(trace.contains(&"derive"), "{trace:?}");
+        }
+        crate::lock::remove_vault_and_lock(&vp);
+    }
+
+    #[test]
+    fn a_failed_open_does_not_read_the_whole_file() {
+        // Wrong password, a plaintext container under `open`, a file that is
+        // not a vault: each fails at the header, before the file is hashed.
+        let dir = scratch_dir();
+        let enc = dir.join("e.aerovault");
+        let plain = dir.join("p.aerozip");
+        let other = dir.join("o.bin");
+        VaultV3::create(&CreateOptionsV3::new(&enc, PW)).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&plain)).unwrap();
+        std::fs::write(&other, vec![0x5Au8; 200_000]).unwrap();
+        crate::lock::take_trace();
+        assert!(VaultV3::open(&enc, "not-the-password").is_err());
+        assert!(VaultV3::open(&plain, PW).is_err());
+        assert!(VaultV3::open(&other, PW).is_err());
+        assert!(VaultV3::open_plaintext(&other).is_err());
+        let trace = crate::lock::take_trace();
+        assert!(!trace.contains(&"generation"), "{trace:?}");
+        // A good open hashes the file once.
+        VaultV3::open(&enc, PW).unwrap();
+        let trace = crate::lock::take_trace();
+        assert_eq!(trace.iter().filter(|e| **e == "generation").count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_changed_between_the_header_check_and_the_hash_is_refused() {
+        // Another writer (one that does not take the lock) replaces the bytes
+        // in place after the header was checked: with another vault of the
+        // same length (other header), and by appending (same header).
+        let dir = scratch_dir();
+        let ours = dir.join("ours.aerovault");
+        let theirs = dir.join("theirs.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&ours, PW)).unwrap();
+        VaultV3::create(&CreateOptionsV3::new(&theirs, PW)).unwrap();
+        let ours_bytes = std::fs::read(&ours).unwrap();
+        let their_bytes = std::fs::read(&theirs).unwrap();
+        assert_eq!(ours_bytes.len(), their_bytes.len());
+        assert_ne!(ours_bytes[..HEADER_SIZE], their_bytes[..HEADER_SIZE]);
+        let mut appended = ours_bytes.clone();
+        appended.extend_from_slice(&[0u8; 10]);
+        for replacement in [their_bytes, appended] {
+            std::fs::write(&ours, &ours_bytes).unwrap();
+            let (path, bytes) = (ours.clone(), replacement.clone());
+            BEFORE_OPEN_GENERATION.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(&path)
+                        .unwrap();
+                    std::io::Write::write_all(&mut f, &bytes).unwrap();
+                }))
+            });
+            let err = VaultV3::open(&ours, PW).map(drop).unwrap_err();
+            assert!(err.contains("changed while it was being"), "{err}");
+            assert!(
+                BEFORE_OPEN_GENERATION.with(|h| h.borrow().is_none()),
+                "hook ran"
+            );
+            assert_eq!(std::fs::read(&ours).unwrap(), replacement);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -3013,6 +3184,48 @@ mod tests {
     }
 
     #[test]
+    fn a_file_rewritten_in_place_during_the_open_is_not_overwritten() {
+        // A writer that does not take the lock rewrites the vault in place
+        // (same inode) after the open decoded it. The handle's baseline must
+        // be the file it decoded, so its next save is refused and the other
+        // writer's file is kept.
+        let vp = vault_path();
+        let other = vault_path();
+        let src = scratch_dir();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        for (path, name) in [(&vp, "a.txt"), (&other, "b.txt")] {
+            VaultV3::create(&CreateOptionsV3::new_plaintext(path)).unwrap();
+            let mut v = VaultV3::open_plaintext(path).unwrap();
+            VaultV3::add_files(&mut v, &[(src.join("a.txt"), name.to_string())]).unwrap();
+        }
+        let theirs = std::fs::read(&other).unwrap();
+        let (path, bytes) = (vp.clone(), theirs.clone());
+        AFTER_OPEN_DECODE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap();
+                std::io::Write::write_all(&mut f, &bytes).unwrap();
+            }))
+        });
+        crate::lock::take_trace();
+        let mut v = VaultV3::open_plaintext(&vp).unwrap();
+        assert!(AFTER_OPEN_DECODE.with(|h| h.borrow().is_none()), "hook ran");
+        // The baseline is taken before the decode, not only before the hook.
+        assert_eq!(crate::lock::take_trace(), ["generation", "decode"]);
+        let err =
+            VaultV3::add_files(&mut v, &[(src.join("a.txt"), "c.txt".to_string())]).unwrap_err();
+        assert!(err.contains("changed"), "{err}");
+        drop(v);
+        assert_eq!(std::fs::read(&vp).unwrap(), theirs);
+        crate::lock::remove_vault_and_lock(&vp);
+        crate::lock::remove_vault_and_lock(&other);
+        std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[test]
     fn open_and_save_each_read_the_whole_file_once_more() {
         // Open hashes the file it decoded; a save hashes the file on disk for
         // its check and the sealed bytes as it writes them, without reading
@@ -3040,10 +3253,158 @@ mod tests {
         std::fs::remove_dir_all(&src).ok();
     }
 
+    #[test]
+    fn a_vault_lock_file_is_never_written_over() {
+        // Vault paths `p` and `p.aerolock`: while writer A holds the lock of
+        // `p`, nothing may replace `p.aerolock` (A's lock file), or a second
+        // writer could lock the new file and save `p` at the same time.
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = scratch_dir();
+        let p = dir.join("p.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&p)).unwrap();
+        let lock_file = crate::lock::lock_path(&p);
+        let held = write_lock(&p).unwrap();
+        #[cfg(unix)]
+        let inode = || std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&lock_file).unwrap());
+        #[cfg(unix)]
+        let before = inode();
+        let refused = |what: &str, err: String| {
+            assert!(err.contains("vault lock file"), "{what}: {err}");
+        };
+        refused(
+            "v3 create",
+            VaultV3::create(&CreateOptionsV3::new_plaintext(&lock_file)).unwrap_err(),
+        );
+        refused(
+            "legacy create",
+            crate::vault::Vault::create(crate::vault::CreateOptions::new(
+                &lock_file,
+                "test-password-123",
+            ))
+            .map(drop)
+            .unwrap_err()
+            .to_string(),
+        );
+        let plain = dir.join("plain.bin");
+        std::fs::write(&plain, vec![5u8; 10_000]).unwrap();
+        refused(
+            "correct gen --out the lock file",
+            crate::error_correction::correct_generate(
+                plain.to_str().unwrap(),
+                10,
+                lock_file.to_str(),
+            )
+            .map(drop)
+            .unwrap_err(),
+        );
+        assert_eq!(std::fs::read(&lock_file).unwrap(), b"");
+        #[cfg(unix)]
+        assert_eq!(inode(), before, "the lock file was replaced");
+        let err = write_lock(&p).map(drop).unwrap_err();
+        assert!(err.contains("locked by another writer"), "{err}");
+        drop(held);
+
+        // An entry named like that lock file is extracted only where no file is.
+        let src = scratch_dir();
+        let named = src.join("payload");
+        std::fs::write(&named, b"payload").unwrap();
+        let q = dir.join("q.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&q)).unwrap();
+        let mut v = VaultV3::open_plaintext(&q).unwrap();
+        VaultV3::add_files(&mut v, &[(named, "p.aerozip.aerolock".to_string())]).unwrap();
+        let err = VaultV3::extract_entry(&v, "p.aerozip.aerolock", &dir).unwrap_err();
+        assert!(err.contains("p.aerozip.aerolock"), "{err}");
+        assert_eq!(std::fs::read(&lock_file).unwrap(), b"");
+        let out = VaultV3::extract_entry(&v, "p.aerozip.aerolock", &src.join("out")).unwrap();
+        assert_eq!(std::fs::read(out).unwrap(), b"payload");
+        drop(v);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
+    }
+
+    #[test]
+    fn extracting_a_folder_again_keeps_its_empty_lock_files() {
+        // A folder of vaults added to a vault carries their empty lock files.
+        // Extracting it twice into the same place works: an empty lock-named
+        // entry over an empty file has nothing to write.
+        let dir = scratch_dir();
+        let src = dir.join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("x.txt"), b"x").unwrap();
+        std::fs::write(src.join("v.aerovault.aerolock"), b"").unwrap();
+        let p = dir.join("p.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&p)).unwrap();
+        let mut v = VaultV3::open_plaintext(&p).unwrap();
+        VaultV3::add_files(
+            &mut v,
+            &[
+                (src.join("x.txt"), "x.txt".to_string()),
+                (
+                    src.join("v.aerovault.aerolock"),
+                    "v.aerovault.aerolock".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        let out = dir.join("out");
+        for _ in 0..2 {
+            VaultV3::extract_all(&v, &out).unwrap();
+            assert_eq!(std::fs::read(out.join("x.txt")).unwrap(), b"x");
+            assert_eq!(
+                std::fs::read(out.join("v.aerovault.aerolock")).unwrap(),
+                b""
+            );
+        }
+        drop(v);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extraction_never_creates_a_directory_named_like_a_lock_file() {
+        // A folder at `<vault>.aerolock` would block every write of that vault,
+        // so no folder named by a vault entry takes a lock file name: v3 folder
+        // entries, v3 file entries' parents, legacy folder entries.
+        let dir = scratch_dir();
+        let src = dir.join("payload");
+        std::fs::write(&src, b"payload").unwrap();
+        let p = dir.join("p.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&p)).unwrap();
+        let mut v = VaultV3::open_plaintext(&p).unwrap();
+        VaultV3::create_directory(&mut v, "d.aerolock").unwrap();
+        VaultV3::add_files(&mut v, &[(src.clone(), "e.AeroLock/f.txt".to_string())]).unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir(&out).unwrap();
+        for entry in ["d.aerolock", "e.AeroLock/f.txt"] {
+            let err = VaultV3::extract_entry(&v, entry, &out).unwrap_err();
+            assert!(err.contains("vault lock file name"), "{entry}: {err}");
+        }
+        let err = VaultV3::extract_all(&v, &out).unwrap_err();
+        assert!(err.contains("vault lock file name"), "{err}");
+        assert!(!out.join("d.aerolock").exists());
+        assert!(!out.join("e.AeroLock").exists());
+        drop(v);
+
+        let legacy = dir.join("l.aerovault");
+        let lv = crate::vault::Vault::create(crate::vault::CreateOptions::new(
+            &legacy,
+            "test-password-123",
+        ))
+        .unwrap();
+        lv.create_directory("g.aerolock").unwrap();
+        let err = lv.extract("g.aerolock", &out).unwrap_err();
+        assert!(err.to_string().contains("vault lock file name"), "{err}");
+        assert!(!out.join("g.aerolock").exists());
+        // Folders with other names are created as before.
+        lv.create_directory("h").unwrap();
+        assert!(lv.extract("h", &out).unwrap().is_dir());
+        drop(lv);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_through_a_symlinked_vault_path_is_refused() {
-        // The link and its target would lock two different `.lock` files, and
+        // The link and its target would lock two different `.aerolock` files, and
         // the rename would replace the link, not the vault that was read.
         crate::lock::set_short_wait_for_this_thread();
         let dir = scratch_dir();

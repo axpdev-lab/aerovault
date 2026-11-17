@@ -7,7 +7,7 @@
 //! A faithful, byte-for-byte port of the AeroFTP application's AEROVAULT3 Error
 //! Correction operations (`src-tauri/src/aerovault_v3.rs`), minus the Tauri
 //! command layer, async and telemetry. Saves and `export_parity` take the
-//! crate's cross-process write lock (`<vault>.lock`, see `crate::lock`).
+//! crate's cross-process write lock (`<vault>.aerolock`, see `crate::lock`).
 //!
 //! Error Correction is NON-CRITICAL: the embedded extension and the
 //! metadata-parity extension are both `critical=false`, so a rev. 3 reader still
@@ -34,9 +34,8 @@ use super::format::VaultHeaderV3;
 use super::manifest::{ChunkRecordV3, ExtensionEntryV3};
 use super::vault::{
     assert_vault_generation_current, atomic_write, open_header_bytes, open_vault, read_capped,
-    save_open_vault, OpenVaultV3,
+    save_open_vault, OpenVaultV3, UnlockedHeader,
 };
-use crate::aerocrypt::KEY_SIZE;
 use crate::error_correction::sidecar::aerocorrect_sidecar_path;
 use crate::error_correction::{
     compute_error_correction_shards_grid, compute_metadata_parity, manifest_error_correction_grid,
@@ -107,9 +106,6 @@ impl ParitySource {
         }
     }
 }
-
-/// A parsed, MAC-verified header together with its unwrapped MAC and master keys.
-type UnlockedHeader = (VaultHeaderV3, [u8; KEY_SIZE], [u8; KEY_SIZE]);
 
 /// Returns the stub ExtensionEntry for the Error Correction layer (length 0
 /// payload at create time). Marked non-critical so rev. 3 readers can extract.
@@ -345,8 +341,12 @@ pub(super) fn export_parity(
 }
 
 /// [`export_parity`] under the caller's write lock, held from the read of the
-/// vault to the publication of the sidecar: no writer can save in between, so
-/// the sidecar always matches the vault it was built from.
+/// vault to the publication of the sidecar: no writer that takes the lock can
+/// save in between, so against those writers the sidecar matches the vault it
+/// was built from. A writer that does not take the lock (an older version, a
+/// manual copy) is caught only if it changed the vault before the generation
+/// check below; one that replaces it between that check and the publication
+/// is not.
 pub(super) fn export_parity_locked(
     vault_path: &Path,
     password: &str,
@@ -385,8 +385,9 @@ pub(super) fn export_parity_locked(
     let out = out_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| default_sidecar_path(vault_path));
-    // Lock-aware writers are held off by the lock; this check still catches a
-    // writer that does not take it (an older version, a manual copy).
+    // Lock-aware writers are held off by the lock. This check also catches a
+    // writer that does not take it (an older version, a manual copy), if it
+    // changed the vault before this point; not one that does so after it.
     #[cfg(test)]
     super::vault::run_before_sidecar_publish_hook();
     assert_vault_generation_current(&vault)?;
