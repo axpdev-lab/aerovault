@@ -1319,14 +1319,14 @@ impl Vault {
     /// Re-wraps the master and MAC keys with a new KEK. The encrypted content
     /// remains unchanged — only the 512-byte header is modified.
     pub fn change_password(&mut self, new_password: impl Into<String>) -> crate::Result<()> {
-        // Held from the read of the vault to the rename (see `crate::lock`).
-        let _lock = crate::lock::acquire(&self.path)?;
         let new_pwd = SecretString::from(new_password.into());
         if new_pwd.expose_secret().len() < MIN_PASSWORD_LENGTH {
             return Err(crate::Error::PasswordPolicy(format!(
                 "password must be at least {MIN_PASSWORD_LENGTH} characters"
             )));
         }
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
 
         let mut vault_data = std::fs::read(&self.path)?;
 
@@ -1829,6 +1829,19 @@ mod tests {
         let mut again = Vault::open(&path, "second-password-2").unwrap();
         again.change_password("fourth-password-4").unwrap();
         assert!(Vault::open(&path, "fourth-password-4").is_ok());
+    }
+
+    #[test]
+    fn a_short_new_password_is_refused_before_the_lock() {
+        // The policy error comes at once, not after waiting for another writer.
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        let mut vault = Vault::create(CreateOptions::new(&path, "first-password-1")).unwrap();
+        let held = crate::lock::acquire(&path).unwrap();
+        let err = vault.change_password("short").unwrap_err();
+        assert!(matches!(err, crate::Error::PasswordPolicy(_)), "{err}");
+        drop(held);
     }
 
     #[test]

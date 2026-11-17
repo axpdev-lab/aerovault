@@ -689,6 +689,11 @@ pub fn correct_generate_with_progress(
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<CorrectGenerateReport, String> {
     let path = Path::new(file);
+    // Refused before the file is read: the write at the end would refuse it.
+    crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
+    if let Some(out) = out {
+        crate::lock::refuse_lock_file_name(Path::new(out)).map_err(|e| e.to_string())?;
+    }
     let rel = rel_name(file);
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
     // it even for tiny files (the gate is a sync-pipeline opt-in, not a CLI-of-one concern).
@@ -1116,6 +1121,30 @@ mod tests {
             "repair" => correct_repair(file, None).map(drop),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn gen_refuses_a_lock_file_name_before_reading_the_file() {
+        // The write would refuse it anyway; the refusal comes before the file
+        // is read and its parity computed (no progress is reported).
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("v.aerovault.aerolock");
+        let plain = dir.path().join("plain.bin");
+        std::fs::write(&named, vec![3u8; 50_000]).unwrap();
+        std::fs::write(&plain, vec![3u8; 50_000]).unwrap();
+        let out = dir.path().join("w.aerolock");
+        for (file, out) in [(&named, None), (&plain, Some(out.to_str().unwrap()))] {
+            let mut read = false;
+            let err =
+                correct_generate_with_progress(file.to_str().unwrap(), 10, out, &mut |_, _| {
+                    read = true
+                })
+                .map(drop)
+                .unwrap_err();
+            assert!(err.contains("vault lock file"), "{err}");
+            assert!(!read, "the file was read before the refusal");
+        }
+        assert!(!out.exists());
     }
 
     #[test]

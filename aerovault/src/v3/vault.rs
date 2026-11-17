@@ -606,7 +606,11 @@ impl VaultV3 {
         // recomputed on every save, so the same holds without a sidecar).
         // One lock across the sidecar check, the save and the refresh: no
         // other writer can save or export in between, so the sidecar that
-        // exists is refreshed and is of this header.
+        // exists is refreshed and is of this header. The new password is
+        // checked first, so a policy error does not wait for another writer.
+        if new_password.len() < MIN_PASSWORD_LEN {
+            return Err("Password must be at least 8 characters".to_string());
+        }
         let lock = write_lock(&vault.path)?;
         let sidecar = super::ec::default_sidecar_path(&vault.path);
         let refresh = sidecar.exists();
@@ -1754,6 +1758,9 @@ fn extract_file_entry(
     // folder again) has nothing to write and keeps the file that is there.
     if crate::lock::refuse_lock_file_name(output_path).is_err() {
         if let Err(e) = tmp.persist_noclobber(output_path) {
+            if e.error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(format!("Persist vault: {}", e.error));
+            }
             let both_empty = e.file.as_file().metadata().is_ok_and(|m| m.len() == 0)
                 && std::fs::symlink_metadata(output_path)
                     .is_ok_and(|m| m.is_file() && m.len() == 0);
@@ -1931,7 +1938,15 @@ fn create_empty_vault(
     // lane derives everything from the password exactly as before.
     let plaintext = lane == VaultLane::Plaintext;
 
-    // The lock first, as for every write, so a create refused by it derives no
+    // The options are checked before anything touches the disk.
+    if !plaintext && password.len() < MIN_PASSWORD_LEN {
+        return Err("Password must be at least 8 characters".to_string());
+    }
+    if let Some(bounds) = &cdc_bounds {
+        bounds.validate()?;
+    }
+
+    // Then the lock, as for every write, so a create refused by it derives no
     // key. The lock file lives next to the vault: create the folder first, as
     // `atomic_write` would, unless the vault path names a lock file.
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
@@ -1950,9 +1965,6 @@ fn create_empty_vault(
             FLAG_PLAINTEXT_CONTENT,
         )
     } else {
-        if password.len() < MIN_PASSWORD_LEN {
-            return Err("Password must be at least 8 characters".to_string());
-        }
         let salt = random_array::<SALT_SIZE>();
         let base_kek = Zeroizing::new(derive_base_kek(password, &salt)?);
         let (kek_master, kek_mac) = derive_keks(&base_kek)?;
@@ -1996,7 +2008,6 @@ fn create_empty_vault(
         empty_manifest(level)
     };
     if let Some(bounds) = cdc_bounds {
-        bounds.validate()?;
         manifest.wrappers.chunking.bounds = Some(bounds);
     }
     // Record the QR-style overhead level so every later seal / export uses the
@@ -3028,6 +3039,39 @@ mod tests {
         assert!(!crate::lock::take_trace().contains(&"derive"));
         assert_eq!(std::fs::read(&vp).unwrap(), before);
         drop(held);
+        crate::lock::remove_vault_and_lock(&vp);
+    }
+
+    #[test]
+    fn a_create_with_bad_options_leaves_nothing_behind() {
+        // A short password or invalid CDC bounds are refused before the
+        // create makes the missing folder or the lock file.
+        let dir = scratch_dir();
+        let vp = dir.join("new").join("sub").join("v.aerovault");
+        let err = VaultV3::create(&CreateOptionsV3::new(&vp, "short")).unwrap_err();
+        assert!(err.contains("at least 8"), "{err}");
+        let bad = CdcBounds {
+            min: 8192,
+            avg: 4096,
+            max: 65536,
+        };
+        let err = VaultV3::create(&CreateOptionsV3::new(&vp, PW).with_cdc_bounds(bad)).unwrap_err();
+        assert!(err.contains("CDC bounds"), "{err}");
+        assert!(!dir.join("new").exists(), "a refused create made a folder");
+        assert!(!crate::lock::lock_path(&vp).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_short_new_password_is_refused_before_the_lock() {
+        crate::lock::set_short_wait_for_this_thread();
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new(&vp, PW)).unwrap();
+        let mut v = VaultV3::open(&vp, PW).unwrap();
+        let held = write_lock(&vp).unwrap();
+        let err = VaultV3::change_password(&mut v, "short").unwrap_err();
+        assert!(err.contains("at least 8"), "{err}");
+        drop((held, v));
         crate::lock::remove_vault_and_lock(&vp);
     }
 
