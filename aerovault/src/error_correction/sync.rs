@@ -394,14 +394,56 @@ fn hash_file_streaming(path: &Path) -> Result<[u8; 32], String> {
     Ok(finalize_sha256(hasher))
 }
 
+/// Run `write` (which replaces `path` or writes its `.aerocorrect`) under the
+/// write lock of `path`, after checking that `path` still holds the bytes that
+/// were read, by their SHA-256 `read_sha256`. The file was read without the
+/// lock, so a writer may have replaced it meanwhile (a vault created at that
+/// path, a vault save): the write is then refused instead of overwriting it.
+/// The lock is taken for any file, not only a vault, so the file cannot turn
+/// into one between the check and the write.
+pub(crate) fn write_if_unchanged(
+    path: &Path,
+    read_sha256: &[u8; 32],
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    #[cfg(test)]
+    run_hook(&BEFORE_WRITE_LOCK);
+    let _lock = crate::lock::acquire(path).map_err(|e| e.to_string())?;
+    if hash_file_streaming(path)? != *read_sha256 {
+        return Err(format!(
+            "{} changed while it was being read; retry",
+            path.display()
+        ));
+    }
+    #[cfg(test)]
+    run_hook(&IN_WRITE_WINDOW);
+    write()
+}
+
+#[cfg(test)]
+type Hook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs before [`write_if_unchanged`] takes the lock.
+    pub(crate) static BEFORE_WRITE_LOCK: Hook = const { std::cell::RefCell::new(None) };
+    /// Test seam: runs between the unchanged check and the write, lock held.
+    pub(crate) static IN_WRITE_WINDOW: Hook = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_hook(hook: &'static std::thread::LocalKey<Hook>) {
+    if let Some(f) = hook.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
 pub fn verify_repair_sync_file(
     rel_path: &str,
     expected_sha256: &[u8; 32],
     path: &Path,
     sidecar_bytes: &[u8],
 ) -> Result<SyncEcRepairResult, String> {
-    // On a vault, hold its write lock from the read to the repaired rename.
-    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
         .len();
@@ -426,6 +468,7 @@ pub fn verify_repair_sync_file(
     let mut src =
         File::open(path).map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
+    let mut read_hasher = Sha256::new();
     let mut recovered_shards = 0usize;
     {
         let mut out = std::io::BufWriter::new(tmp.as_file());
@@ -433,6 +476,7 @@ pub fn verify_repair_sync_file(
             let mut buf = vec![0u8; seg.window_len as usize];
             src.read_exact(&mut buf)
                 .map_err(|e| format!("read AeroSync EC target window {}: {e}", path.display()))?;
+            read_hasher.update(&buf);
             let mut blocks = vec![buf];
             recovered_shards += reconstruct_from_error_correction(&mut blocks, &seg.avec_bytes)?;
             hasher.update(&blocks[0]);
@@ -458,13 +502,16 @@ pub fn verify_repair_sync_file(
     tmp.as_file()
         .sync_all()
         .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
-    // On a persist failure the temp file is removed, so a decrypted-plaintext
-    // `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
-    crate::v3::vault::persist_over(tmp, path).map_err(|e| {
-        format!(
-            "persist repaired AeroSync EC target {}: {e}",
-            path.display()
-        )
+    // On a persist failure (or a refusal) the temp file is removed, so a
+    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
+    // plaintext-at-rest).
+    write_if_unchanged(path, &finalize_sha256(read_hasher), || {
+        crate::v3::vault::persist_over(tmp, path).map_err(|e| {
+            format!(
+                "persist repaired AeroSync EC target {}: {e}",
+                path.display()
+            )
+        })
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
@@ -501,12 +548,10 @@ pub fn verify_repair_sync_file_streamed_with_progress(
     sidecar_path: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcRepairResult, String> {
-    // On a vault, hold its write lock from the read to the repaired rename.
-    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     repair_streamed(rel_path, expected_sha256, path, sidecar_path, progress)
 }
 
-/// The streamed verify/repair; the caller holds the vault lock on a container.
+/// The streamed verify/repair shared by the streamed and standalone entry points.
 fn repair_streamed(
     rel_path: &str,
     expected_sha256: &[u8; 32],
@@ -556,6 +601,7 @@ fn repair_streamed(
     let mut src =
         File::open(path).map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
+    let mut read_hasher = Sha256::new();
     let mut recovered_shards = 0usize;
     {
         let mut out = std::io::BufWriter::new(tmp.as_file());
@@ -566,6 +612,7 @@ fn repair_streamed(
             let mut buf = vec![0u8; window_len];
             src.read_exact(&mut buf)
                 .map_err(|e| format!("read AeroSync EC target window {}: {e}", path.display()))?;
+            read_hasher.update(&buf);
             let mut blocks = vec![buf];
             recovered_shards += reconstruct_from_error_correction(&mut blocks, &avec)?;
             hasher.update(&blocks[0]);
@@ -596,13 +643,16 @@ fn repair_streamed(
     tmp.as_file()
         .sync_all()
         .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
-    // On a persist failure the temp file is removed, so a decrypted-plaintext
-    // `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
-    crate::v3::vault::persist_over(tmp, path).map_err(|e| {
-        format!(
-            "persist repaired AeroSync EC target {}: {e}",
-            path.display()
-        )
+    // On a persist failure (or a refusal) the temp file is removed, so a
+    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
+    // plaintext-at-rest).
+    write_if_unchanged(path, &finalize_sha256(read_hasher), || {
+        crate::v3::vault::persist_over(tmp, path).map_err(|e| {
+            format!(
+                "persist repaired AeroSync EC target {}: {e}",
+                path.display()
+            )
+        })
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
@@ -746,8 +796,6 @@ pub fn verify_repair_standalone_file_streamed_with_progress(
     expect_sha256: Option<&[u8; 32]>,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcRepairResult, String> {
-    // On a vault, hold its write lock from the sidecar read to the repaired rename.
-    let _lock = crate::lock::acquire_if_container(path).map_err(|e| e.to_string())?;
     let reader = AeroCorrectSidecarReader::open(sidecar_path)?;
     let expected = reader.content_sha256;
     drop(reader);
@@ -1232,7 +1280,10 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n != "payload.bin" && n != "payload.bin.aerocorrect")
+                // `payload.bin.lock`: the repair's write lock, left in place on purpose.
+                .filter(|n| {
+                    n != "payload.bin" && n != "payload.bin.aerocorrect" && n != "payload.bin.lock"
+                })
                 .collect();
             assert!(
                 leftovers.is_empty(),

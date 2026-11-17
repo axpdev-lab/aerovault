@@ -2271,20 +2271,29 @@ mod tests {
         vault.change_password("new-password-456").unwrap();
         assert_eq!(mode(&path), 0o640, "password change");
 
-        // Special bits are never carried over, and a symlinked vault path does
-        // not lend its link mode (0777 on Linux) to the replacement file.
+        // Special bits are never carried over.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4640)).unwrap();
         let second = dir.path().join("second.txt");
         std::fs::write(&second, b"second payload").unwrap();
         vault.add_files(&[&second]).unwrap();
         assert_eq!(mode(&path), 0o640, "setuid dropped");
+        // A write through a symlinked vault path is refused (0.6.9): it would
+        // replace the link, not the vault behind it. Link and vault stay as
+        // they were.
         let target = dir.path().join("real.aerovault");
         std::fs::rename(&path, &target).unwrap();
         symlink(&target, &path).unwrap();
+        let before = std::fs::read(&target).unwrap();
         let reopened = Vault::open(&path, "new-password-456").unwrap();
         let third = dir.path().join("third.txt");
         std::fs::write(&third, b"third payload").unwrap();
-        reopened.add_files(&[&third]).unwrap();
-        assert_eq!(mode(&path), 0o600, "symlink mode not copied");
+        let err = reopened.add_files(&[&third]).unwrap_err().to_string();
+        assert!(err.contains("is a symbolic link"), "{err}");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(mode(&target), 0o640);
     }
 }

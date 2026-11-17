@@ -2313,11 +2313,56 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
     Ok(())
 }
 
+/// A writer that passes bytes through and keeps their count and BLAKE3 hash,
+/// so a save gets the generation of what it wrote without reading it back.
+struct HashingWriter<'a> {
+    inner: &'a mut std::fs::File,
+    hasher: blake3::Hasher,
+    len: u64,
+}
+
+impl<'a> HashingWriter<'a> {
+    fn new(inner: &'a mut std::fs::File) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+            len: 0,
+        }
+    }
+
+    /// Length and hash of everything written, as [`file_generation`] would
+    /// read them back from the start of a fresh file.
+    fn finish(self) -> (u64, [u8; 32]) {
+        (self.len, *self.hasher.finalize().as_bytes())
+    }
+}
+
+impl std::io::Write for HashingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = std::io::Write::write(self.inner, buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.inner)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: how many whole-file reads [`file_generation`] made on this thread.
+    pub(super) static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Length and BLAKE3 hash of the whole file behind `file`, read from its start.
 /// The whole file, not the header: a write can leave the header identical
 /// (a rename to a name of the same length changes only the manifest bytes).
 fn file_generation(file: &mut std::fs::File) -> Result<(u64, [u8; 32]), String> {
     use std::io::Seek;
+    #[cfg(test)]
+    GENERATION_READS.with(|n| n.set(n.get() + 1));
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(|e| format!("Read vault: {e}"))?;
     let mut hasher = blake3::Hasher::new();
@@ -2417,8 +2462,11 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
             .prefix(".aerovault-v3-")
             .tempfile_in(parent)
             .map_err(|e| format!("Create temp file: {e}"))?;
+        // Hash the bytes as they are written: the generation baseline of the
+        // sealed file, without reading it back.
+        let mut sealed = HashingWriter::new(tmp.as_file_mut());
         {
-            let mut w = std::io::BufWriter::new(tmp.as_file_mut());
+            let mut w = std::io::BufWriter::new(&mut sealed);
             write_container(
                 &mut w,
                 vault.header.clone(),
@@ -2431,6 +2479,7 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
             )?;
             w.flush().map_err(|e| format!("Flush temp file: {e}"))?;
         }
+        let generation = sealed.finish();
         tmp.as_file_mut()
             .sync_all()
             .map_err(|e| format!("Sync temp file: {e}"))?;
@@ -2438,7 +2487,6 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
         // from a later read of the path, which may already show another
         // writer's generation.
         let file = tmp.as_file_mut();
-        let generation = file_generation(file)?;
         let mut header_bytes = [0u8; HEADER_SIZE];
         file.seek(std::io::SeekFrom::Start(0))
             .and_then(|_| file.read_exact(&mut header_bytes))
@@ -2962,6 +3010,72 @@ mod tests {
         assert_eq!(std::fs::read(&vp).unwrap(), bytes);
         crate::lock::remove_vault_and_lock(&vp);
         std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[test]
+    fn open_and_save_each_read_the_whole_file_once_more() {
+        // Open hashes the file it decoded; a save hashes the file on disk for
+        // its check and the sealed bytes as it writes them, without reading
+        // the new file back.
+        let vp = vault_path();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&vp)).unwrap();
+        let src = scratch_dir();
+        std::fs::write(src.join("a.txt"), vec![3u8; 100_000]).unwrap();
+        let reads = || GENERATION_READS.with(|n| n.replace(0));
+        reads();
+        let mut v = VaultV3::open_plaintext(&vp).unwrap();
+        assert_eq!(reads(), 1, "open");
+        VaultV3::add_files(&mut v, &[(src.join("a.txt"), "a.txt".to_string())]).unwrap();
+        assert_eq!(reads(), 1, "save");
+        // The baseline the save kept is the file now on disk.
+        let mut file = std::fs::File::open(&vp).unwrap();
+        assert_eq!(
+            file_generation(&mut file).unwrap(),
+            (v.opened_file_len, v.opened_hash)
+        );
+        drop(file);
+        VaultV3::add_files(&mut v, &[(src.join("a.txt"), "b.txt".to_string())]).unwrap();
+        drop(v);
+        crate::lock::remove_vault_and_lock(&vp);
+        std::fs::remove_dir_all(&src).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_through_a_symlinked_vault_path_is_refused() {
+        // The link and its target would lock two different `.lock` files, and
+        // the rename would replace the link, not the vault that was read.
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = scratch_dir();
+        let real = dir.join("real.aerozip");
+        let alias = dir.join("alias.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&real)).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
+        let add = |v: &mut OpenVaultV3| {
+            VaultV3::add_files(v, &[(dir.join("a.txt"), "a.txt".to_string())])
+        };
+        let real_before = std::fs::read(&real).unwrap();
+        let mut through_alias = VaultV3::open_plaintext(&alias).unwrap();
+        for held in [true, false] {
+            let lock = held.then(|| write_lock(&real).unwrap());
+            let err = add(&mut through_alias).unwrap_err();
+            assert!(err.contains("is a symbolic link"), "{err}");
+            drop(lock);
+            assert!(std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read(&real).unwrap(), real_before);
+            assert!(!crate::lock::lock_path(&alias).exists());
+        }
+        // Through the target path the same add works.
+        let mut v = VaultV3::open_plaintext(&real).unwrap();
+        add(&mut v).unwrap();
+        assert_eq!(VaultV3::summary(&v).entries.len(), 1);
+        drop((v, through_alias));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists());
     }
 
     #[test]

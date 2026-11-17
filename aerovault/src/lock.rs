@@ -10,14 +10,19 @@
 //! separate, stable `<vault>.lock` next to the vault, and hold it from the
 //! moment they read the state they will write (for a v3 handle opened
 //! earlier, from the check that the file is still the one it read) until the
-//! rename is done. Readers never take it.
+//! rename is done. Readers never take it. Tools that rewrite any file or
+//! write its `.aerocorrect` (`correct repair`, `correct gen`) read it without
+//! the lock, then take the lock of that file, vault or not, for their write,
+//! and write only if it still holds the bytes they read
+//! (`error_correction::sync::write_if_unchanged`), so a vault created or saved
+//! at that path meanwhile is not lost.
 //!
 //! The OS drops the lock when the holder exits or crashes, so there is no
 //! stale-lock cleanup. The `<vault>.lock` file itself is left in place on
 //! purpose: deleting it would let two writers lock two different files.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -74,7 +79,19 @@ pub(crate) fn lock_path(vault: &Path) -> PathBuf {
 /// holds nothing: such a process cannot rename anything over the vault
 /// either, so only a read of it (an export to another folder) can follow, and
 /// a write fails later with its own cause.
+///
+/// A `vault` path that is itself a symbolic link is refused: a writer going
+/// through the link and one using its target would lock two different files,
+/// and the rename would replace the link with a regular file, leaving two
+/// diverging copies.
 pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
+    if std::fs::symlink_metadata(vault).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(io::Error::other(format!(
+            "{} is a symbolic link: writing through it would replace the link and \
+             lock a different file than a writer using its target; use the target path",
+            vault.display()
+        )));
+    }
     let path = lock_path(vault);
     let Some(file) = open_lock_file(&path)? else {
         return Ok(WriteLock { _file: None });
@@ -200,23 +217,6 @@ pub(crate) fn remove_vault_and_lock(vault: &Path) {
     );
 }
 
-/// [`acquire`] when `path` is an AeroVault container (v2 or v3 magic), so a
-/// generic tool that rewrites a file or its `.aerocorrect` (`correct repair`,
-/// `correct gen`) cannot interleave with a vault writer. Any other file gets
-/// no lock and no `.lock` file next to it.
-pub(crate) fn acquire_if_container(path: &Path) -> io::Result<Option<WriteLock>> {
-    let mut magic = [0u8; 10];
-    let is_container = File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && (&magic == crate::constants::MAGIC || &magic == crate::v3::constants::MAGIC);
-    if is_container {
-        acquire(path).map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +316,21 @@ mod tests {
         let err = acquire(&vault).unwrap_err();
         assert!(err.to_string().contains("symbolic link"), "{err}");
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_vault_path_is_refused() {
+        let dir = scratch();
+        let target = dir.join("real.aerovault");
+        std::fs::write(&target, b"vault").unwrap();
+        let link = dir.join("link.aerovault");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = acquire(&link).unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(!lock_path(&link).exists());
+        acquire(&target).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
