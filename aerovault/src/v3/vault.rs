@@ -4108,20 +4108,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn password_change_reports_a_sidecar_it_can_neither_refresh_nor_remove() {
-        // A directory at the sidecar path can be neither replaced nor removed.
-        // The password change is saved, the error says so and what to do, and
-        // the vault opens with the new password only.
+    fn password_change_refuses_a_sidecar_directory_before_saving() {
+        // An existing directory is rejected before the password is committed.
+        // Preserve both the vault bytes and the unrelated directory contents.
         const NEW_PW: &str = "new-password-12345";
         let (vp, sidecar) = vault_with_sidecar();
         std::fs::remove_file(&sidecar).unwrap();
         std::fs::create_dir(&sidecar).unwrap();
         std::fs::write(sidecar.join("keep"), b"x").unwrap();
+        let before = std::fs::read(&vp).unwrap();
 
         let mut vault = VaultV3::open(&vp, PW).unwrap();
         let err = VaultV3::change_password(&mut vault, NEW_PW).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        assert_eq!(std::fs::read(&vp).unwrap(), before);
+        assert_eq!(std::fs::read(sidecar.join("keep")).unwrap(), b"x");
+        drop(vault);
+        assert!(VaultV3::open(&vp, PW).is_ok());
+        assert!(VaultV3::open(&vp, NEW_PW).is_err());
+
+        crate::lock::remove_vault_and_lock(&vp);
+        std::fs::remove_dir_all(&sidecar).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn password_change_reports_a_sidecar_it_can_neither_refresh_nor_remove() {
+        // An uncooperative filesystem writer replaces the sidecar only after
+        // the new password is saved. Keep the committed-state diagnostic and
+        // removal-failure path covered independently of preflight refusal.
+        const NEW_PW: &str = "new-password-12345";
+        let (vp, sidecar) = vault_with_sidecar();
+        let injected_sidecar = sidecar.clone();
+        let mut vault = VaultV3::open(&vp, PW).unwrap();
+        AFTER_PERSIST.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(&injected_sidecar).unwrap();
+                std::fs::create_dir(&injected_sidecar).unwrap();
+                std::fs::write(injected_sidecar.join("keep"), b"x").unwrap();
+            }));
+        });
+        let err = VaultV3::change_password(&mut vault, NEW_PW).unwrap_err();
         assert!(err.starts_with("Password changed"), "{err}");
         assert!(err.contains("remove the old one"), "{err}");
+        assert_eq!(std::fs::read(sidecar.join("keep")).unwrap(), b"x");
         drop(vault);
         assert!(VaultV3::open(&vp, NEW_PW).is_ok());
         assert!(VaultV3::open(&vp, PW).is_err());
@@ -5322,10 +5352,17 @@ mod tests {
             std::io::Error::last_os_error()
         );
         let short = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
-        if short == long {
-            eprintln!("8.3 names disabled on this volume; native alias case unavailable");
+        let short_leaf = short.file_name().unwrap();
+        if short_leaf
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&long.file_name().unwrap().to_string_lossy())
+        {
+            eprintln!("8.3 vault leaf unavailable on this volume; native alias case skipped");
             return;
         }
+        // Keep the long parent so this regression must exercise an aliased
+        // vault leaf, independently of any short name on a parent directory.
+        let short = long.with_file_name(short_leaf);
         let sidecar = super::super::ec::default_sidecar_path(&long);
         let before = std::fs::read(&sidecar).unwrap();
         let mut vault = VaultV3::open(&short, PW).unwrap();
@@ -5340,6 +5377,9 @@ mod tests {
             VaultV3::open(&long, "new-password-123")
                 .unwrap()
                 .header_repaired_on_open
+        );
+        eprintln!(
+            "8.3 vault leaf exercised: {short_leaf:?}; sidecar and password recovery verified"
         );
     }
 }
