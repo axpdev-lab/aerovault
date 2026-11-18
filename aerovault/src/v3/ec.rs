@@ -33,8 +33,8 @@ use super::constants::{
 use super::format::VaultHeaderV3;
 use super::manifest::{ChunkRecordV3, ExtensionEntryV3};
 use super::vault::{
-    assert_vault_generation_current, atomic_write, open_header_bytes, open_vault, read_capped,
-    save_open_vault, OpenVaultV3, UnlockedHeader,
+    assert_vault_generation_current, atomic_write, open_header_bytes, read_capped, save_open_vault,
+    OpenVaultV3, UnlockedHeader,
 };
 use crate::error_correction::{
     compute_error_correction_shards_grid, compute_metadata_parity, manifest_error_correction_grid,
@@ -543,7 +543,7 @@ pub(super) fn export_parity_under_locks(
     _source_lock: &crate::lock::WriteLock,
     _out_lock: &Option<crate::lock::WriteLock>,
 ) -> Result<ExportParityResult, String> {
-    let vault = open_vault(vault_path, password)?;
+    let vault = super::vault::open_vault_under_guard(vault_path, password, _source_lock)?;
     if vault.manifest_repaired_on_open {
         return Err(
             "Vault manifest was recovered on open: run repair before exporting parity".to_string(),
@@ -629,7 +629,7 @@ pub(super) fn strip_parity(
     // leave the vault with no recovery at all.
     let lock = super::vault::write_lock(vault_path)?;
     let vault_path = lock.source_path();
-    let mut vault = open_vault(vault_path, password)?;
+    let mut vault = super::vault::open_vault_under_guard(vault_path, password, &lock)?;
     let had_embedded = vault
         .extensions
         .iter()

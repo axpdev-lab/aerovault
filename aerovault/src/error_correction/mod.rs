@@ -1153,7 +1153,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn correct_generate_replaces_a_planted_symlink_instead_of_following_it() {
+    fn correct_generate_explicitly_replaces_a_planted_symlink_instead_of_following_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let file = write_file(dir.path(), "data.bin", &sample(40_000));
@@ -1162,11 +1162,26 @@ mod tests {
         let sidecar = aerocorrect_sidecar_path_for(&file);
         std::os::unix::fs::symlink(&sentinel, &sidecar).unwrap();
 
-        correct_generate(&file, 15, None).unwrap();
+        correct_generate(&file, 15, Some(&sidecar)).unwrap();
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not overwrite");
         let meta = std::fs::symlink_metadata(&sidecar).unwrap();
         assert!(meta.file_type().is_file());
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn correct_generate_refuses_an_automatic_symlink_and_preserves_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_file(dir.path(), "data.bin", &sample(40_000));
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"do not overwrite").unwrap();
+        let sidecar = aerocorrect_sidecar_path_for(&file);
+        std::os::unix::fs::symlink(&sentinel, &sidecar).unwrap();
+        let error = correct_generate(&file, 15, None).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert_eq!(std::fs::read_link(&sidecar).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not overwrite");
     }
 
     /// A 50 kB file with its sidecar, then damaged so a repair has to write.

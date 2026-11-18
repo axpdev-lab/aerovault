@@ -2198,6 +2198,11 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    static AFTER_OPEN_RECOVERY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test seam: runs once in an open, after the header is checked and right
     /// before the file is hashed.
     static BEFORE_OPEN_GENERATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -2268,6 +2273,38 @@ fn open_vault_with(
     password: &str,
     encrypted_only: bool,
 ) -> Result<OpenVaultV3, String> {
+    open_vault_with_guard(path, password, encrypted_only, None)
+}
+
+pub(super) fn open_vault_under_guard(
+    path: impl Into<PathBuf>,
+    password: &str,
+    lock: &WriteLock,
+) -> Result<OpenVaultV3, String> {
+    let path = path.into();
+    let guard = lock.covers_namespace(&path).then_some(lock);
+    open_vault_with_guard(path, password, false, guard)
+}
+
+fn retry_open_for_recovery(
+    path: &Path,
+    password: &str,
+    encrypted_only: bool,
+) -> Result<OpenVaultV3, String> {
+    // Healthy reads stay lock-free. Before using detached recovery, reopen the
+    // source under the same guard that excludes paired rotation and stripping.
+    // This also recovers a journal published after the first optimistic check.
+    let real = std::fs::canonicalize(path).map_err(|e| format!("Resolve recovery source: {e}"))?;
+    let guard = crate::lock::acquire_for_export(&real).map_err(|e| e.to_string())?;
+    open_vault_with_guard(path.to_path_buf(), password, encrypted_only, Some(&guard))
+}
+
+fn open_vault_with_guard(
+    path: impl Into<PathBuf>,
+    password: &str,
+    encrypted_only: bool,
+    recovery_guard: Option<&WriteLock>,
+) -> Result<OpenVaultV3, String> {
     let path =
         crate::lock::anchored(&path.into()).map_err(|e| format!("Resolve vault parent: {e}"))?;
     // A regular Windows leaf can be an 8.3 alias. Retain the long namespace
@@ -2279,8 +2316,19 @@ fn open_vault_with(
     } else {
         path
     };
-    super::strip_transaction::recover_if_pending(&path)?;
-    let mut file = crate::source::open_regular(&path).map_err(|e| format!("Open vault: {e}"))?;
+    if let Some(guard) = recovery_guard {
+        super::strip_transaction::recover_under_guard(guard)?;
+    } else {
+        super::strip_transaction::recover_if_pending(&path)?;
+    }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_OPEN_RECOVERY_CHECK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    // Once recovery takes a guard, read its pinned physical source, retaining
+    // the supplied leaf namespace only for sidecar selection and the handle.
+    let source = recovery_guard.map_or(path.as_path(), WriteLock::source_path);
+    let mut file = crate::source::open_regular(source).map_err(|e| format!("Open vault: {e}"))?;
     let file_len = file
         .metadata()
         .map_err(|e| format!("Vault metadata: {e}"))?
@@ -2332,6 +2380,10 @@ fn open_vault_with(
         match open_header_bytes(&header_bytes, password) {
             Ok((h, mac, master)) => (h, mac, master, false),
             Err(orig) => {
+                if recovery_guard.is_none() {
+                    drop(file);
+                    return retry_open_for_recovery(&path, password, encrypted_only);
+                }
                 match super::ec::recover_header_from_sidecar(&path, &header_bytes, password)? {
                     Some((h, mac, master)) => (h, mac, master, true),
                     None => return Err(orig),
@@ -2417,6 +2469,10 @@ fn open_vault_with(
     let (manifest, manifest_repaired_on_open) = match decode_manifest(&encrypted_manifest) {
         Ok(m) => (m, false),
         Err(orig) => {
+            if recovery_guard.is_none() {
+                drop(file);
+                return retry_open_for_recovery(&path, password, encrypted_only);
+            }
             let embedded = super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
             let rebuilt = match embedded {
                 Some(r) if r != encrypted_manifest => Some(r),
@@ -5359,6 +5415,56 @@ mod tests {
         eprintln!(
             "8.3 vault leaf exercised: {short_leaf:?}; sidecar and password recovery verified"
         );
+    }
+
+    #[test]
+    fn review_reader_past_journal_check_cannot_recover_old_password_mid_rotation() {
+        use super::super::ec::RecoveryPlacement;
+        for placement in [RecoveryPlacement::Detached, RecoveryPlacement::Both] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("reader-race.aerovault");
+            VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
+                .unwrap();
+            super::super::ec::export_parity(&path, PW, None).unwrap();
+            let mut vault = VaultV3::open(&path, PW).unwrap();
+            std::thread::scope(|scope| {
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                let (result_tx, result_rx) = std::sync::mpsc::channel();
+                let reader_path = path.clone();
+                let reader = scope.spawn(move || {
+                    crate::lock::set_short_wait_for_this_thread();
+                    AFTER_OPEN_RECOVERY_CHECK.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move || {
+                            ready_tx.send(()).unwrap();
+                            resume_rx
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        }));
+                    });
+                    let result = VaultV3::open(&reader_path, PW).map(|v| v.header_repaired_on_open);
+                    result_tx.send(result.clone()).unwrap();
+                    result
+                });
+                ready_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                super::super::strip_transaction::AFTER_STRIP_VAULT.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        resume_tx.send(()).unwrap();
+                        let error = result_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap()
+                            .unwrap_err();
+                        assert!(error.contains("locked by another writer"), "{error}");
+                    }));
+                });
+                VaultV3::change_password(&mut vault, "new-password-123").unwrap();
+                assert!(reader.join().unwrap().is_err());
+            });
+            assert!(VaultV3::open(&path, PW).is_err());
+            assert!(VaultV3::open(&path, "new-password-123").is_ok());
+        }
     }
 
     #[test]
