@@ -36,7 +36,6 @@ use super::vault::{
     assert_vault_generation_current, atomic_write, open_header_bytes, open_vault, read_capped,
     save_open_vault, OpenVaultV3, UnlockedHeader,
 };
-use crate::error_correction::sidecar::aerocorrect_sidecar_path;
 use crate::error_correction::{
     compute_error_correction_shards_grid, compute_metadata_parity, manifest_error_correction_grid,
     reconstruct_from_error_correction,
@@ -122,7 +121,9 @@ pub(super) fn error_correction_stub_extension() -> ExtensionEntryV3 {
 
 /// Default sidecar path for a vault: `X` gets `X.aerocorrect`.
 pub(super) fn default_sidecar_path(vault_path: &Path) -> PathBuf {
-    PathBuf::from(aerocorrect_sidecar_path(&vault_path.to_string_lossy()))
+    let mut native = vault_path.as_os_str().to_os_string();
+    native.push(".aerocorrect");
+    PathBuf::from(native)
 }
 
 /// SHA-256 of a byte slice (the unified `.aerocorrect` format binds by content).
@@ -262,22 +263,22 @@ fn collect_live_block_refs(vault: &OpenVaultV3) -> Vec<&[u8]> {
 }
 
 /// Geometry-derived upper bounds apply before parsing even a legacy locator.
-/// K=2/P=2 is deliberately more generous than every supported overhead grid.
+/// Parity bytes and checksum counts have independent monotone upper bounds.
 fn open_vault_sidecar(
     vault_path: &Path,
     sidecar: &Path,
 ) -> Result<crate::error_correction::sidecar::AeroCorrectSidecarReader, String> {
     use crate::error_correction::{
-        parity_payload_len,
+        parity_payload_bound,
         sidecar::{AeroCorrectSidecarReader, SidecarReadLimits},
     };
     let size = crate::source::open_regular(vault_path)
         .and_then(|f| f.metadata())
         .map_err(|e| e.to_string())?
         .len();
-    let data = parity_payload_len(size, 2, 2)?;
-    let manifest = parity_payload_len(size.min(MAX_MANIFEST_SIZE), 2, 2)?;
-    let header = parity_payload_len(HEADER_SIZE as u64, 2, 2)?;
+    let data = parity_payload_bound(size)?;
+    let manifest = parity_payload_bound(size.min(MAX_MANIFEST_SIZE))?;
+    let header = parity_payload_bound(HEADER_SIZE as u64)?;
     let max = data
         .checked_add(manifest)
         .and_then(|n| n.checked_add(header))
@@ -291,7 +292,7 @@ fn read_vault_segment(
     index: usize,
     region_len: u64,
 ) -> Result<Vec<u8>, String> {
-    let max = crate::error_correction::parity_payload_len(region_len, 2, 2)?;
+    let max = crate::error_correction::parity_payload_bound(region_len)?;
     let max = usize::try_from(max).map_err(|_| "sidecar parity exceeds address space")?;
     open_vault_sidecar(vault_path, sidecar)?.read_segment_avec_bounded(index, max)
 }
@@ -549,7 +550,6 @@ pub(super) fn strip_parity(
         return Err("Vault has no embedded Error Correction parity to strip".to_string());
     }
     let sidecar = default_sidecar_path(vault_path);
-    let has_sidecar = sidecar.exists();
     let _sidecar_lock = if !force {
         // We read the recovery file itself: the export-only symlink-replacement
         // exception cannot protect a symlink target while validating it.
@@ -557,6 +557,7 @@ pub(super) fn strip_parity(
     } else {
         None
     };
+    let has_sidecar = sidecar.exists();
     if !has_sidecar && !force {
         return Err(
             "Refusing to strip embedded parity: no detached recovery file exists. Run \"vault export-parity\" first, or pass --force to drop recovery entirely."
@@ -597,10 +598,10 @@ pub(super) fn strip_parity(
     if force {
         super::vault::save_locked(&mut vault, &lock)?;
     } else {
-        let prepared = tempfile::Builder::new()
-            .prefix(".aerostrip-prepare-")
-            .tempdir_in(super::vault::output_parent_dir(vault_path))
-            .map_err(|e| e.to_string())?;
+        let prepared = super::strip_transaction::private_dir(
+            super::vault::output_parent_dir(vault_path),
+            ".aerostrip-prepare-",
+        )?;
         super::strip_transaction::copy_file(vault_path, &prepared.path().join("old-vault"))?;
         super::strip_transaction::copy_file(&sidecar, &prepared.path().join("old-sidecar"))?;
         let staged = prepared.path().join("new-vault");
@@ -2251,6 +2252,57 @@ mod tests {
                     .with(|h| *h.borrow_mut() = Some(crash)),
                 _ => panic!("unknown boundary"),
             }
+            let parent = path.parent().unwrap().to_path_buf();
+            super::super::strip_transaction::BEFORE_STRIP_JOURNAL.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let prepared = std::fs::read_dir(&parent)
+                            .unwrap()
+                            .map(|e| e.unwrap().path())
+                            .find(|p| {
+                                p.file_name()
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .starts_with(".aerostrip-prepare-")
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            std::fs::metadata(&prepared).unwrap().permissions().mode() & 0o077,
+                            0
+                        );
+                        for name in [
+                            "old-vault",
+                            "old-sidecar",
+                            "new-vault",
+                            "new-sidecar",
+                            "journal.json",
+                        ] {
+                            assert_eq!(
+                                std::fs::metadata(prepared.join(name))
+                                    .unwrap()
+                                    .permissions()
+                                    .mode()
+                                    & 0o077,
+                                0,
+                                "{name}"
+                            );
+                        }
+                    }
+                    if std::env::var_os("AEROVAULT_WAITING_WRITER").is_some() {
+                        std::fs::write(parent.join("strip-ready"), b"ready").unwrap();
+                        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        while !parent.join("writer-blocked").exists() {
+                            assert!(
+                                std::time::Instant::now() < until,
+                                "writer never reached source contention"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }))
+            });
             VaultV3::strip_parity(&path, PW, false).unwrap();
             panic!("crash boundary was not reached");
         }
@@ -2292,6 +2344,25 @@ mod tests {
             };
             assert_eq!(status.code(), Some(77), "{phase}: {status}");
             assert!(super::super::strip_transaction::journal_path(&path).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let journal = super::super::strip_transaction::journal_path(&path);
+                assert_eq!(
+                    std::fs::metadata(&journal).unwrap().permissions().mode() & 0o077,
+                    0
+                );
+                for name in ["old-vault", "old-sidecar", "journal.json"] {
+                    assert_eq!(
+                        std::fs::metadata(journal.join(name))
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o077,
+                        0
+                    );
+                }
+            }
             #[cfg(unix)]
             let reopen_path = if phase == "vault" {
                 let alias = dir.path().join("linked.aerovault");
@@ -2438,5 +2509,253 @@ mod tests {
             .unwrap_err()
             .contains("pending strip transaction conflicts"));
         assert_eq!(std::fs::read(&path).unwrap(), newer);
+    }
+    #[test]
+    fn review_detached_parity_repairs_shard_boundary_streams() {
+        use super::super::manifest::ManifestEntryV3;
+        for len in [8192usize, 8193] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("boundary.aerozip");
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new_plaintext(&path),
+                RecoveryPlacement::Detached,
+                20,
+            )
+            .unwrap();
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            let payload: Vec<u8> = (0..len - 8).map(|i| (i % 251) as u8).collect();
+            let key = crate::aerocrypt::hkdf_expand::<32>(
+                &vault.master_key,
+                super::super::constants::HKDF_CHUNK_ID,
+            )
+            .unwrap();
+            let id = super::super::chunking::keyed_chunk_id(&key, &payload);
+            vault.data = ((len - 8) as u64).to_le_bytes().to_vec();
+            vault.data.extend_from_slice(&payload);
+            vault.manifest.chunks.insert(
+                id.clone(),
+                ChunkRecordV3 {
+                    id: id.clone(),
+                    block_index: 0,
+                    data_offset: 0,
+                    block_len: payload.len() as u64,
+                    plaintext_len: payload.len() as u64,
+                    compressed_len: payload.len() as u64,
+                    cipher_hash: blake3::hash(&payload).to_hex().to_string(),
+                    stored_raw: true,
+                },
+            );
+            vault.manifest.entries.push(ManifestEntryV3 {
+                path: "item.bin".into(),
+                size: payload.len() as u64,
+                modified: vault.manifest.modified.clone(),
+                is_dir: false,
+                chunks: vec![id],
+                pack_offset: None,
+            });
+            let lock = super::super::vault::write_lock(&path).unwrap();
+            super::super::vault::save_locked(&mut vault, &lock).unwrap();
+            drop(lock);
+            drop(vault);
+            let intact = VaultV3::open_plaintext(&path).unwrap();
+            assert_eq!(
+                collect_live_block_refs(&intact)
+                    .iter()
+                    .map(|b| b.len())
+                    .sum::<usize>(),
+                len
+            );
+            VaultV3::export_parity(&path, "", None).unwrap();
+            assert!(!read_vault_segment(
+                &path,
+                &default_sidecar_path(&path),
+                VAULT_SIDECAR_SEG_DATA,
+                len as u64
+            )
+            .unwrap()
+            .is_empty());
+            corrupt_data_section(&path, 32);
+            let mut damaged = VaultV3::open_plaintext(&path).unwrap();
+            assert!(VaultV3::repair(&mut damaged, false, None).unwrap().0 > 0);
+            let reopened = VaultV3::open_plaintext(&path).unwrap();
+            assert!(VaultV3::scrub(&reopened).is_empty());
+            let output =
+                VaultV3::extract_entry(&reopened, "item.bin", &dir.path().join("out")).unwrap();
+            assert_eq!(std::fs::read(output).unwrap(), payload);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_native_non_utf8_paths_remain_writable_and_recoverable() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"parent-\xff".to_vec()));
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join(std::ffi::OsString::from_vec(b"vault-\xfe.aerozip".to_vec()));
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&path),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        let source = parent.join("input");
+        std::fs::write(&source, b"native path contents").unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(source, "item".into())]).unwrap();
+        drop(vault);
+        let mut expected = path.as_os_str().to_os_string();
+        expected.push(".aerocorrect");
+        assert_eq!(
+            default_sidecar_path(&path).as_os_str(),
+            expected.as_os_str()
+        );
+        VaultV3::export_parity(&path, "", None).unwrap();
+        VaultV3::strip_parity(&path, "", false).unwrap();
+        let reopened = VaultV3::open_plaintext(&path).unwrap();
+        let output = VaultV3::extract_entry(&reopened, "item", &parent.join("out")).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"native path contents");
+    }
+
+    #[test]
+    fn review_strip_rechecks_sidecar_after_destination_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late-sidecar.aerozip");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&path),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, "", None).unwrap();
+        let sidecar = default_sidecar_path(&path);
+        let ready = std::fs::read(&sidecar).unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        std::thread::scope(|scope| {
+            let guard = crate::lock::acquire(&sidecar).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let p = path.clone();
+            let worker = scope.spawn(move || {
+                crate::lock::ON_LOCK_CONTENTION.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        tx.send(()).unwrap();
+                    }))
+                });
+                VaultV3::strip_parity(&p, "", false)
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            std::fs::write(&sidecar, ready).unwrap();
+            drop(guard);
+            assert!(worker.join().unwrap().unwrap().sidecar_present);
+        });
+        assert!(!VaultV3::has_error_correction(&path).unwrap());
+        assert!(VaultV3::open_plaintext(&path).is_ok());
+    }
+
+    #[test]
+    fn review_strip_sync_error_reports_completed_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.aerozip");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&path),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, "", None).unwrap();
+        super::super::strip_transaction::FAIL_FINAL_SYNC.with(|f| f.set(true));
+        let error = VaultV3::strip_parity(&path, "", false).unwrap_err();
+        assert!(
+            error.contains("stripped vault and refreshed sidecar remain"),
+            "{error}"
+        );
+        assert!(!error.contains("original vault restored"));
+        assert!(!VaultV3::has_error_correction(&path).unwrap());
+        assert!(!super::super::strip_transaction::journal_path(&path).exists());
+        let mut current = VaultV3::open_plaintext(&path).unwrap();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged[current.header.manifest_offset as usize + 4] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        current = VaultV3::open_plaintext(&path).unwrap();
+        assert!(current.manifest_repaired_on_open);
+    }
+
+    #[test]
+    fn review_waiting_writers_recover_strip_under_the_acquired_guard() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for (phase, operation) in [
+            ("journal", "save"),
+            ("vault", "create"),
+            ("journal", "export"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("restart.aerovault");
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&path, PW),
+                RecoveryPlacement::Both,
+                20,
+            )
+            .unwrap();
+            VaultV3::export_parity(&path, PW, None).unwrap();
+            let mut old_handle = VaultV3::open(&path, PW).unwrap();
+            let mut child=Child(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","v3::ec::tests::review_strip_restarts_with_usable_metadata_at_each_publication_boundary","--nocapture"])
+                .env("AEROVAULT_STRIP_RESTART_DIR",dir.path()).env("AEROVAULT_STRIP_RESTART_PHASE",phase)
+                .env("AEROVAULT_WAITING_WRITER","1").spawn().unwrap());
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            while !dir.path().join("strip-ready").exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "strip child exited before readiness"
+                );
+                assert!(
+                    std::time::Instant::now() < until,
+                    "strip child readiness timeout"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::thread::scope(|scope| {
+                let target = path.clone();
+                let blocked = dir.path().join("writer-blocked");
+                let worker = scope.spawn(move || {
+                    crate::lock::ON_LOCK_CONTENTION.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move || {
+                            std::fs::write(blocked, b"blocked").unwrap();
+                        }))
+                    });
+                    match operation {
+                        "save" => VaultV3::create_directory(&mut old_handle, "waiter").map(|_| ()),
+                        "create" => VaultV3::create(&CreateOptionsV3::new(&target, PW)),
+                        "export" => VaultV3::export_parity(&target, PW, None).map(|_| ()),
+                        _ => unreachable!(),
+                    }
+                });
+                let status = loop {
+                    if let Some(s) = child.0.try_wait().unwrap() {
+                        break s;
+                    }
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "strip child exit timeout"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                assert_eq!(status.code(), Some(77));
+                worker.join().unwrap().unwrap();
+            });
+            assert!(!super::super::strip_transaction::journal_path(&path).exists());
+            let reopened = VaultV3::open(&path, PW).unwrap();
+            if operation == "save" {
+                assert!(reopened.manifest.entries.iter().any(|e| e.path == "waiter"));
+            }
+        }
     }
 }

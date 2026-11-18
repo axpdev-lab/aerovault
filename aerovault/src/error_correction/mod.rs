@@ -268,6 +268,28 @@ pub(crate) fn compute_error_correction_shards(data_blocks: &[&[u8]]) -> (Vec<u8>
     )
 }
 
+/// Monotone bound for any protected length up to L and every supported grid.
+/// Independent parity/checksum bounds avoid shard-boundary count reductions.
+pub(crate) fn parity_payload_bound(l: u64) -> Result<u64, String> {
+    if l == 0 {
+        return Ok(0);
+    }
+    let shard = l.div_ceil(2).clamp(
+        ERROR_CORRECTION_MIN_SHARD as u64,
+        ERROR_CORRECTION_MAX_SHARD as u64,
+    );
+    let checksums = l
+        .div_ceil(ERROR_CORRECTION_MIN_SHARD as u64)
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_mul(ERROR_CORRECTION_SHARD_CKSUM_LEN as u64));
+    l.checked_add(shard.checked_mul(2).ok_or("parity bound overflow")?)
+        .and_then(|n| n.checked_add(checksums?))
+        .and_then(|n| n.checked_add(32))
+        .ok_or_else(|| "parity bound overflow".to_string())
+}
+
+#[cfg(test)]
 pub(crate) fn parity_payload_len(l: u64, k: u64, p: u64) -> Result<u64, String> {
     if l == 0 {
         return Ok(0);
@@ -1503,7 +1525,7 @@ mod tests {
                     parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
                     actual
                 );
-                assert!(actual <= parity_payload_len(len as u64, 2, 2).unwrap());
+                assert!(actual <= parity_payload_bound(len as u64).unwrap());
             }
         }
         for (k, p) in grids {
@@ -1531,5 +1553,38 @@ mod tests {
                     .len() as u64
             );
         }
+    }
+    #[test]
+    fn review_parity_bound_covers_checksum_discontinuities() {
+        let mut previous = 0;
+        for len in 0..=100_000 {
+            let bound = parity_payload_bound(len).unwrap();
+            assert!(bound >= previous, "bound must remain monotone at {len}");
+            previous = bound;
+            for pct in ERROR_CORRECTION_MIN_PCT..=ERROR_CORRECTION_MAX_PCT {
+                let (k, p) = error_correction_grid(pct);
+                assert!(
+                    bound >= parity_payload_len(len, k as u64, p as u64).unwrap(),
+                    "{len}/{pct}"
+                );
+            }
+        }
+        assert_eq!(parity_payload_len(8193, 10, 2).unwrap(), 8304);
+        assert!(parity_payload_len(8193, 2, 2).unwrap() < 8304);
+        for pct in ERROR_CORRECTION_MIN_PCT..=ERROR_CORRECTION_MAX_PCT {
+            let (k, p) = error_correction_grid(pct);
+            for len in [
+                2,
+                k as u64 * ERROR_CORRECTION_MAX_SHARD as u64 - 1,
+                k as u64 * ERROR_CORRECTION_MAX_SHARD as u64 + 1,
+                u32::MAX as u64,
+            ] {
+                assert!(
+                    parity_payload_bound(len).unwrap()
+                        >= parity_payload_len(len, k as u64, p as u64).unwrap()
+                );
+            }
+        }
+        assert!(parity_payload_bound(u64::MAX).is_err());
     }
 }

@@ -220,8 +220,31 @@ fn ignored_in_names(c: char) -> bool {
 /// or RAM-disk drivers do not report it), the given name is used without its
 /// trailing dots and spaces (a short name then still locks its own file).
 #[cfg(windows)]
+fn windows_name_query(vault: &Path) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let mut leaf: Vec<u16> = vault
+        .file_name()
+        .unwrap_or_default()
+        .encode_wide()
+        .collect();
+    while leaf
+        .last()
+        .is_some_and(|c| *c == u16::from(b'.') || *c == u16::from(b' '))
+    {
+        leaf.pop();
+    }
+    if leaf.is_empty() {
+        return Err(io::Error::other(
+            "file name cannot consist only of dots or spaces",
+        ));
+    }
+    Ok(vault.with_file_name(std::ffi::OsString::from_wide(&leaf)))
+}
+
+#[cfg(windows)]
 fn lock_name_source(vault: &Path) -> io::Result<PathBuf> {
-    match std::fs::canonicalize(vault) {
+    let query = windows_name_query(vault)?;
+    match std::fs::canonicalize(&query) {
         Ok(real) => Ok(match real.file_name() {
             Some(name) => vault.with_file_name(name),
             None => vault.to_path_buf(),
@@ -253,6 +276,57 @@ fn lock_name_source(vault: &Path) -> io::Result<PathBuf> {
     Ok(vault.to_path_buf())
 }
 
+/// Resolve the actual namespace leaf, retaining a symbolic link itself.
+fn namespace_name_source(vault: &Path) -> io::Result<PathBuf> {
+    #[cfg(windows)]
+    let query = windows_name_query(vault)?;
+    #[cfg(windows)]
+    if std::fs::symlink_metadata(&query).is_ok_and(|m| m.file_type().is_symlink()) {
+        use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFinalPathNameByHandleW(
+                handle: *mut std::ffi::c_void,
+                path: *mut u16,
+                size: u32,
+                flags: u32,
+            ) -> u32;
+        }
+        // OPEN_REPARSE_POINT returns the link object. Normalized names from
+        // that handle resolve short aliases without resolving the link target.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000 | 0x0200_0000)
+            .open(&query)?;
+        let mut name = vec![0u16; 32768];
+        // SAFETY: file owns a live handle; name is writable for the supplied
+        // length. The API writes UTF-16 units and returns their initialized count.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                name.as_mut_ptr(),
+                name.len() as u32,
+                0,
+            )
+        };
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len as usize >= name.len() {
+            return Err(io::Error::other(
+                "destination namespace path exceeds Windows limit",
+            ));
+        }
+        name.truncate(len as usize);
+        let actual = PathBuf::from(std::ffi::OsString::from_wide(&name));
+        return actual
+            .file_name()
+            .map(|leaf| vault.with_file_name(leaf))
+            .ok_or_else(|| io::Error::other("destination namespace has no basename"));
+    }
+    lock_name_source(vault)
+}
+
 /// Take the write lock of `vault`, waiting up to 30 seconds for another
 /// writer. Errors say why: the lock file could not be created or opened,
 /// the lock could not be taken, or another writer kept it too long.
@@ -269,40 +343,43 @@ fn lock_name_source(vault: &Path) -> io::Result<PathBuf> {
 /// a space ([`lock_name_source`]). On Windows a lock file that another
 /// program holds open with delete access is waited for like a held lock.
 pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
-    if std::fs::symlink_metadata(vault).is_ok_and(|m| m.file_type().is_symlink()) {
-        return acquire_without_recovery(vault);
-    }
-    // Restore an interrupted strip before any kind of replacing writer acts.
-    crate::v3::strip_transaction::recover_if_pending(vault).map_err(io::Error::other)?;
-    acquire_without_recovery(vault)
+    recover_acquired(acquire_without_recovery(vault)?)
 }
 
 pub(crate) fn acquire_without_recovery(vault: &Path) -> io::Result<WriteLock> {
-    acquire_with_policy(vault, false)
+    acquire_with_policy(vault, false, false)
 }
 
-/// A read-only vault export may proceed without a source lock on read-only
-/// media. Its destination still requires a real write lock, and its source
-/// generation check cannot exclude a writer after that check without a lock.
+fn recover_acquired(lock: WriteLock) -> io::Result<WriteLock> {
+    // A strip can publish its journal while this writer waits. Recovery must
+    // inspect it under the guard we just acquired, never reacquire that guard.
+    crate::v3::strip_transaction::recover_under_guard(&lock).map_err(io::Error::other)?;
+    Ok(lock)
+}
+
+/// A read-only export may lack a source lock on read-only media. A pending
+/// strip still requires a real guard and writable media to recover safely.
 pub(crate) fn acquire_for_export(vault: &Path) -> io::Result<WriteLock> {
-    if std::fs::symlink_metadata(vault).is_ok_and(|m| m.file_type().is_symlink()) {
-        return acquire_with_policy(vault, true);
-    }
-    crate::v3::strip_transaction::recover_if_pending(vault).map_err(io::Error::other)?;
-    acquire_with_policy(vault, true)
+    recover_acquired(acquire_with_policy(vault, true, false)?)
 }
 
-fn acquire_with_policy(vault: &Path, allow_unlocked_read: bool) -> io::Result<WriteLock> {
+fn acquire_with_policy(
+    vault: &Path,
+    allow_unlocked_read: bool,
+    replace_leaf_link: bool,
+) -> io::Result<WriteLock> {
     refuse_lock_file_name(vault)?;
     let source = anchored(vault)?;
-    if std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_symlink()) {
+    if !replace_leaf_link
+        && std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_symlink())
+    {
         return Err(io::Error::other(format!(
             "{} is a symbolic link: writing through it would replace the link and \
              lock a different file than a writer using its target; use the target path",
             vault.display()
         )));
     }
-    let source = lock_name_source(&source)?;
+    let source = namespace_name_source(&source)?;
     let path = lock_path(&source);
     let deadline = Instant::now() + wait();
     let file = loop {
@@ -439,7 +516,7 @@ pub(crate) fn refuse_destination(out: &Path, source: &Path) -> io::Result<()> {
 pub(crate) fn destination_can_exist(out: &Path) -> io::Result<bool> {
     match std::fs::symlink_metadata(out) {
         Ok(_) => Ok(true),
-        Err(e) if name_too_long(&e) => Ok(false),
+        Err(e) if name_too_long(&e) || cfg!(windows) && e.raw_os_error() == Some(123) => Ok(false),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(e) => Err(e),
     }
@@ -481,7 +558,7 @@ impl WriteLock {
         let Some(file) = &self._file else {
             return false;
         };
-        let Ok(path) = anchored(source).and_then(|p| lock_name_source(&p)) else {
+        let Ok(path) = anchored(source).and_then(|p| namespace_name_source(&p)) else {
             return false;
         };
         let path = lock_path(&path);
@@ -507,10 +584,9 @@ impl WriteLock {
 /// Take the write lock of `out`, a destination the caller named for a file
 /// built from `held` (already locked by the caller): `export-parity --out`,
 /// `correct gen --out`. A vault at `out` is then replaced only while none of
-/// its writers holds its lock. `None` when `out` is a symbolic link (other
-/// than the input link itself), or when the real source guard already covers
-/// the same normalized namespace: the rename replaces the link, never the file
-/// it names, so there is nothing of a writer's to protect. Refused when `out`
+/// its writers holds its lock. Leaf links are replaced under their own namespace
+/// guard without following their targets. `None` only when the real source
+/// guard already covers that normalized namespace. Refused when `out`
 /// names a lock file or is `held` itself, before any missing parent folder of
 /// `out` is created.
 pub(crate) fn acquire_destination(
@@ -522,11 +598,8 @@ pub(crate) fn acquire_destination(
     if !destination_can_exist(out)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "destination basename exceeds the destination filesystem limit",
+            "destination basename is invalid for the destination filesystem",
         ));
-    }
-    if std::fs::symlink_metadata(out).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Ok(None);
     }
     if source_guard._file.is_some() && !source_guard.covers_namespace(held) {
         return Err(io::Error::other(
@@ -537,7 +610,7 @@ pub(crate) fn acquire_destination(
         return Ok(None);
     }
     std::fs::create_dir_all(parent_or_dot(out))?;
-    acquire(out).map(Some)
+    recover_acquired(acquire_with_policy(out, false, true)?).map(Some)
 }
 
 /// Open (or create) the lock file without following a symbolic link (or, on
@@ -1045,5 +1118,69 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("locked by another writer"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn review_symbolic_destination_keeps_its_own_guard_through_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let target = dir.path().join("target");
+        let out = dir.path().join("out");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&target, b"target untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &out).unwrap();
+        let source_guard = acquire(&source).unwrap();
+        let destination = acquire_destination(&out, &source, &source_guard)
+            .unwrap()
+            .expect("symbolic destination needs a real guard");
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"exported").unwrap();
+        std::fs::rename(&staged, &out).unwrap();
+        set_short_wait_for_this_thread();
+        assert!(acquire(&out)
+            .unwrap_err()
+            .to_string()
+            .contains("locked by another writer"));
+        assert!(acquire_destination(&out, &source, &source_guard)
+            .unwrap_err()
+            .to_string()
+            .contains("locked by another writer"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"target untouched");
+        drop(destination);
+        assert!(acquire(&out).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn review_windows_namespace_resolves_link_without_following_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("a-long-symbolic-destination");
+        std::fs::write(&target, b"untouched").unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(&target, &link) {
+            if e.raw_os_error() == Some(1314) {
+                eprintln!("Windows symlink privilege unavailable");
+                return;
+            }
+            panic!("cannot prepare symbolic destination: {e}");
+        }
+        let resolved = namespace_name_source(&link).unwrap();
+        assert_eq!(resolved.file_name(), link.file_name());
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"source").unwrap();
+        let source_guard = acquire(&source).unwrap();
+        let dest = acquire_destination(&link, &source, &source_guard)
+            .unwrap()
+            .unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"replacement").unwrap();
+        std::fs::rename(&staged, &link).unwrap();
+        set_short_wait_for_this_thread();
+        assert!(acquire(&link)
+            .unwrap_err()
+            .to_string()
+            .contains("locked by another writer"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        drop(dest);
     }
 }

@@ -58,6 +58,28 @@ struct Journal {
     new_sidecar: Generation,
 }
 
+pub(super) fn private_dir(parent: &Path, prefix: &str) -> Result<tempfile::TempDir, String> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent).map_err(|e| e.to_string())
+}
+
+fn private_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
 fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     fs::File::open(path)
@@ -72,11 +94,7 @@ fn sync_dir(path: &Path) -> Result<(), String> {
 /// prepared directory is private; targets are fresh files, never reused paths.
 pub(super) fn copy_file(source: &Path, target: &Path) -> Result<Generation, String> {
     let mut input = crate::source::open_regular_no_follow(source).map_err(|e| e.to_string())?;
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .map_err(|e| e.to_string())?;
+    let mut output = private_options().open(target).map_err(|e| e.to_string())?;
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
     loop {
         let n = input.read(&mut *buf).map_err(|e| e.to_string())?;
@@ -127,10 +145,7 @@ fn replace_from(
 fn cleanup(path: &Path) -> Result<(), String> {
     // Remove the recovery marker atomically before garbage collection. A crash
     // can leave a private GC directory, never a half-deleted active journal.
-    let gc = tempfile::Builder::new()
-        .prefix(".aerostrip-gc-")
-        .tempdir_in(output_parent_dir(path))
-        .map_err(|e| e.to_string())?;
+    let gc = private_dir(output_parent_dir(path), ".aerostrip-gc-")?;
     fs::remove_dir(gc.path()).map_err(|e| e.to_string())?;
     fs::rename(path, gc.path()).map_err(|e| e.to_string())?;
     sync_dir(output_parent_dir(path))?;
@@ -234,7 +249,13 @@ fn load(path: &Path, source: &Path) -> Result<(Journal, PathBuf), String> {
     Ok((journal, recorded))
 }
 
-fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<(), String> {
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryOutcome {
+    Original,
+    Stripped,
+}
+
+fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<RecoveryOutcome, String> {
     if !lock.covers_namespace(source) {
         return Err("strip source lock namespace changed".to_string());
     }
@@ -248,10 +269,13 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<(), St
         generation(source).map_err(|e| conflict(path, &format!("vault unavailable: {e}")))?;
     let sidecar_now =
         generation(&sidecar).map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
-    if vault_now == journal.new_vault && sidecar_now == journal.new_sidecar
-        || vault_now == journal.old_vault && sidecar_now == journal.old_sidecar
-    {
-        return cleanup(path);
+    if vault_now == journal.new_vault && sidecar_now == journal.new_sidecar {
+        cleanup(path)?;
+        return Ok(RecoveryOutcome::Stripped);
+    }
+    if vault_now == journal.old_vault && sidecar_now == journal.old_sidecar {
+        cleanup(path)?;
+        return Ok(RecoveryOutcome::Original);
     }
     if ![journal.old_vault, journal.new_vault].contains(&vault_now)
         || ![journal.old_sidecar, journal.new_sidecar].contains(&sidecar_now)
@@ -276,11 +300,12 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<(), St
         journal.old_sidecar,
         sidecar_now,
     )?;
-    cleanup(path)
+    cleanup(path)?;
+    Ok(RecoveryOutcome::Original)
 }
 
-/// Normal readers stay lock-free unless a pending strip needs recovery. All
-/// writers call this before taking their usual guard, including correction tools.
+/// Readers stay lock-free unless a pending strip needs recovery. Writers use
+/// recover_under_guard after acquiring their source guard, including after waits.
 pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
     let source = crate::lock::anchored(source).map_err(|e| e.to_string())?;
     // Readers may use a leaf link or a Windows short name. Find the original
@@ -299,13 +324,23 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
         Ok(_) => {}
     }
     let lock = crate::lock::acquire_without_recovery(&source).map_err(|e| e.to_string())?;
-    // Another holder may have completed/rolled back before we acquired it.
-    if !path.exists() {
-        return Ok(());
+    recover_under_guard(&lock)
+}
+
+pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
+    let source = lock.source_path();
+    let path = journal_path(source);
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => {}
     }
-    let sidecar = super::ec::default_sidecar_path(&source);
+    if !lock.covers_namespace(source) {
+        return Err("pending strip recovery requires a real source lock".to_string());
+    }
+    let sidecar = super::ec::default_sidecar_path(source);
     let _sidecar = crate::lock::acquire(&sidecar).map_err(|e| e.to_string())?;
-    recover_locked(&source, &path, &lock)
+    recover_locked(source, &path, lock).map(|_| ())
 }
 
 /// The caller has prepared old/new vault and sidecar files in a private temp
@@ -332,9 +367,7 @@ pub(super) fn publish(
             "vault or sidecar changed while preparing strip; originals left unchanged".to_string(),
         );
     }
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut file = private_options()
         .open(prepared.path().join("journal.json"))
         .map_err(|e| e.to_string())?;
     file.write_all(&serde_json::to_vec(&journal).map_err(|e| e.to_string())?)
@@ -345,6 +378,10 @@ pub(super) fn publish(
     let path = journal_path(source);
     if path.exists() {
         return Err("pending strip transaction already exists; reopen vault first".to_string());
+    }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_STRIP_JOURNAL.with(|h| h.borrow_mut().take()) {
+        hook();
     }
     fs::rename(prepared.path(), &path).map_err(|e| format!("publish strip journal: {e}"))?;
     sync_dir(output_parent_dir(source))?;
@@ -360,6 +397,10 @@ pub(super) fn publish(
             hook();
         }
         fs::rename(path.join("new-sidecar"), &sidecar).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if FAIL_FINAL_SYNC.with(|fail| fail.replace(false)) {
+            return Err("injected final directory sync failure".to_string());
+        }
         sync_dir(output_parent_dir(source))?;
         #[cfg(test)]
         if let Some(hook) = AFTER_STRIP_SIDECAR.with(|h| h.borrow_mut().take()) {
@@ -369,7 +410,8 @@ pub(super) fn publish(
     })();
     if let Err(error) = result {
         return Err(match recover_locked(source, &path, lock) {
-            Ok(()) => format!("Could not publish stripped vault and sidecar ({error}); original vault restored"),
+            Ok(RecoveryOutcome::Original) => format!("Could not publish stripped vault and sidecar ({error}); original vault restored"),
+            Ok(RecoveryOutcome::Stripped) => format!("Strip publication completed, but final durability sync failed ({error}); stripped vault and refreshed sidecar remain, journal retired"),
             Err(restore) => format!("Could not publish strip ({error}); recovery pending ({restore}); rollback copies retained in {}", path.display()),
         });
     }
@@ -378,6 +420,8 @@ pub(super) fn publish(
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static FAIL_FINAL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static BEFORE_STRIP_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_STRIP_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_STRIP_VAULT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_STRIP_SIDECAR: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -413,5 +457,26 @@ mod tests {
         fs::write(&b, b"identical bytes").unwrap();
         assert!(!same_existing_file(&a, &b));
         assert!(same_existing_file(&a, &a));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn review_strip_preparation_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let prepared = private_dir(root.path(), ".aerostrip-prepare-").unwrap();
+        assert_eq!(
+            fs::metadata(prepared.path()).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let original = root.path().join("private.aerozip");
+        fs::write(&original, b"private plaintext").unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o600)).unwrap();
+        let backup = prepared.path().join("old-vault");
+        copy_file(&original, &backup).unwrap();
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        assert_eq!(fs::read(backup).unwrap(), b"private plaintext");
     }
 }
