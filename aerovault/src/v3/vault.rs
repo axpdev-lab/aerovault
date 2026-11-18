@@ -613,7 +613,8 @@ impl VaultV3 {
             return Err("Password must be at least 8 characters".to_string());
         }
         let lock = write_lock(&vault.path)?;
-        let sidecar = super::ec::default_sidecar_path(&vault.path);
+        vault.path = lock.source_path().to_path_buf();
+        let sidecar = super::ec::default_sidecar_path(lock.source_path());
         // An export from another source can target this path too. Lock before
         // the existence check, even when no sidecar has been published yet.
         let sidecar_lock =
@@ -624,6 +625,15 @@ impl VaultV3 {
                 // a default export nor a competing writer can publish it.
                 None
             };
+        if sidecar_lock.is_some() {
+            super::ec::validate_automatic_sidecar_destination(&sidecar)?;
+        }
+        if super::ec::legacy_sidecar_path(lock.source_path()).is_some_and(|p| p.exists()) {
+            // This ambiguous old name can be shared by several byte-distinct
+            // vaults. Never silently leave an automatically used old-password
+            // recovery copy, or delete/overwrite another vault's shared copy.
+            return Err("Legacy lossy-name recovery file exists; migrate the verified recovery file to the native sidecar path and retire the shared legacy name before changing the password".to_string());
+        }
         let refresh = sidecar.exists();
         if (refresh || has_embedded_parity(vault)) && !super::ec::scrub_vault(vault).is_empty() {
             return Err(
@@ -2117,7 +2127,10 @@ fn create_empty_vault(
     // Refuse sidecar contention before replacing even the container itself.
     let sidecar_lock = if error_correction.is_some_and(|p| p.writes_sidecar()) {
         let out = super::ec::default_sidecar_path(path);
-        crate::lock::acquire_destination(&out, path, &_lock).map_err(|e| e.to_string())?
+        let guard =
+            crate::lock::acquire_destination(&out, path, &_lock).map_err(|e| e.to_string())?;
+        super::ec::validate_automatic_sidecar_destination(&out)?;
+        guard
     } else {
         None
     };
@@ -2203,7 +2216,7 @@ fn refresh_sidecar(
     sidecar_lock: &Option<WriteLock>,
 ) -> Result<(), String> {
     let Err(e) = super::ec::export_parity_under_locks(
-        &vault.path,
+        lock.source_path(),
         new_password,
         sidecar,
         lock,
@@ -2245,6 +2258,15 @@ fn open_vault_with(
 ) -> Result<OpenVaultV3, String> {
     let path =
         crate::lock::anchored(&path.into()).map_err(|e| format!("Resolve vault parent: {e}"))?;
+    // A regular Windows leaf can be an 8.3 alias. Retain the long namespace
+    // spelling for recovery reads and later default-sidecar writes. A symbolic
+    // leaf remains symbolic so a later replacing write still refuses it.
+    #[cfg(windows)]
+    let path = if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+        std::fs::canonicalize(&path).map_err(|e| format!("Resolve vault leaf: {e}"))?
+    } else {
+        path
+    };
     super::strip_transaction::recover_if_pending(&path)?;
     let mut file = crate::source::open_regular(&path).map_err(|e| format!("Open vault: {e}"))?;
     let file_len = file
@@ -3339,6 +3361,18 @@ mod tests {
         assert_eq!(std::fs::read(&sidecar).unwrap(), before);
         assert!(!path.exists(), "failed creation replaced the source first");
         drop(held);
+        // Releasing the lock is not permission to overwrite the foreign vault.
+        let error = VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap_err();
+        assert!(error.contains("contains a vault"), "{error}");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+        assert!(!path.exists());
+        // Explicit fixture cleanup allows a normal seed/export for the rotation check.
+        std::fs::remove_file(&sidecar).unwrap();
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new(&path, PW),
             RecoveryPlacement::Both,
@@ -5225,5 +5259,87 @@ mod tests {
         assert!(VaultV3::open_plaintext(&path)
             .unwrap_err()
             .contains("identity"));
+    }
+    #[test]
+    fn review_create_and_rotate_refuse_automatic_sidecar_collisions() {
+        use super::super::ec::{default_sidecar_path, RecoveryPlacement};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.aerovault");
+        let sidecar = default_sidecar_path(&path);
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        for placement in [RecoveryPlacement::Detached, RecoveryPlacement::Both] {
+            assert!(VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&path, PW),
+                placement,
+                20
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        std::fs::remove_dir(&sidecar).unwrap();
+        VaultV3::create(&CreateOptionsV3::new(&sidecar, PW)).unwrap();
+        let foreign = std::fs::read(&sidecar).unwrap();
+        assert!(VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Both,
+            20
+        )
+        .is_err());
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        assert!(VaultV3::change_password(&mut vault, "new-password-123").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), foreign);
+        assert!(VaultV3::open(&path, PW).is_ok());
+        assert!(VaultV3::open(&sidecar, PW).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn review_windows_short_name_rotation_refreshes_long_name_sidecar() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetShortPathNameW(long: *const u16, short: *mut u16, capacity: u32) -> u32;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long-owned-vault-namespace.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            super::super::ec::RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let long = std::fs::canonicalize(&path).unwrap();
+        let wide: Vec<u16> = long.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 32768];
+        let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        assert!(
+            len > 0 && len < buf.len(),
+            "GetShortPathNameW failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]));
+        if short == long {
+            eprintln!("8.3 names disabled on this volume; native alias case unavailable");
+            return;
+        }
+        let sidecar = super::super::ec::default_sidecar_path(&long);
+        let before = std::fs::read(&sidecar).unwrap();
+        let mut vault = VaultV3::open(&short, PW).unwrap();
+        assert_eq!(vault.path, long);
+        VaultV3::change_password(&mut vault, "new-password-123").unwrap();
+        assert_ne!(std::fs::read(&sidecar).unwrap(), before);
+        let mut damaged = std::fs::read(&long).unwrap();
+        damaged[super::super::constants::HEADER_MAC_OFFSET] ^= 1;
+        std::fs::write(&long, damaged).unwrap();
+        assert!(VaultV3::open(&long, PW).is_err());
+        assert!(
+            VaultV3::open(&long, "new-password-123")
+                .unwrap()
+                .header_repaired_on_open
+        );
     }
 }

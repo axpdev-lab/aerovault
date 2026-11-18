@@ -27,10 +27,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::ERROR_CORRECTION_SHARD_CKSUM_LEN;
-use super::{
-    error_correction_grid, ERROR_CORRECTION_MAX_PCT, ERROR_CORRECTION_MAX_SHARD,
-    ERROR_CORRECTION_MIN_SHARD,
-};
+use super::{error_correction_grid, ERROR_CORRECTION_MAX_SHARD, ERROR_CORRECTION_MIN_SHARD};
 
 /// Magic for a unified detached recovery file: "AEROCORR".
 pub const AEROCORRECT_MAGIC: &[u8; 8] = b"AEROCORR";
@@ -593,8 +590,8 @@ fn avec_len_for_checked(content_len: u64, pct: u32) -> Option<u64> {
 }
 
 fn validate_segment_avec_len(window_len: u64, avec_len: u64) -> Result<(), String> {
-    let max_len = avec_len_for_checked(window_len, ERROR_CORRECTION_MAX_PCT)
-        .ok_or("aerocorrect sidecar segment AVEC length geometry overflows")?;
+    let max_len = super::parity_payload_bound(window_len)
+        .map_err(|e| format!("aerocorrect sidecar segment AVEC length geometry: {e}"))?;
     if avec_len > max_len {
         return Err(format!(
             "aerocorrect sidecar segment AVEC length {avec_len} exceeds maximum {max_len} for window length {window_len}"
@@ -1430,8 +1427,8 @@ mod tests {
 
     #[test]
     fn rejects_segment_avec_len_above_window_max_before_reading_payload() {
-        let max_avec = avec_len_for(1, ERROR_CORRECTION_MAX_PCT);
-        // A directory claiming an AVEC longer than any legal payload for its window is
+        let max_avec = super::super::parity_payload_bound(1).unwrap();
+        // A directory claiming an AVEC beyond the monotone allocation bound is
         // rejected by `validate_segment_avec_len` before the payload is materialized.
         let oversize = AeroCorrectSidecar::new(
             sha256(&[0u8]),
@@ -1511,5 +1508,24 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("file-size bound"), "{error}");
+    }
+    #[test]
+    fn review_partial_shards_round_trip_below_fifty_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [16_384, 16_385] {
+            for pct in [20, 50] {
+                let sc = single_segment(&sample(len), pct);
+                for bytes in [v1_encode(&sc), sc.to_bytes()] {
+                    assert_eq!(AeroCorrectSidecar::from_bytes(&bytes).unwrap(), sc);
+                    let path = dir.path().join("partial.aerocorrect");
+                    std::fs::write(&path, &bytes).unwrap();
+                    let mut reader = AeroCorrectSidecarReader::open(&path).unwrap();
+                    assert_eq!(
+                        reader.read_segment_avec(0).unwrap(),
+                        sc.segments[0].avec_bytes
+                    );
+                }
+            }
+        }
     }
 }

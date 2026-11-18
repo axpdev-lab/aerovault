@@ -126,6 +126,51 @@ pub(super) fn default_sidecar_path(vault_path: &Path) -> PathBuf {
     PathBuf::from(native)
 }
 
+pub(super) fn legacy_sidecar_path(vault: &Path) -> Option<PathBuf> {
+    let old = PathBuf::from(crate::error_correction::sidecar::aerocorrect_sidecar_path(
+        &vault.to_string_lossy(),
+    ));
+    (old != default_sidecar_path(vault)).then_some(old)
+}
+
+fn recovery_sidecar_path(vault: &Path) -> PathBuf {
+    let native = default_sidecar_path(vault);
+    if std::fs::symlink_metadata(&native).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        if let Some(legacy) = legacy_sidecar_path(vault).filter(|p| p.exists()) {
+            return legacy;
+        }
+    }
+    native
+}
+
+/// An automatic recovery filename is not authorization to replace another
+/// vault or a non-file. Call only while its destination guard is held.
+pub(super) fn validate_automatic_sidecar_destination(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Inspect automatic sidecar destination: {e}")),
+        Ok(meta) if !meta.is_file() => {
+            return Err(
+                "Automatic sidecar destination is not a regular file; vault left unchanged"
+                    .to_string(),
+            )
+        }
+        Ok(_) => {}
+    }
+    let file = crate::source::open_regular_no_follow(path).map_err(|e| e.to_string())?;
+    let mut magic = Vec::with_capacity(10);
+    file.take(10)
+        .read_to_end(&mut magic)
+        .map_err(|e| e.to_string())?;
+    if !magic.is_empty()
+        && (super::constants::MAGIC.starts_with(&magic)
+            || crate::constants::MAGIC.starts_with(&magic))
+    {
+        return Err("Automatic sidecar destination contains a vault; move it aside or choose an explicit output path".to_string());
+    }
+    Ok(())
+}
+
 /// SHA-256 of a byte slice (the unified `.aerocorrect` format binds by content).
 fn container_sha256(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -339,7 +384,7 @@ pub(super) fn resolve_parity_source(
             ParitySource::Explicit,
         ));
     }
-    let sidecar_path = default_sidecar_path(&vault.path);
+    let sidecar_path = recovery_sidecar_path(&vault.path);
     if sidecar_path.exists() {
         let parity = read_vault_segment(
             &vault.path,
@@ -364,7 +409,7 @@ pub(super) fn resolve_parity_source(
 /// A parsed empty creation seed has no recovery to protect. Missing sidecars
 /// likewise do not block salvage; unreadable/malformed recovery stays protected.
 pub(super) fn detached_recovery_needs_protection(path: &Path) -> bool {
-    let sidecar = default_sidecar_path(path);
+    let sidecar = recovery_sidecar_path(path);
     if !sidecar.exists() {
         return false;
     }
@@ -414,7 +459,14 @@ pub(super) fn export_parity(
     if let Some(p) = out_path {
         crate::lock::refuse_destination(p, vault_path).map_err(|e| e.to_string())?;
     }
-    let lock = crate::lock::acquire_for_export(vault_path).map_err(|e| e.to_string())?;
+    // Export only reads its source: resolve a leaf link, lock its target, and
+    // keep output checks against both the supplied alias and the real source.
+    let real =
+        std::fs::canonicalize(vault_path).map_err(|e| format!("Resolve export source: {e}"))?;
+    if let Some(p) = out_path {
+        crate::lock::refuse_destination(p, &real).map_err(|e| e.to_string())?;
+    }
+    let lock = crate::lock::acquire_for_export(&real).map_err(|e| e.to_string())?;
     #[cfg(test)]
     if let Some(hook) = AFTER_EXPORT_SOURCE_LOCK.with(|h| h.borrow_mut().take()) {
         hook();
@@ -443,6 +495,9 @@ pub(super) fn export_parity_locked(
     let out = crate::lock::anchored(&out).map_err(|e| e.to_string())?;
     let out_lock =
         crate::lock::acquire_destination(&out, vault_path, _lock).map_err(|e| e.to_string())?;
+    if out_path.is_none() {
+        validate_automatic_sidecar_destination(&out)?;
+    }
     export_parity_under_locks(vault_path, password, &out, _lock, &out_lock)
 }
 
@@ -869,7 +924,7 @@ pub(super) fn recover_header_from_sidecar(
     on_disk_header: &[u8],
     password: &str,
 ) -> Result<Option<UnlockedHeader>, String> {
-    let sidecar_path = default_sidecar_path(vault_path);
+    let sidecar_path = recovery_sidecar_path(vault_path);
     if !sidecar_path.exists() {
         return Ok(None);
     }
@@ -898,6 +953,14 @@ pub(super) fn recover_header_from_sidecar(
         Some(b) if b.len() == HEADER_SIZE => b,
         _ => return Ok(None),
     };
+    if sidecar_path != default_sidecar_path(vault_path)
+        && on_disk_header.get(12..124) != rebuilt.get(12..124)
+    {
+        // Different raw salt/wrapped keys can belong to another vault sharing
+        // this lossy name. Without unchanged key material, require an explicit
+        // owner-selected migration rather than guessing that file's identity.
+        return Err("Legacy recovery name is ambiguous because stored key material differs; copy the verified recovery file to the native .aerocorrect path before recovery".to_string());
+    }
     match open_header_bytes(&rebuilt, password) {
         Ok(triple) => Ok(Some(triple)),
         Err(_) => Ok(None),
@@ -912,7 +975,7 @@ pub(super) fn reconstruct_manifest_from_sidecar(
     vault_path: &Path,
     on_disk_manifest: &[u8],
 ) -> Result<Option<Vec<u8>>, String> {
-    let sidecar_path = default_sidecar_path(vault_path);
+    let sidecar_path = recovery_sidecar_path(vault_path);
     if !sidecar_path.exists() {
         return Ok(None);
     }
@@ -2328,6 +2391,19 @@ mod tests {
             VaultV3::export_parity(&path, PW, None).unwrap();
             let old_vault = std::fs::read(&path).unwrap();
             let old_sidecar = std::fs::read(default_sidecar_path(&path)).unwrap();
+            #[cfg(unix)]
+            let old_sidecar_inode = {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+                std::fs::set_permissions(
+                    default_sidecar_path(&path),
+                    std::fs::Permissions::from_mode(0o640),
+                )
+                .unwrap();
+                std::fs::metadata(default_sidecar_path(&path))
+                    .unwrap()
+                    .ino()
+            };
             let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "v3::ec::tests::review_strip_restarts_with_usable_metadata_at_each_publication_boundary", "--nocapture"])
                 .env(KEY, dir.path()).env("AEROVAULT_STRIP_RESTART_PHASE", phase).spawn().unwrap());
@@ -2383,6 +2459,21 @@ mod tests {
 
             assert!(!super::super::strip_transaction::journal_path(&path).exists());
             if phase != "sidecar" {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    assert_eq!(
+                        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                        0o640
+                    );
+                    let meta = std::fs::metadata(default_sidecar_path(&path)).unwrap();
+                    assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+                    assert_eq!(
+                        meta.ino(),
+                        old_sidecar_inode,
+                        "untouched original sidecar was replaced"
+                    );
+                }
                 assert_eq!(std::fs::read(&path).unwrap(), old_vault);
                 assert_eq!(
                     std::fs::read(default_sidecar_path(&path)).unwrap(),
@@ -2585,7 +2676,9 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    // The fixture needs a filesystem accepting arbitrary native byte names;
+    // macOS rejects its directory name with EILSEQ before vault code runs.
+    #[cfg(target_os = "linux")]
     #[test]
     fn review_native_non_utf8_paths_remain_writable_and_recoverable() {
         use std::os::unix::ffi::OsStringExt;
@@ -2757,5 +2850,154 @@ mod tests {
                 assert!(reopened.manifest.entries.iter().any(|e| e.path == "waiter"));
             }
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn review_export_accepts_read_only_leaf_link_and_protects_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.aerovault");
+        let alias = dir.path().join("alias.aerovault");
+        let out = dir.path().join("custom.aerocorrect");
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        VaultV3::export_parity(&alias, PW, Some(&out)).unwrap();
+        let reader =
+            crate::error_correction::sidecar::AeroCorrectSidecarReader::open(&out).unwrap();
+        reader.verify_binding(&container_sha256(&before)).unwrap();
+        assert!(VaultV3::export_parity(&alias, PW, Some(&alias)).is_err());
+        assert!(VaultV3::export_parity(&alias, PW, Some(&path)).is_err());
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn review_automatic_sidecar_refuses_vault_published_during_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.aerovault");
+        let other = dir.path().join("other.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        VaultV3::create(&CreateOptionsV3::new(&other, PW)).unwrap();
+        let other_bytes = std::fs::read(&other).unwrap();
+        let sidecar = default_sidecar_path(&path);
+        let guard = crate::lock::acquire(&sidecar).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let p = path.clone();
+            let worker = scope.spawn(move || {
+                crate::lock::ON_LOCK_CONTENTION.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        tx.send(()).unwrap();
+                    }))
+                });
+                VaultV3::export_parity(&p, PW, None)
+            });
+            let waited = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            if waited {
+                std::fs::write(&sidecar, &other_bytes).unwrap();
+            }
+            drop(guard);
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(waited, "export did not encounter destination guard");
+            assert!(error.contains("contains a vault"), "{error}");
+        });
+        assert_eq!(std::fs::read(&sidecar).unwrap(), other_bytes);
+        assert!(VaultV3::open(&sidecar, PW).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_legacy_lossy_sidecar_recovers_without_mutating_shared_name() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(std::ffi::OsString::from_vec(
+            b"vault-\xff.aerovault".to_vec(),
+        ));
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        seed_tree(&mut vault, dir.path());
+        drop(vault);
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let native = default_sidecar_path(&path);
+        let legacy = legacy_sidecar_path(&path).unwrap();
+        std::fs::rename(&native, &legacy).unwrap();
+        let parity = std::fs::read(&legacy).unwrap();
+        let healthy = std::fs::read(&path).unwrap();
+        let info = VaultV3::open(&path, PW).unwrap();
+        let manifest_offset = info.header.manifest_offset as usize;
+        for offset in [
+            super::super::constants::HEADER_MAC_OFFSET,
+            manifest_offset + 4,
+        ] {
+            let mut damaged = healthy.clone();
+            damaged[offset] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            let recovered = VaultV3::open(&path, PW).unwrap();
+            if offset == manifest_offset + 4 {
+                assert!(recovered.manifest_repaired_on_open);
+            } else {
+                assert!(recovered.header_repaired_on_open);
+            }
+            assert!(VaultV3::open(&path, "incorrect-password-123").is_err());
+            assert!(!native.exists());
+            assert_eq!(std::fs::read(&legacy).unwrap(), parity);
+        }
+        std::fs::write(&path, &healthy).unwrap();
+        corrupt_data_section(&path, 32);
+        let mut damaged = VaultV3::open(&path, PW).unwrap();
+        assert!(VaultV3::create_directory(&mut damaged, "refused")
+            .unwrap_err()
+            .contains("damaged blocks"));
+        assert!(VaultV3::repair(&mut damaged, false, None).unwrap().0 > 0);
+        assert!(VaultV3::scrub(&VaultV3::open(&path, PW).unwrap()).is_empty());
+        assert_eq!(std::fs::read(&legacy).unwrap(), parity);
+        std::fs::write(&path, &healthy).unwrap();
+        let mut current = VaultV3::open(&path, PW).unwrap();
+        assert!(VaultV3::change_password(&mut current, "new-password-123")
+            .unwrap_err()
+            .contains("Legacy lossy-name"));
+        assert_eq!(std::fs::read(&path).unwrap(), healthy);
+        // A same-password foreign sidecar at the ambiguous legacy name cannot substitute its header.
+        let foreign = dir.path().join("foreign.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&foreign, PW),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let foreign_parity = std::fs::read(default_sidecar_path(&foreign)).unwrap();
+        std::fs::write(&legacy, &foreign_parity).unwrap();
+        let mut damaged = healthy.clone();
+        damaged[super::super::constants::HEADER_MAC_OFFSET] ^= 1;
+        std::fs::write(&path, &damaged).unwrap();
+        assert!(VaultV3::open(&path, PW).is_err());
+        assert_eq!(std::fs::read(&legacy).unwrap(), foreign_parity);
+        std::fs::write(&legacy, &parity).unwrap();
+        // A present native file takes priority: do not hide its damage with a legacy copy.
+        std::fs::write(&native, b"broken native sidecar").unwrap();
+        assert!(VaultV3::open(&path, PW).is_err());
+        std::fs::remove_file(&native).unwrap();
+        std::fs::write(&path, &healthy).unwrap();
+        // Explicit owner migration permits rotation; only the new password can recover afterwards.
+        std::fs::rename(&legacy, &native).unwrap();
+        let mut current = VaultV3::open(&path, PW).unwrap();
+        VaultV3::change_password(&mut current, "new-password-123").unwrap();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged[super::super::constants::HEADER_MAC_OFFSET] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        assert!(VaultV3::open(&path, PW).is_err());
+        assert!(
+            VaultV3::open(&path, "new-password-123")
+                .unwrap()
+                .header_repaired_on_open
+        );
     }
 }

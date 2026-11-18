@@ -48,6 +48,39 @@ pub(super) fn journal_path(source: &Path) -> PathBuf {
 }
 
 #[derive(Serialize, Deserialize)]
+struct SavedPermissions {
+    unix_mode: Option<u32>,
+    readonly: bool,
+}
+impl SavedPermissions {
+    fn capture(path: &Path) -> Result<Self, String> {
+        let p = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+        #[cfg(unix)]
+        let unix_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(p.mode() & 0o777)
+        };
+        #[cfg(not(unix))]
+        let unix_mode = None;
+        Ok(Self {
+            unix_mode,
+            readonly: p.readonly(),
+        })
+    }
+    fn apply(&self, path: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(mode) = self.unix_mode {
+            use std::os::unix::fs::PermissionsExt;
+            return fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+                .map_err(|e| e.to_string());
+        }
+        let mut permissions = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+        permissions.set_readonly(self.readonly);
+        fs::set_permissions(path, permissions).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     version: u8,
@@ -56,6 +89,10 @@ struct Journal {
     new_vault: Generation,
     old_sidecar: Generation,
     new_sidecar: Generation,
+    #[serde(default)]
+    old_vault_permissions: Option<SavedPermissions>,
+    #[serde(default)]
+    old_sidecar_permissions: Option<SavedPermissions>,
 }
 
 pub(super) fn private_dir(parent: &Path, prefix: &str) -> Result<tempfile::TempDir, String> {
@@ -112,6 +149,7 @@ fn replace_from(
     target: &Path,
     expected: Generation,
     target_before: Generation,
+    permissions: Option<&SavedPermissions>,
 ) -> Result<(), String> {
     if generation(source)? != expected {
         return Err("strip rollback copy failed its generation check".to_string());
@@ -138,6 +176,11 @@ fn replace_from(
             "strip target changed while preparing rollback; newer file left untouched".to_string(),
         );
     }
+    if let Some(permissions) = permissions {
+        permissions.apply(temp.path())?;
+    }
+    // Backups remain private: permissions are restored only on the replacement.
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
     persist_over(temp, target).map_err(|e| e.to_string())?;
     sync_dir(output_parent_dir(target))
 }
@@ -288,18 +331,24 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     {
         return Err("strip rollback generation check failed; files left untouched".to_string());
     }
-    replace_from(
-        &path.join("old-vault"),
-        source,
-        journal.old_vault,
-        vault_now,
-    )?;
-    replace_from(
-        &path.join("old-sidecar"),
-        &sidecar,
-        journal.old_sidecar,
-        sidecar_now,
-    )?;
+    if vault_now != journal.old_vault {
+        replace_from(
+            &path.join("old-vault"),
+            source,
+            journal.old_vault,
+            vault_now,
+            journal.old_vault_permissions.as_ref(),
+        )?;
+    }
+    if sidecar_now != journal.old_sidecar {
+        replace_from(
+            &path.join("old-sidecar"),
+            &sidecar,
+            journal.old_sidecar,
+            sidecar_now,
+            journal.old_sidecar_permissions.as_ref(),
+        )?;
+    }
     cleanup(path)?;
     Ok(RecoveryOutcome::Original)
 }
@@ -358,6 +407,8 @@ pub(super) fn publish(
         new_vault: generation(&prepared.path().join("new-vault"))?,
         old_sidecar: generation(&prepared.path().join("old-sidecar"))?,
         new_sidecar: generation(&prepared.path().join("new-sidecar"))?,
+        old_vault_permissions: Some(SavedPermissions::capture(source)?),
+        old_sidecar_permissions: Some(SavedPermissions::capture(&sidecar)?),
     };
     if !lock.covers_namespace(source)
         || generation(source)? != journal.old_vault
@@ -367,11 +418,14 @@ pub(super) fn publish(
             "vault or sidecar changed while preparing strip; originals left unchanged".to_string(),
         );
     }
+    let encoded = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
+    if encoded.len() > 4096 {
+        return Err("strip journal exceeds size limit; originals left unchanged".to_string());
+    }
     let mut file = private_options()
         .open(prepared.path().join("journal.json"))
         .map_err(|e| e.to_string())?;
-    file.write_all(&serde_json::to_vec(&journal).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    file.write_all(&encoded).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
     sync_dir(prepared.path())?;

@@ -519,10 +519,6 @@ pub fn verify_repair_sync_file(
     // ERROR_ACCESS_DENIED (os error 5) (audit M1). The repair loop above is the only
     // reader of `src`, so the handle is safe to drop here.
     drop(src);
-    // Preserve the original file's permissions across the atomic replace.
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
-    }
     tmp.as_file()
         .sync_all()
         .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
@@ -530,6 +526,13 @@ pub fn verify_repair_sync_file(
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
     write_if_unchanged(path, &finalize_sha256(read_hasher), |locked_path| {
+        // The private stage stays private throughout any wait. Permission-only
+        // changes do not affect the content hash, so sample them under guard.
+        let permissions = std::fs::metadata(locked_path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        tmp.as_file().sync_all().map_err(|e| e.to_string())?;
         crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
@@ -665,9 +668,6 @@ fn repair_streamed(
     // ERROR_ACCESS_DENIED (os error 5) (audit M1). The repair loop above is the only
     // reader of `src`, so the handle is safe to drop here.
     drop(src);
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
-    }
     tmp.as_file()
         .sync_all()
         .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
@@ -675,6 +675,13 @@ fn repair_streamed(
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
     write_if_unchanged(path, &finalize_sha256(read_hasher), |locked_path| {
+        // The private stage stays private throughout any wait. Permission-only
+        // changes do not affect the content hash, so sample them under guard.
+        let permissions = std::fs::metadata(locked_path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        tmp.as_file().sync_all().map_err(|e| e.to_string())?;
         crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
@@ -1531,5 +1538,56 @@ mod tests {
         assert!(err.contains("post-repair SHA-256"));
         // Original on disk is byte-for-byte untouched (temp discarded).
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn review_repair_applies_permissions_only_after_source_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("payload.bin");
+            let data = sample_data(40_000);
+            let generated = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let sidecar = dir.path().join("parity");
+            std::fs::write(&sidecar, &generated.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[5000] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let parent = dir.path().to_path_buf();
+            let target = path.clone();
+            BEFORE_WRITE_LOCK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let stage = std::fs::read_dir(&parent)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(".tmp"))
+                        .unwrap();
+                    assert_eq!(
+                        std::fs::metadata(stage).unwrap().permissions().mode() & 0o077,
+                        0
+                    );
+                    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }))
+            });
+            let result = if streamed {
+                verify_repair_sync_file_streamed("rel", &generated.file_sha256, &path, &sidecar)
+            } else {
+                verify_repair_sync_file(
+                    "rel",
+                    &generated.file_sha256,
+                    &path,
+                    &generated.sidecar_bytes,
+                )
+            }
+            .unwrap();
+            assert!(matches!(result, SyncEcRepairResult::Repaired { .. }));
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

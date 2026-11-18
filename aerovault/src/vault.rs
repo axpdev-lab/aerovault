@@ -1407,10 +1407,11 @@ impl Vault {
         // Windows readers must not keep the old source handle across rename.
         drop(source);
         rename_into_place(tmp.path(), &self.path)?;
-        fsync_parent_dir(&self.path)?;
-
+        // Rename commits the password change even when directory sync fails.
         self.header = new_header;
-
+        if let Err(error) = sync_password_change_parent(&self.path) {
+            return Err(crate::Error::Io(std::io::Error::other(format!("Password changed; use the new password, but durability could not be confirmed: {error}"))));
+        }
         Ok(())
     }
 
@@ -1674,6 +1675,19 @@ fn open_new_output_file(path: &Path, output_dir: &Path) -> crate::Result<File> {
         }
         Ok(file)
     }
+}
+
+#[cfg(test)]
+thread_local! { static FAIL_PASSWORD_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn sync_password_change_parent(path: &Path) -> crate::Result<()> {
+    #[cfg(test)]
+    if FAIL_PASSWORD_SYNC.with(|f| f.replace(false)) {
+        return Err(crate::Error::Io(std::io::Error::other(
+            "injected directory sync failure",
+        )));
+    }
+    fsync_parent_dir(path)
 }
 
 #[cfg(unix)]
@@ -2548,6 +2562,30 @@ mod tests {
             "vault::tests::review_legacy_password_rotation_streams_under_memory_limit",
             KEY,
             &path,
+        );
+    }
+    #[test]
+    fn review_legacy_password_sync_failure_reports_committed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("password.aerovault");
+        let mut vault = Vault::create(CreateOptions::new(&path, "old-password-123")).unwrap();
+        FAIL_PASSWORD_SYNC.with(|f| f.set(true));
+        let error = vault
+            .change_password("new-password-123")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Password changed") && error.contains("durability"),
+            "{error}"
+        );
+        assert!(Vault::open(&path, "old-password-123").is_err());
+        assert!(Vault::open(&path, "new-password-123").is_ok());
+        vault.create_directory("after-sync-failure").unwrap();
+        assert!(Vault::open(&path, "old-password-123").is_err());
+        assert!(Vault::open(&path, "new-password-123").is_ok());
+        assert_eq!(
+            vault.header.to_bytes().as_slice(),
+            &std::fs::read(&path).unwrap()[..HEADER_SIZE]
         );
     }
 }
