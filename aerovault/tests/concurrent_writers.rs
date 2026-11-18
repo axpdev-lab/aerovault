@@ -16,6 +16,54 @@ const TRIALS: usize = 40;
 const WRITERS: usize = 2;
 const ADDS: usize = 5;
 
+fn documented_refusal(error: &str) -> bool {
+    error == "Vault changed while this write was in progress; retry operation"
+        || error.starts_with("vault is locked by another writer (")
+            && error.ends_with("); retry when it has finished")
+}
+
+#[test]
+fn same_generation_handles_preserve_each_successful_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("directed.aerozip");
+    VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+    let mut a = VaultV3::open_plaintext(&path).unwrap();
+    let mut b = VaultV3::open_plaintext(&path).unwrap();
+    let source = dir.path().join("source");
+    std::fs::write(&source, b"directed data").unwrap();
+    let first = VaultV3::add_files(&mut a, &[(source.clone(), "first".to_string())]);
+    let second = VaultV3::add_files(&mut b, &[(source, "second".to_string())]);
+    assert!(first.is_ok());
+    let current = VaultV3::open_plaintext(&path).unwrap();
+    let entries = VaultV3::summary(&current).entries;
+    assert!(entries.iter().any(|e| e.path == "first"));
+    match second {
+        Ok(()) => assert!(entries.iter().any(|e| e.path == "second")),
+        Err(error) => {
+            assert!(documented_refusal(&error), "{error}");
+            assert!(!entries.iter().any(|e| e.path == "second"));
+        }
+    }
+}
+
+#[test]
+fn only_documented_refusals_are_expected() {
+    assert!(documented_refusal(
+        "vault is locked by another writer (x.aerolock); retry when it has finished"
+    ));
+    assert!(documented_refusal(
+        "Vault changed while this write was in progress; retry operation"
+    ));
+    for error in [
+        "writer lock setup blocked",
+        "unlocked input",
+        "changed password",
+        "file changed unexpectedly",
+    ] {
+        assert!(!documented_refusal(error), "accepted: {error}");
+    }
+}
+
 /// One trial: returns (adds reported Ok, adds refused, Ok adds missing).
 fn trial(dir: &Path, t: usize) -> (usize, usize, usize) {
     let vault = dir.join(format!("t{t}.aerozip"));
@@ -44,7 +92,7 @@ fn trial(dir: &Path, t: usize) -> (usize, usize, usize) {
                         match res {
                             Ok(()) => ok.push(name),
                             // A refusal is a correct outcome; a lost update is not.
-                            Err(e) if e.contains("changed") || e.contains("locked") => refused += 1,
+                            Err(e) if documented_refusal(&e) => refused += 1,
                             Err(e) => panic!("unexpected error: {e}"),
                         }
                     }

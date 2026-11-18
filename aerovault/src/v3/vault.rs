@@ -480,9 +480,9 @@ impl VaultV3 {
 
     /// Add files into the vault at the given vault-relative paths, then persist.
     pub fn add_files(vault: &mut OpenVaultV3, sources: &[(PathBuf, String)]) -> Result<(), String> {
-        write_op(vault, |v| {
+        write_op(vault, |v, lock| {
             append_sources_batched(v, sources)?;
-            save_open_vault(v)
+            save_locked(v, lock)
         })
     }
 
@@ -505,12 +505,12 @@ impl VaultV3 {
             };
             mapped.push((source.clone(), entry_path));
         }
-        write_op(vault, |v| {
+        write_op(vault, |v, lock| {
             if !target.is_empty() {
                 create_directory_in_manifest(&mut v.manifest, target)?;
             }
             append_sources_batched(v, &mapped)?;
-            save_open_vault(v)
+            save_locked(v, lock)
         })
     }
 
@@ -518,9 +518,9 @@ impl VaultV3 {
     /// Returns `true` when the leaf directory was newly created, `false` when it
     /// already existed.
     pub fn create_directory(vault: &mut OpenVaultV3, dir_path: &str) -> Result<bool, String> {
-        write_op(vault, |v| {
+        write_op(vault, |v, lock| {
             let created = create_directory_in_manifest(&mut v.manifest, dir_path)?;
-            save_open_vault(v)?;
+            save_locked(v, lock)?;
             Ok(created)
         })
     }
@@ -532,7 +532,9 @@ impl VaultV3 {
         source_dir: &Path,
         target_prefix: Option<&str>,
     ) -> Result<(usize, usize), String> {
-        write_op(vault, |v| add_directory_into(v, source_dir, target_prefix))
+        write_op(vault, |v, lock| {
+            add_directory_into(v, source_dir, target_prefix, lock)
+        })
     }
 
     /// Delete a single entry (file or empty directory), then persist.
@@ -546,11 +548,11 @@ impl VaultV3 {
         entry_names: &[String],
         recursive: bool,
     ) -> Result<usize, String> {
-        write_op(vault, |v| {
+        write_op(vault, |v, lock| {
             // Compaction replaces the data section: keep the old one until the
             // save succeeds, so a failed delete leaves the handle as it was.
             let (removed, replaced) = delete_entries_from_manifest(v, entry_names, recursive)?;
-            if let Err(e) = save_open_vault(v) {
+            if let Err(e) = save_locked(v, lock) {
                 if let Some(data) = replaced {
                     v.data = data;
                 }
@@ -562,9 +564,9 @@ impl VaultV3 {
 
     /// Move (or rename across directories) an entry/subtree, then persist.
     pub fn move_entry(vault: &mut OpenVaultV3, from: &str, to: &str) -> Result<(), String> {
-        write_op(vault, |v| {
+        write_op(vault, |v, lock| {
             move_entry_in_manifest(v, from, to)?;
-            save_open_vault(v)
+            save_locked(v, lock)
         })
     }
 
@@ -580,17 +582,17 @@ impl VaultV3 {
             Some(parent) => join_vault_path(parent, &leaf),
             None => leaf,
         };
-        write_op(vault, |v| {
+        write_op(vault, |v, lock| {
             move_entry_in_manifest(v, &current, &target)?;
-            save_open_vault(v)
+            save_locked(v, lock)
         })
     }
 
     /// Copy an entry/subtree (reusing the same content chunks), then persist.
     pub fn copy_entry(vault: &mut OpenVaultV3, from: &str, to: &str) -> Result<(), String> {
-        write_op(vault, |v| {
+        write_op(vault, |v, lock| {
             copy_entry_in_manifest(v, from, to)?;
-            save_open_vault(v)
+            save_locked(v, lock)
         })
     }
 
@@ -614,13 +616,14 @@ impl VaultV3 {
         let sidecar = super::ec::default_sidecar_path(&vault.path);
         // An export from another source can target this path too. Lock before
         // the existence check, even when no sidecar has been published yet.
-        let sidecar_lock = if crate::lock::destination_name_fits(&sidecar) {
-            Some(crate::lock::acquire(&sidecar).map_err(|e| e.to_string())?)
-        } else {
-            // This basename cannot exist on the supported filesystem; neither
-            // a default export nor a competing writer can publish it.
-            None
-        };
+        let sidecar_lock =
+            if crate::lock::destination_can_exist(&sidecar).map_err(|e| e.to_string())? {
+                Some(crate::lock::acquire(&sidecar).map_err(|e| e.to_string())?)
+            } else {
+                // The destination filesystem refuses this basename; neither
+                // a default export nor a competing writer can publish it.
+                None
+            };
         let refresh = sidecar.exists();
         if (refresh || has_embedded_parity(vault)) && !super::ec::scrub_vault(vault).is_empty() {
             return Err(
@@ -1205,8 +1208,14 @@ fn progress_total(entries: &[&ManifestEntryV3]) -> u64 {
 /// it themselves.
 fn write_op<T>(
     vault: &mut OpenVaultV3,
-    op: impl FnOnce(&mut OpenVaultV3) -> Result<T, String>,
+    op: impl FnOnce(&mut OpenVaultV3, &WriteLock) -> Result<T, String>,
 ) -> Result<T, String> {
+    let lock = write_lock(&vault.path)?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_MUTATION_SIDECAR_LOCK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    let _sidecar_lock = lock_default_sidecar(&vault.path)?;
     if (has_embedded_parity(vault) || super::ec::detached_recovery_needs_protection(&vault.path))
         && !super::ec::scrub_vault(vault).is_empty()
     {
@@ -1214,12 +1223,39 @@ fn write_op<T>(
     }
     let manifest = vault.manifest.clone();
     let data_len = vault.data.len();
-    let result = op(vault);
+    let result = op(vault, &lock);
     if result.is_err() {
         vault.manifest = manifest;
         vault.data.truncate(data_len);
     }
     result
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static BEFORE_MUTATION_SIDECAR_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn lock_default_sidecar(path: &Path) -> Result<Option<WriteLock>, String> {
+    let sidecar = super::ec::default_sidecar_path(path);
+    if crate::lock::destination_can_exist(&sidecar).map_err(|e| e.to_string())? {
+        crate::lock::acquire(&sidecar)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(None)
+    }
+}
+
+pub(super) fn validate_chunk_identities(manifest: &VaultManifestV3) -> Result<(), String> {
+    if manifest
+        .chunks
+        .iter()
+        .any(|(key, record)| key != &record.id)
+    {
+        return Err("Vault chunk map key does not match record identity".to_string());
+    }
+    Ok(())
 }
 
 fn has_embedded_parity(vault: &OpenVaultV3) -> bool {
@@ -1815,7 +1851,7 @@ fn extract_file_entry(
 /// Resolve the directory an output/temp file lives in, mapping a parent-less or
 /// empty parent to the current directory. Shared by `atomic_write` and the
 /// streaming `extract_file_entry` so both place their temp beside the target.
-pub(super) fn output_parent_dir(target: &Path) -> &Path {
+pub(crate) fn output_parent_dir(target: &Path) -> &Path {
     target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1984,6 +2020,7 @@ fn create_empty_vault(
     std::fs::create_dir_all(output_parent_dir(path))
         .map_err(|e| format!("Create parent dir: {e}"))?;
     let _lock = write_lock(path)?;
+    let path = _lock.source_path();
 
     // Keys are zeroized on every return, the early ones included.
     let (salt, wrapped_master_key, wrapped_mac_key, master_key, mac_key, flags) = if plaintext {
@@ -2206,7 +2243,9 @@ fn open_vault_with(
     password: &str,
     encrypted_only: bool,
 ) -> Result<OpenVaultV3, String> {
-    let path = path.into();
+    let path =
+        crate::lock::anchored(&path.into()).map_err(|e| format!("Resolve vault parent: {e}"))?;
+    super::strip_transaction::recover_if_pending(&path)?;
     let mut file = crate::source::open_regular(&path).map_err(|e| format!("Open vault: {e}"))?;
     let file_len = file
         .metadata()
@@ -2370,6 +2409,7 @@ fn open_vault_with(
         return Err("AeroVault v3 header/manifest encryption-lane mismatch".to_string());
     }
     validate_manifest_paths(&manifest)?;
+    validate_chunk_identities(&manifest)?;
     #[cfg(test)]
     crate::lock::trace("decode");
 
@@ -2538,7 +2578,22 @@ pub(super) fn write_lock(path: &Path) -> Result<WriteLock, String> {
 
 /// [`save_open_vault`] for a caller that already holds the write lock, from
 /// the generation check to the rename, so no other writer can save between.
-pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<(), String> {
+pub(super) fn save_locked(vault: &mut OpenVaultV3, lock: &WriteLock) -> Result<(), String> {
+    let target = vault.path.clone();
+    save_locked_to(vault, lock, &target)
+}
+
+/// Seal to a private staging path without replacing the source. Used only by
+/// the two-file strip transaction; all generation checks still concern source.
+pub(super) fn save_locked_to(
+    vault: &mut OpenVaultV3,
+    lock: &WriteLock,
+    target: &Path,
+) -> Result<(), String> {
+    if !lock.covers_namespace(&vault.path) {
+        return Err("source lock namespace changed; retry operation".to_string());
+    }
+    validate_chunk_identities(&vault.manifest)?;
     assert_vault_generation_current(vault)?;
     // Writers refuse damaged blocks before mutating (`write_op`); repair saves
     // only a fully verified reconstruction.
@@ -2603,7 +2658,7 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
     // as `atomic_write`, via the shared helpers.
     let ((file_len, file_hash), header_bytes) = {
         use std::io::Write;
-        let parent = output_parent_dir(&vault.path);
+        let parent = output_parent_dir(target);
         std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
         let mut tmp = tempfile::Builder::new()
             .prefix(".aerovault-v3-")
@@ -2640,7 +2695,10 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
             .map_err(|e| format!("Read header: {e}"))?;
         #[cfg(test)]
         run_in_save_window_hook();
-        persist_over(tmp, &vault.path).map_err(|e| format!("Persist vault: {e}"))?;
+        if !lock.covers_namespace(&vault.path) {
+            return Err("source lock namespace changed; retry operation".to_string());
+        }
+        persist_over(tmp, target).map_err(|e| format!("Persist vault: {e}"))?;
         fsync_parent_dir(parent);
         #[cfg(test)]
         run_after_persist_hook();
@@ -2653,6 +2711,8 @@ pub(super) fn save_locked(vault: &mut OpenVaultV3, _lock: &WriteLock) -> Result<
     vault.opened_file_len = file_len;
     vault.opened_hash = file_hash;
     vault.header = header;
+    vault.header_repaired_on_open = false;
+    vault.manifest_repaired_on_open = false;
     Ok(())
 }
 
@@ -2804,6 +2864,7 @@ fn add_directory_into(
     vault: &mut OpenVaultV3,
     source_dir: &Path,
     target_prefix: Option<&str>,
+    lock: &WriteLock,
 ) -> Result<(usize, usize), String> {
     let source = source_dir
         .canonicalize()
@@ -2878,7 +2939,7 @@ fn add_directory_into(
         .collect();
     append_sources_batched(vault, &sources)?;
 
-    save_open_vault(vault)?;
+    save_locked(vault, lock)?;
     Ok((total_files, added_dirs))
 }
 
@@ -3318,7 +3379,7 @@ mod tests {
                     .map_err(|e| e.to_string()),
                 "export" | "sidecar" => VaultV3::export_parity(&path, PW, None).map(drop),
                 "hash" => {
-                    crate::error_correction::sync::write_if_unchanged(&path, &[0; 32], || Ok(()))
+                    crate::error_correction::sync::write_if_unchanged(&path, &[0; 32], |_| Ok(()))
                 }
                 _ => unreachable!(),
             };
@@ -5076,5 +5137,93 @@ mod tests {
     #[cfg(not(windows))]
     fn plant_dir_reparse_point(link: &Path, target: &Path) -> bool {
         std::os::unix::fs::symlink(target, link).is_ok() && link.exists()
+    }
+
+    #[test]
+    fn review_detached_parity_published_before_mutation_lock_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            crate::v3::RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let source = dir.path().join("data");
+        std::fs::write(&source, vec![7u8; 200_000]).unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        VaultV3::add_files(&mut vault, &[(source.clone(), "first".to_string())]).unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let sidecar = super::super::ec::default_sidecar_path(&path);
+        let recovery = std::fs::read(&sidecar).unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        let mut damaged = std::fs::read(&path).unwrap();
+        damaged[DATA_OFFSET as usize + 20] ^= 1;
+        std::fs::write(&path, &damaged).unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        let out = sidecar.clone();
+        let bytes = recovery.clone();
+        BEFORE_MUTATION_SIDECAR_LOCK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _publisher = crate::lock::acquire(&out).unwrap();
+                atomic_write(&out, &bytes).unwrap();
+            }))
+        });
+        let error = VaultV3::add_files(&mut vault, &[(source, "second".to_string())]).unwrap_err();
+        assert!(error.contains("damaged blocks"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), recovery);
+        assert!(VaultV3::repair(&mut vault, false, None).unwrap().0 > 0);
+    }
+
+    #[test]
+    fn review_default_sidecar_cannot_be_published_during_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        let sidecar = super::super::ec::default_sidecar_path(&path);
+        IN_SAVE_WINDOW.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let error = std::thread::spawn(move || {
+                    crate::lock::set_short_wait_for_this_thread();
+                    crate::lock::acquire(&sidecar).unwrap_err().to_string()
+                })
+                .join()
+                .unwrap();
+                assert!(error.contains("locked by another writer"), "{error}");
+            }))
+        });
+        VaultV3::create_directory(&mut vault, "committed").unwrap();
+    }
+    #[test]
+    fn review_chunk_identity_is_rejected_at_open_and_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let source = dir.path().join("input");
+        std::fs::write(&source, b"identity content").unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(source, "item".to_string())]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let record = vault.manifest.chunks.values_mut().next().unwrap();
+        let mut id = record.id.clone().into_bytes();
+        id[0] = if id[0] == b'a' { b'b' } else { b'a' };
+        record.id = String::from_utf8(id).unwrap();
+        let guard = write_lock(&path).unwrap();
+        assert!(save_locked(&mut vault, &guard)
+            .unwrap_err()
+            .contains("identity"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(guard);
+        let altered = serde_json::to_vec(&vault.manifest).unwrap();
+        assert_eq!(altered.len() as u64, vault.header.manifest_len);
+        let mut bytes = before;
+        let offset = vault.header.manifest_offset as usize;
+        bytes[offset..offset + altered.len()].copy_from_slice(&altered);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(VaultV3::open_plaintext(&path)
+            .unwrap_err()
+            .contains("identity"));
     }
 }

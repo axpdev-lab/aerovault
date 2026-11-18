@@ -268,6 +268,29 @@ pub(crate) fn compute_error_correction_shards(data_blocks: &[&[u8]]) -> (Vec<u8>
     )
 }
 
+pub(crate) fn parity_payload_len(l: u64, k: u64, p: u64) -> Result<u64, String> {
+    if l == 0 {
+        return Ok(0);
+    }
+    if k == 0 {
+        return Err("zero parity data-shard count".to_string());
+    }
+    let size = l.div_ceil(k).clamp(
+        ERROR_CORRECTION_MIN_SHARD as u64,
+        ERROR_CORRECTION_MAX_SHARD as u64,
+    );
+    let data = l.div_ceil(size);
+    let parity = data
+        .div_ceil(k)
+        .checked_mul(p)
+        .ok_or("parity size overflow")?;
+    data.checked_add(parity)
+        .and_then(|v| v.checked_mul(ERROR_CORRECTION_SHARD_CKSUM_LEN as u64))
+        .and_then(|v| v.checked_add(parity.checked_mul(size)?))
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| "parity size overflow".to_string())
+}
+
 /// As `compute_error_correction_shards`, with an explicit (K data, P parity) group so
 /// the QR-style overhead level (#276) is honored. The grid is recorded in the AVEC
 /// payload header, so reconstruction reads K/P back from the payload regardless of the
@@ -730,14 +753,21 @@ pub fn correct_generate_with_progress(
     // the lock and the check are those of the file it names, so a link to a
     // vault shares that vault's lock. Nothing is written over the link itself.
     let locked = std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
-    sync::write_if_unchanged_with_lock(&locked, &generated.file_sha256, |source_guard| {
+    {
+        #[cfg(test)]
+        sync::run_hook(&sync::BEFORE_WRITE_LOCK);
+        let source_guard = crate::lock::acquire(&locked).map_err(|e| e.to_string())?;
         // Every destination can hold a vault, including the default sidecar.
         crate::lock::refuse_destination(Path::new(&sidecar_path), path)
             .map_err(|e| e.to_string())?;
-        let _out_lock =
-            crate::lock::acquire_destination(Path::new(&sidecar_path), &locked, source_guard)
-                .map_err(|e| e.to_string())?;
-        sync::assert_unchanged(&locked, &generated.file_sha256)?;
+        std::fs::create_dir_all(crate::v3::vault::output_parent_dir(Path::new(
+            &sidecar_path,
+        )))
+        .map_err(|e| e.to_string())?;
+        let destination =
+            crate::lock::anchored(Path::new(&sidecar_path)).map_err(|e| e.to_string())?;
+        let _out_lock = crate::lock::acquire_destination(&destination, &locked, &source_guard)
+            .map_err(|e| e.to_string())?;
         if path != locked {
             let current =
                 std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
@@ -746,11 +776,13 @@ pub fn correct_generate_with_progress(
                     "{file} changed target while it was being read; retry"
                 ));
             }
-            sync::assert_unchanged(path, &generated.file_sha256)?;
         }
-        crate::v3::vault::atomic_write(Path::new(&sidecar_path), &generated.sidecar_bytes)
+        sync::assert_unchanged(&locked, &generated.file_sha256)?;
+        #[cfg(test)]
+        sync::run_hook(&sync::IN_WRITE_WINDOW);
+        crate::v3::vault::atomic_write(&destination, &generated.sidecar_bytes)
             .map_err(|e| format!("write sidecar {sidecar_path}: {e}"))
-    })?;
+    }?;
     let segments =
         sidecar::aerocorrect_windows(generated.file_size, sidecar::AEROCORRECT_WINDOW_SIZE).len()
             as u64;
@@ -1440,5 +1472,64 @@ mod tests {
             b_bytes,
             "B untouched after failed repair"
         );
+    }
+    #[test]
+    fn review_relative_generate_hashes_once_after_destination_lock() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let absolute = dir.path().join("input.bin");
+        let path = absolute
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap()
+            .to_path_buf();
+        std::fs::write(&path, sample(32_000)).unwrap();
+        assert!(path.is_relative());
+        sync::HASH_READS.with(|n| n.set(0));
+        correct_generate(path.to_str().unwrap(), 20, None).unwrap();
+        assert_eq!(sync::HASH_READS.with(|n| n.get()), 1);
+    }
+    #[test]
+    fn review_parity_length_matches_generator_and_bounds_every_supported_grid() {
+        let mut grids = std::collections::BTreeSet::new();
+        for pct in ERROR_CORRECTION_MIN_PCT..=ERROR_CORRECTION_MAX_PCT {
+            let (k, p) = error_correction_grid(pct);
+            assert!(k >= 2 && p <= 2);
+            grids.insert((k, p));
+            for len in [1, 256, ERROR_CORRECTION_MIN_SHARD - 1, 9001] {
+                let input = vec![0x5a; len];
+                let actual = compute_error_correction_shards_grid(&[&input], k, p)
+                    .0
+                    .len() as u64;
+                assert_eq!(
+                    parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
+                    actual
+                );
+                assert!(actual <= parity_payload_len(len as u64, 2, 2).unwrap());
+            }
+        }
+        for (k, p) in grids {
+            for len in [
+                0,
+                k * ERROR_CORRECTION_MIN_SHARD - 1,
+                k * ERROR_CORRECTION_MIN_SHARD + 1,
+            ] {
+                let input = vec![0x5a; len];
+                assert_eq!(
+                    parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
+                    compute_error_correction_shards_grid(&[&input], k, p)
+                        .0
+                        .len() as u64
+                );
+            }
+        }
+        for (k, p) in [(4, 2), (13, 2)] {
+            let len = k * ERROR_CORRECTION_MAX_SHARD + 1;
+            let input = vec![0x5a; len];
+            assert_eq!(
+                parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
+                compute_error_correction_shards_grid(&[&input], k, p)
+                    .0
+                    .len() as u64
+            );
+        }
     }
 }

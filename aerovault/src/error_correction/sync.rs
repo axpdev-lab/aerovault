@@ -374,9 +374,15 @@ pub fn verify_repair_sync_bytes(
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
 
+#[cfg(test)]
+thread_local! { pub(crate) static HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Stream a file and return its SHA-256 with bounded memory (one `HASH_READ_CHUNK`
 /// buffer at a time). Shared by the verify fast path and the standalone verify.
 fn hash_file_streaming(path: &Path) -> Result<[u8; 32], String> {
+    #[cfg(test)]
+    HASH_READS.with(|n| n.set(n.get() + 1));
+
     let mut file = crate::source::open_regular(path)
         .map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -403,9 +409,9 @@ fn hash_file_streaming(path: &Path) -> Result<[u8; 32], String> {
 pub(crate) fn write_if_unchanged(
     path: &Path,
     read_sha256: &[u8; 32],
-    write: impl FnOnce() -> Result<(), String>,
+    write: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    write_if_unchanged_with_lock(path, read_sha256, |_| write())
+    write_if_unchanged_with_lock(path, read_sha256, |lock| write(lock.source_path()))
 }
 
 pub(crate) fn write_if_unchanged_with_lock(
@@ -416,7 +422,7 @@ pub(crate) fn write_if_unchanged_with_lock(
     #[cfg(test)]
     run_hook(&BEFORE_WRITE_LOCK);
     let _lock = crate::lock::acquire(path).map_err(|e| e.to_string())?;
-    assert_unchanged(path, read_sha256)?;
+    assert_unchanged(_lock.source_path(), read_sha256)?;
     #[cfg(test)]
     run_hook(&IN_WRITE_WINDOW);
     write(&_lock)
@@ -446,7 +452,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn run_hook(hook: &'static std::thread::LocalKey<Hook>) {
+pub(crate) fn run_hook(hook: &'static std::thread::LocalKey<Hook>) {
     if let Some(f) = hook.with(|h| h.borrow_mut().take()) {
         f();
     }
@@ -458,6 +464,9 @@ pub fn verify_repair_sync_file(
     path: &Path,
     sidecar_bytes: &[u8],
 ) -> Result<SyncEcRepairResult, String> {
+    let pinned = crate::lock::anchored(path).map_err(|e| e.to_string())?;
+    let path = pinned.as_path();
+
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
@@ -520,8 +529,8 @@ pub fn verify_repair_sync_file(
     // On a persist failure (or a refusal) the temp file is removed, so a
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
-    write_if_unchanged(path, &finalize_sha256(read_hasher), || {
-        crate::v3::vault::persist_over(tmp, path).map_err(|e| {
+    write_if_unchanged(path, &finalize_sha256(read_hasher), |locked_path| {
+        crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
                 path.display()
@@ -574,6 +583,9 @@ fn repair_streamed(
     sidecar_path: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcRepairResult, String> {
+    let pinned = crate::lock::anchored(path).map_err(|e| e.to_string())?;
+    let path = pinned.as_path();
+
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
@@ -662,8 +674,8 @@ fn repair_streamed(
     // On a persist failure (or a refusal) the temp file is removed, so a
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
-    write_if_unchanged(path, &finalize_sha256(read_hasher), || {
-        crate::v3::vault::persist_over(tmp, path).map_err(|e| {
+    write_if_unchanged(path, &finalize_sha256(read_hasher), |locked_path| {
+        crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
                 path.display()
@@ -939,7 +951,7 @@ mod tests {
             return;
         }
         let mut ran = false;
-        let result = write_if_unchanged(&path, &hash, || {
+        let result = write_if_unchanged(&path, &hash, |_| {
             ran = true;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::rename(staged.path(), &path).unwrap();

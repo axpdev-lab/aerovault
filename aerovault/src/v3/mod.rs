@@ -25,6 +25,7 @@ pub mod ec;
 pub mod format;
 pub mod manifest;
 pub mod packing;
+pub(crate) mod strip_transaction;
 pub mod telemetry;
 pub mod vault;
 

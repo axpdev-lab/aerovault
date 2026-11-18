@@ -13,13 +13,28 @@ use std::{
 /// Follow ordinary source symlinks, but never block opening a FIFO. Validate
 /// the opened handle, rather than a path that can change between stat and open.
 pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    open_regular_with_policy(path, false)
+}
+
+pub(crate) fn open_regular_no_follow(path: &Path) -> io::Result<File> {
+    open_regular_with_policy(path, true)
+}
+
+fn open_regular_with_policy(path: &Path, no_follow: bool) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NONBLOCK | if no_follow { libc::O_NOFOLLOW } else { 0 });
     }
+    #[cfg(windows)]
+    if no_follow {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = no_follow;
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
@@ -28,16 +43,6 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
-}
-
-/// Read a regular file with the same nonblocking/type contract. Wipe any
-/// partially read input on error and retain protected ownership through caller
-/// validation on success.
-pub(crate) fn read_regular(path: &Path) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
-    let mut file = open_regular(path)?;
-    let mut bytes = zeroize::Zeroizing::new(Vec::new());
-    crate::secret::read_to_end(&mut file, &mut bytes)?;
-    Ok(bytes)
 }
 
 /// Process isolation makes FIFO regressions fail on a deadline even if an old
@@ -98,16 +103,41 @@ pub(crate) mod fifo_test {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn review_regular_read_keeps_protected_ownership_through_validation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("short-plaintext");
-        std::fs::write(&path, b"sensitive source").unwrap();
-        let bytes: zeroize::Zeroizing<Vec<u8>> = super::read_regular(&path).unwrap();
-        assert_eq!(bytes.as_slice(), b"sensitive source");
-        // This compile-time return contract retains Zeroizing across caller
-        // early returns; its Drop implementation performs the wipe.
+/// Memory regressions run in isolated Linux children; limits never affect the
+/// parent test harness and every timeout kills and reaps the child.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod memory_test {
+    pub(crate) fn limit() {
+        let bound = 1536 * 1024 * 1024;
+        let r = libc::rlimit {
+            rlim_cur: bound,
+            rlim_max: bound,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &r) }, 0);
+    }
+    pub(crate) fn run(test: &str, key: &str, path: &std::path::Path) {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env(key, path)
+                .spawn()
+                .unwrap(),
+        );
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let status = loop {
+            if let Some(s) = child.0.try_wait().unwrap() {
+                break s;
+            }
+            assert!(std::time::Instant::now() < end, "memory child timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(status.success(), "memory-limited child failed: {status}");
     }
 }

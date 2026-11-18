@@ -25,3 +25,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
 rpassword = "7"
+
+[dev-dependencies]
+tempfile = { workspace = true }

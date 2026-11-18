@@ -1,6 +1,6 @@
 name: CI
 
-# Run the test suite on Linux and Windows. Some fixes are Windows-specific
+# Run the test suite on Linux, Windows and macOS. Some fixes are Windows-specific
 # (for example legacy vault writes replacing the file by rename), so they are
 # exercised on a Windows runner, not only type-checked.
 
@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,6 +41,18 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --release --no-fail-fast
+
+      - name: HFS+ filename and sidecar lock regression
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          image="$RUNNER_TEMP/aerovault-hfs.dmg"
+          mount="$RUNNER_TEMP/aerovault-hfs"
+          hdiutil create -size 128m -fs HFS+ -volname AeroVaultTest "$image"
+          mkdir -p "$mount"
+          hdiutil attach "$image" -mountpoint "$mount" -nobrowse
+          trap 'hdiutil detach "$mount"' EXIT
+          AEROVAULT_TEST_HFS_ROOT="$mount" cargo test --release -p aerovault --lib review_hfs_ -- --ignored --nocapture
 
   msrv:
     name: Test Rust 1.89

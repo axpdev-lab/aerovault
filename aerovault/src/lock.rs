@@ -10,7 +10,7 @@
 //! separate, stable `<vault>.aerolock` next to the vault, and hold it from the
 //! moment they read the state they will write (for a v3 handle opened
 //! earlier, from the check that the file is still the one it read) until the
-//! rename is done. Readers never take it. Tools that rewrite any file or
+//! rename is done. Readers normally take no lock; pending strip recovery does. Tools that rewrite any file or
 //! write its `.aerocorrect` (`correct repair`, `correct gen`) read it without
 //! the lock, then take the lock of that file, vault or not, for their write,
 //! and write only if it still holds the bytes they read
@@ -83,11 +83,17 @@ fn wait() -> Duration {
 pub(crate) struct WriteLock {
     /// `None` only for a read-only export from media with no creatable lock.
     _file: Option<File>,
+    path: PathBuf,
+    source: PathBuf,
 }
 
 #[cfg(all(test, unix))]
 pub(crate) fn test_unlocked_export_guard() -> WriteLock {
-    WriteLock { _file: None }
+    WriteLock {
+        _file: None,
+        path: PathBuf::new(),
+        source: PathBuf::new(),
+    }
 }
 
 #[cfg(test)]
@@ -108,9 +114,11 @@ pub(crate) fn lock_path(vault: &Path) -> PathBuf {
     // Normalize before deciding whether to hash too: equivalent Unicode names
     // can cross the suffix-length boundary in their original spellings.
     let normalized = basename.to_str().map(|name| {
-        name.trim_end_matches(['.', ' '])
-            .nfc()
+        name.chars()
             .filter(|&c| !ignored_in_names(c))
+            .collect::<String>()
+            .trim_end_matches(['.', ' '])
+            .nfc()
             // Pinned Unicode tables make the digest independent of the Rust
             // toolchain's changing Unicode/case tables (MSRV and stable agree).
             .case_fold()
@@ -261,6 +269,15 @@ fn lock_name_source(vault: &Path) -> io::Result<PathBuf> {
 /// a space ([`lock_name_source`]). On Windows a lock file that another
 /// program holds open with delete access is waited for like a held lock.
 pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
+    if std::fs::symlink_metadata(vault).is_ok_and(|m| m.file_type().is_symlink()) {
+        return acquire_without_recovery(vault);
+    }
+    // Restore an interrupted strip before any kind of replacing writer acts.
+    crate::v3::strip_transaction::recover_if_pending(vault).map_err(io::Error::other)?;
+    acquire_without_recovery(vault)
+}
+
+pub(crate) fn acquire_without_recovery(vault: &Path) -> io::Result<WriteLock> {
     acquire_with_policy(vault, false)
 }
 
@@ -268,24 +285,36 @@ pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
 /// media. Its destination still requires a real write lock, and its source
 /// generation check cannot exclude a writer after that check without a lock.
 pub(crate) fn acquire_for_export(vault: &Path) -> io::Result<WriteLock> {
+    if std::fs::symlink_metadata(vault).is_ok_and(|m| m.file_type().is_symlink()) {
+        return acquire_with_policy(vault, true);
+    }
+    crate::v3::strip_transaction::recover_if_pending(vault).map_err(io::Error::other)?;
     acquire_with_policy(vault, true)
 }
 
 fn acquire_with_policy(vault: &Path, allow_unlocked_read: bool) -> io::Result<WriteLock> {
     refuse_lock_file_name(vault)?;
-    if std::fs::symlink_metadata(vault).is_ok_and(|m| m.file_type().is_symlink()) {
+    let source = anchored(vault)?;
+    if std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(io::Error::other(format!(
             "{} is a symbolic link: writing through it would replace the link and \
              lock a different file than a writer using its target; use the target path",
             vault.display()
         )));
     }
-    let path = lock_path(&lock_name_source(vault)?);
+    let source = lock_name_source(&source)?;
+    let path = lock_path(&source);
     let deadline = Instant::now() + wait();
     let file = loop {
         match open_lock_file(&path) {
             Ok(Some(file)) => break file,
-            Ok(None) if allow_unlocked_read => return Ok(WriteLock { _file: None }),
+            Ok(None) if allow_unlocked_read => {
+                return Ok(WriteLock {
+                    _file: None,
+                    path,
+                    source,
+                })
+            }
             Ok(None) => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -306,7 +335,11 @@ fn acquire_with_policy(vault: &Path, allow_unlocked_read: bool) -> io::Result<Wr
             Ok(()) => {
                 #[cfg(test)]
                 trace("lock");
-                return Ok(WriteLock { _file: Some(file) });
+                return Ok(WriteLock {
+                    _file: Some(file),
+                    path,
+                    source,
+                });
             }
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 #[cfg(test)]
@@ -401,8 +434,74 @@ pub(crate) fn refuse_destination(out: &Path, source: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn destination_name_fits(out: &Path) -> bool {
-    name_units(out.file_name().unwrap_or_default()) <= 255
+/// Ask the destination filesystem, independently of the bounded lock spelling.
+/// In particular HFS+ permits multibyte names longer than 255 UTF-8 bytes.
+pub(crate) fn destination_can_exist(out: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(out) {
+        Ok(_) => Ok(true),
+        Err(e) if name_too_long(&e) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+fn name_too_long(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ENAMETOOLONG)
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(206)
+    } // ERROR_FILENAME_EXCED_RANGE
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Pin a parent directory before taking a lock or selecting an output. Preserve
+/// the leaf: replacing a leaf symlink must not accidentally write its target.
+pub(crate) fn anchored(path: &Path) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("file path has no basename"))?;
+    Ok(std::fs::canonicalize(parent_or_dot(path))?.join(name))
+}
+
+impl WriteLock {
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source
+    }
+
+    /// Only a real guard of this very lock file can cover a second namespace.
+    /// Never reconstruct the held path through the caller's mutable aliases.
+    pub(crate) fn covers_namespace(&self, source: &Path) -> bool {
+        let Some(file) = &self._file else {
+            return false;
+        };
+        let Ok(path) = anchored(source).and_then(|p| lock_name_source(&p)) else {
+            return false;
+        };
+        let path = lock_path(&path);
+        if path != self.path {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (file.metadata(), std::fs::symlink_metadata(&path)) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino() && b.is_file(),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            true
+        } // Windows lock handles deny delete sharing.
+    }
 }
 
 /// Take the write lock of `out`, a destination the caller named for a file
@@ -420,29 +519,22 @@ pub(crate) fn acquire_destination(
     source_guard: &WriteLock,
 ) -> io::Result<Option<WriteLock>> {
     refuse_destination(out, held)?;
-    if !destination_name_fits(out) {
+    if !destination_can_exist(out)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "destination basename exceeds 255 native units",
+            "destination basename exceeds the destination filesystem limit",
         ));
     }
     if std::fs::symlink_metadata(out).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(None);
     }
-    let out_lock_path = lock_path(&lock_name_source(out)?);
-    let held_lock_path = lock_path(&lock_name_source(held)?);
-    // Distinct case-sensitive filenames may conservatively share a normalized
-    // lock namespace. Its already-held real guard protects both paths; taking
-    // it again would deadlock. A lock-less read-only export cannot use this.
-    if source_guard._file.is_some() {
-        if let (Ok(a), Ok(b)) = (
-            std::fs::canonicalize(&out_lock_path),
-            std::fs::canonicalize(&held_lock_path),
-        ) {
-            if a == b {
-                return Ok(None);
-            }
-        }
+    if source_guard._file.is_some() && !source_guard.covers_namespace(held) {
+        return Err(io::Error::other(
+            "source lock namespace changed; retry operation",
+        ));
+    }
+    if source_guard.covers_namespace(out) {
+        return Ok(None);
     }
     std::fs::create_dir_all(parent_or_dot(out))?;
     acquire(out).map(Some)
@@ -874,5 +966,84 @@ mod tests {
         let err = res.unwrap_err();
         assert!(err.to_string().contains("not a regular file"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn review_ignored_characters_are_removed_before_trailing_trim() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("v.aerovault.");
+        let b = dir.path().join("v.aerovault.\u{200c}");
+        assert_eq!(lock_path(&a), lock_path(&b));
+        #[cfg(unix)]
+        {
+            set_short_wait_for_this_thread();
+            let _guard = acquire(&a).unwrap();
+            let error = acquire(&b).unwrap_err();
+            assert!(
+                error.to_string().contains("locked by another writer"),
+                "{error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_destination_reuse_checks_the_guard_identity() {
+        use std::os::unix::fs::symlink;
+        set_short_wait_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let alias = dir.path().join("alias");
+        symlink(&a, &alias).unwrap();
+        let held = alias.join("source");
+        let out = b.join("SOURCE");
+        let guard = acquire(&held).unwrap();
+        let _other = acquire(&out).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&b, &alias).unwrap();
+        let error = acquire_destination(&out, &held, &guard).unwrap_err();
+        assert!(error.to_string().contains("namespace changed"), "{error}");
+    }
+
+    #[test]
+    fn review_destination_length_uses_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("界".repeat(90));
+        match std::fs::write(&path, b"valid") {
+            Ok(()) => {
+                assert!(destination_can_exist(&path).unwrap());
+                let _guard = acquire(&path).unwrap();
+            }
+            Err(error) => {
+                assert!(name_too_long(&error), "{error}");
+                assert!(!destination_can_exist(&path).unwrap());
+            }
+        }
+        let invalid = dir.path().join("x".repeat(1000));
+        assert!(!destination_can_exist(&invalid).unwrap());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the dedicated HFS+ CI image"]
+    fn review_hfs_ignored_suffix_aliases_contend() {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::var_os("AEROVAULT_TEST_HFS_ROOT")
+            .expect("run with the dedicated HFS+ image mounted");
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let a = dir.path().join("v.aerovault.");
+        let b = dir.path().join("v.aerovault.\u{200c}");
+        std::fs::write(&a, b"one file").unwrap();
+        assert_eq!(
+            std::fs::metadata(&a).unwrap().ino(),
+            std::fs::metadata(&b).unwrap().ino()
+        );
+        set_short_wait_for_this_thread();
+        let _guard = acquire(&a).unwrap();
+        assert!(acquire(&b)
+            .unwrap_err()
+            .to_string()
+            .contains("locked by another writer"));
     }
 }
