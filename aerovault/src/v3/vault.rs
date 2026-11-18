@@ -640,17 +640,60 @@ impl VaultV3 {
                 "Vault has damaged blocks: run repair before changing the password".to_string(),
             );
         }
-        let (header, modified) = (vault.header.clone(), vault.manifest.modified.clone());
+        let previous = (
+            vault.header.clone(),
+            vault.manifest.modified.clone(),
+            vault.opened_file_len,
+            vault.opened_hash,
+            vault.header_repaired_on_open,
+            vault.manifest_repaired_on_open,
+        );
         change_password_in_place(vault, new_password)?;
-        if let Err(e) = save_locked(vault, &lock) {
-            // The caller is told the change failed: a later save on this
-            // handle must not persist the new password.
-            vault.header = header;
-            vault.manifest.modified = modified;
-            return Err(e);
-        }
-        if refresh {
-            refresh_sidecar(vault, &sidecar, new_password, &lock, &sidecar_lock)?;
+        let mut staged = false;
+        let result = (|| {
+            if !refresh {
+                return save_locked(vault, &lock);
+            }
+            // A process interruption between two independent renames must not
+            // leave old-header recovery beside a newly rotated container.
+            // Use the same bounded, restart-recoverable pair transaction as
+            // non-forced stripping, under the already held source/sidecar locks.
+            let prepared = super::strip_transaction::private_dir(
+                output_parent_dir(lock.source_path()),
+                ".aeropassword-prepare-",
+            )?;
+            super::strip_transaction::copy_file(
+                lock.source_path(),
+                &prepared.path().join("old-vault"),
+            )?;
+            super::strip_transaction::copy_file(&sidecar, &prepared.path().join("old-sidecar"))?;
+            let target = prepared.path().join("new-vault");
+            save_locked_to(vault, &lock, &target)?;
+            staged = true;
+            super::ec::export_parity_under_locks(
+                &target,
+                new_password,
+                &prepared.path().join("new-sidecar"),
+                &lock,
+                &sidecar_lock,
+            )?;
+            super::strip_transaction::publish(lock.source_path(), prepared, &lock)
+        })();
+        if let Err(error) = result {
+            if staged && assert_vault_generation_current(vault).is_ok() {
+                return Err(format!("Password changed on disk, but paired recovery publication reported an error ({error}); recovery may be pending; preserve the vault, sidecar and journal and reopen before further writes"));
+            }
+            // Restore every field updated by a staged seal. A later mutation
+            // on this handle must not persist a password reported as failed.
+            (
+                vault.header,
+                vault.manifest.modified,
+                vault.opened_file_len,
+                vault.opened_hash,
+                vault.header_repaired_on_open,
+                vault.manifest_repaired_on_open,
+            ) = previous;
+            return Err(error);
         }
         Ok(())
     }
@@ -2205,37 +2248,6 @@ fn run_after_persist_hook() {
     }
 }
 
-/// Re-export the sidecar after a password change. On failure a stale sidecar
-/// would keep the old password working, so it is removed, unless another handle
-/// has changed the vault since: the sidecar then belongs to that change.
-fn refresh_sidecar(
-    vault: &OpenVaultV3,
-    sidecar: &Path,
-    new_password: &str,
-    lock: &WriteLock,
-    sidecar_lock: &Option<WriteLock>,
-) -> Result<(), String> {
-    let Err(e) = super::ec::export_parity_under_locks(
-        lock.source_path(),
-        new_password,
-        sidecar,
-        lock,
-        sidecar_lock,
-    ) else {
-        return Ok(());
-    };
-    let outcome = if assert_vault_generation_current(vault).is_err() {
-        "the vault was changed by another writer meanwhile"
-    } else if std::fs::remove_file(sidecar).is_ok() {
-        "the old one was removed"
-    } else {
-        "remove the old one, it still accepts the old password"
-    };
-    Err(format!(
-        "Password changed, but the .aerocorrect recovery file could not be refreshed ({e}); {outcome}; run export-parity"
-    ))
-}
-
 /// A plaintext-lane header: the flag is set and the header verifies under the
 /// public key. A flag bit rotted on an encrypted vault fails the MAC check.
 fn plaintext_lane_header(header_bytes: &[u8]) -> bool {
@@ -2290,7 +2302,7 @@ fn open_vault_with(
     // check and goes down the encrypted path, where the real MAC fails and the
     // sidecar header recovery runs. With no password (open_plaintext) a header
     // that carries the flag stays on this lane and reports its own MAC error.
-    let plaintext_header = if password.is_empty() {
+    let plaintext_header = if !encrypted_only && password.is_empty() {
         VaultHeaderV3::from_bytes(&header_bytes)
             .is_ok_and(|h| h.flags & FLAG_PLAINTEXT_CONTENT != 0)
     } else {
@@ -2468,6 +2480,12 @@ fn open_vault_with(
 fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<(), String> {
     if header.data_offset != DATA_OFFSET {
         return Err("Invalid AeroVault v3 data offset".to_string());
+    }
+    if header.manifest_len > MAX_MANIFEST_SIZE {
+        return Err("manifest exceeds size limit".to_string());
+    }
+    if header.extension_dir_len > MAX_EXTENSION_DIR_SIZE {
+        return Err("extension directory exceeds size limit".to_string());
     }
     let ranges = [
         (header.data_offset, header.data_len, "data"),
@@ -2723,7 +2741,9 @@ pub(super) fn save_locked_to(
         persist_over(tmp, target).map_err(|e| format!("Persist vault: {e}"))?;
         fsync_parent_dir(parent);
         #[cfg(test)]
-        run_after_persist_hook();
+        if target == vault.path {
+            run_after_persist_hook();
+        }
         (generation, header_bytes)
     };
 
@@ -3057,37 +3077,6 @@ mod tests {
         assert!(VaultV3::open(&path, PW_A).is_ok());
     }
 
-    #[test]
-    fn password_change_cleanup_keeps_a_newer_writers_sidecar() {
-        // Handle A saves its new header; before A refreshes the sidecar, handle
-        // B changes the password again and exports its own. A's refresh fails
-        // (the vault no longer opens with A's password) and must not delete B's.
-        const PW_A: &str = "password-a-12345";
-        const PW_B: &str = "password-b-12345";
-        let (vp, sidecar) = vault_with_sidecar();
-        let mut a = VaultV3::open(&vp, PW).unwrap();
-        change_password_in_place(&mut a, PW_A).unwrap();
-        save_open_vault(&mut a).unwrap();
-        let mut b = VaultV3::open(&vp, PW_A).unwrap();
-        VaultV3::change_password(&mut b, PW_B).unwrap();
-        let sidecar_b = std::fs::read(&sidecar).unwrap();
-
-        let lock = write_lock(&vp).unwrap();
-        let sidecar_lock = crate::lock::acquire_destination(&sidecar, &vp, &lock).unwrap();
-        let err = refresh_sidecar(&a, &sidecar, PW_A, &lock, &sidecar_lock).unwrap_err();
-        assert!(err.contains("another writer"), "{err}");
-        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_b);
-        assert!(VaultV3::open(&vp, PW).is_err());
-        assert!(VaultV3::open(&vp, PW_A).is_err());
-        assert!(VaultV3::open(&vp, PW_B).is_ok());
-
-        // Released before the cleanup: on Windows a held lock file cannot be
-        // deleted (it is opened without delete sharing).
-        drop((sidecar_lock, lock));
-        crate::lock::remove_vault_and_lock(&vp);
-        std::fs::remove_file(&sidecar).ok();
-    }
-
     #[cfg(unix)]
     #[test]
     fn failed_save_does_not_leave_the_change_in_the_handle() {
@@ -3144,18 +3133,19 @@ mod tests {
     fn writer_is_held_off_while_a_password_change_refreshes_the_sidecar() {
         // B runs inside A's lock on this thread and must give up.
         crate::lock::set_short_wait_for_this_thread();
-        // A has saved its new header and is about to publish the refreshed
-        // sidecar when B tries to change the password again. B must wait and
-        // give up (A holds the lock across save and refresh), so A's sidecar
-        // is published and is of the header now on disk.
+        // During pair publication A has replaced the vault but not the sidecar.
+        // A pre-opened B must give up at the source lock. A reader must also
+        // refuse while the journal needs that held lock for recovery.
         const PW_A: &str = "password-a-12345";
         const PW_B: &str = "password-b-12345";
         let (vp, sidecar) = vault_with_sidecar();
         let b_result = std::rc::Rc::new(std::cell::RefCell::new(None));
         let (path, seen) = (vp.clone(), b_result.clone());
-        BEFORE_SIDECAR_PUBLISH.with(|h| {
+        let mut b = VaultV3::open(&vp, PW).unwrap();
+        super::super::strip_transaction::AFTER_STRIP_VAULT.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
-                let mut b = VaultV3::open(&path, PW_A).unwrap();
+                let error = VaultV3::open(&path, PW_A).unwrap_err();
+                assert!(error.contains("locked by another writer"), "{error}");
                 *seen.borrow_mut() = Some(VaultV3::change_password(&mut b, PW_B));
             }));
         });
@@ -4131,33 +4121,21 @@ mod tests {
         std::fs::remove_dir_all(&sidecar).ok();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn password_change_reports_a_sidecar_it_can_neither_refresh_nor_remove() {
-        // An uncooperative filesystem writer replaces the sidecar only after
-        // the new password is saved. Keep the committed-state diagnostic and
-        // removal-failure path covered independently of preflight refusal.
+    fn password_change_reports_committed_pair_after_final_sync_failure() {
         const NEW_PW: &str = "new-password-12345";
         let (vp, sidecar) = vault_with_sidecar();
-        let injected_sidecar = sidecar.clone();
         let mut vault = VaultV3::open(&vp, PW).unwrap();
-        AFTER_PERSIST.with(|h| {
-            *h.borrow_mut() = Some(Box::new(move || {
-                std::fs::remove_file(&injected_sidecar).unwrap();
-                std::fs::create_dir(&injected_sidecar).unwrap();
-                std::fs::write(injected_sidecar.join("keep"), b"x").unwrap();
-            }));
-        });
+        super::super::strip_transaction::FAIL_FINAL_SYNC.with(|f| f.set(true));
         let err = VaultV3::change_password(&mut vault, NEW_PW).unwrap_err();
-        assert!(err.starts_with("Password changed"), "{err}");
-        assert!(err.contains("remove the old one"), "{err}");
-        assert_eq!(std::fs::read(sidecar.join("keep")).unwrap(), b"x");
-        drop(vault);
+        assert!(err.starts_with("Password changed on disk"), "{err}");
+        assert!(!super::super::strip_transaction::journal_path(&vp).exists());
         assert!(VaultV3::open(&vp, NEW_PW).is_ok());
         assert!(VaultV3::open(&vp, PW).is_err());
-
+        VaultV3::create_directory(&mut vault, "after-sync-failure").unwrap();
+        drop(vault);
         crate::lock::remove_vault_and_lock(&vp);
-        std::fs::remove_dir_all(&sidecar).ok();
+        std::fs::remove_file(&sidecar).ok();
     }
 
     #[test]
@@ -5381,5 +5359,132 @@ mod tests {
         eprintln!(
             "8.3 vault leaf exercised: {short_leaf:?}; sidecar and password recovery verified"
         );
+    }
+
+    #[test]
+    fn review_plaintext_specific_error_requires_public_mac_even_for_empty_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        for password in ["", PW] {
+            assert_eq!(
+                VaultV3::open(&path, password).unwrap_err(),
+                PLAINTEXT_NOT_A_VAULT
+            );
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[super::super::constants::HEADER_MAC_OFFSET] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        for password in ["", PW] {
+            assert_ne!(
+                VaultV3::open(&path, password).unwrap_err(),
+                PLAINTEXT_NOT_A_VAULT
+            );
+        }
+        assert!(VaultV3::open_plaintext(&path).unwrap_err().contains("MAC"));
+    }
+
+    #[test]
+    fn review_section_caps_reject_in_file_ranges_before_generation_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, cap) in [
+            ("manifest", MAX_MANIFEST_SIZE),
+            ("extension", MAX_EXTENSION_DIR_SIZE),
+        ] {
+            let path = dir.path().join(format!("{name}.aerozip"));
+            VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let mut header = VaultHeaderV3::from_bytes(&bytes[..HEADER_SIZE]).unwrap();
+            if name == "manifest" {
+                header.manifest_len = cap + 1;
+            } else {
+                header.extension_dir_len = cap + 1;
+            }
+            let len =
+                header.manifest_offset + header.manifest_len + header.extension_dir_len + 4096;
+            header.header_mac = header.compute_mac(&aerovz_mac_key().unwrap()).unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(len).unwrap();
+            std::io::Write::write_all(&mut file, &header.to_bytes()).unwrap();
+            drop(file);
+            crate::lock::take_trace();
+            assert!(VaultV3::open_plaintext(&path)
+                .unwrap_err()
+                .contains("size limit"));
+            assert!(!crate::lock::take_trace().contains(&"generation"));
+        }
+    }
+
+    #[test]
+    fn review_password_rotation_recovers_after_first_pair_replacement() {
+        const KEY: &str = "AEROVAULT_PASSWORD_RESTART_DIR";
+        const NEW_PW: &str = "new-password-restart-123";
+        if let Some(root) = std::env::var_os(KEY) {
+            let path = PathBuf::from(root).join("restart.aerovault");
+            super::super::strip_transaction::AFTER_STRIP_VAULT
+                .with(|h| *h.borrow_mut() = Some(Box::new(|| std::process::exit(77))));
+            let mut vault = VaultV3::open(&path, PW).unwrap();
+            VaultV3::change_password(&mut vault, NEW_PW).unwrap();
+            panic!("rotation interruption hook was not reached");
+        }
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                self.0.kill().ok();
+                self.0.wait().ok();
+            }
+        }
+        for placement in [
+            super::super::ec::RecoveryPlacement::Detached,
+            super::super::ec::RecoveryPlacement::Both,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("restart.aerovault");
+            VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
+                .unwrap();
+            let payload = dir.path().join("payload");
+            std::fs::write(&payload, b"protected content").unwrap();
+            let mut vault = VaultV3::open(&path, PW).unwrap();
+            VaultV3::add_files(&mut vault, &[(payload, "payload".into())]).unwrap();
+            drop(vault);
+            VaultV3::export_parity(&path, PW, None).unwrap();
+            let sidecar = super::super::ec::default_sidecar_path(&path);
+            let old_vault = std::fs::read(&path).unwrap();
+            let old_sidecar = std::fs::read(&sidecar).unwrap();
+            let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "v3::vault::tests::review_password_rotation_recovers_after_first_pair_replacement", "--nocapture"])
+                .env(KEY, dir.path()).spawn().unwrap());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rotation child timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert_eq!(status.code(), Some(77));
+            assert!(super::super::strip_transaction::journal_path(&path).exists());
+            assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+            // An interrupted rotation rolls back before any password is tried.
+            let mut recovered = VaultV3::open(&path, PW).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), old_vault);
+            assert!(!super::super::strip_transaction::journal_path(&path).exists());
+            assert!(VaultV3::open(&path, NEW_PW).is_err());
+            VaultV3::change_password(&mut recovered, NEW_PW).unwrap();
+            drop(recovered);
+            // A completed rotation cannot resurrect the old password through parity.
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[super::super::constants::HEADER_MAC_OFFSET] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+            assert!(VaultV3::open(&path, PW).is_err());
+            assert!(
+                VaultV3::open(&path, NEW_PW)
+                    .unwrap()
+                    .header_repaired_on_open
+            );
+        }
     }
 }

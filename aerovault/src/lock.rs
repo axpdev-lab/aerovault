@@ -541,6 +541,17 @@ fn name_too_long(error: &io::Error) -> bool {
 /// Pin a parent directory before taking a lock or selecting an output. Preserve
 /// the leaf: replacing a leaf symlink must not accidentally write its target.
 pub(crate) fn anchored(path: &Path) -> io::Result<PathBuf> {
+    // Path::file_name normalizes these suffixes away. A directory spelling
+    // must never become a replacing write to the preceding regular file.
+    let raw = path.as_os_str().as_encoded_bytes();
+    if raw.ends_with(b"/")
+        || raw.ends_with(b"/.")
+        || cfg!(windows) && (raw.ends_with(b"\\") || raw.ends_with(b"\\."))
+    {
+        return Err(io::Error::other(
+            "file path ends in a directory separator or dot component",
+        ));
+    }
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("file path has no basename"))?;
@@ -1182,5 +1193,34 @@ mod tests {
             .contains("locked by another writer"));
         assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
         drop(dest);
+    }
+
+    #[test]
+    fn review_directory_suffix_never_replaces_the_shorter_vault_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.aerovault");
+        crate::vault::Vault::create(crate::vault::CreateOptions::new(&path, "test-password-123"))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for suffix in ["/", "/."] {
+            let mut spelling = path.as_os_str().to_os_string();
+            spelling.push(suffix);
+            let bad = PathBuf::from(spelling);
+            assert!(
+                crate::vault::Vault::create(crate::vault::CreateOptions::new(
+                    &bad,
+                    "test-password-123"
+                ))
+                .is_err()
+            );
+            assert!(
+                crate::v3::VaultV3::create(&crate::v3::CreateOptionsV3::new_plaintext(&bad))
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let ordinary = dir.path().join("ordinary.aerozip");
+        crate::v3::VaultV3::create(&crate::v3::CreateOptionsV3::new_plaintext(&ordinary)).unwrap();
+        assert!(crate::v3::VaultV3::open_plaintext(&ordinary).is_ok());
     }
 }

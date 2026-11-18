@@ -143,6 +143,24 @@ impl ErrorCorrectionPayloadHeader {
                 "invalid Error Correction payload header (zero shard geometry)".to_string(),
             );
         }
+        if u32::from(h.data_shards) + u32::from(h.parity_shards) >= 256 {
+            return Err("invalid Error Correction group width".to_string());
+        }
+        // Every supported v2 writer chooses S from L and K by this rule
+        // (including the original fixed K=10/P=2 releases). Serialized byte
+        // limits alone cannot bound K zero-padding allocations during repair.
+        let expected_shard = h.total_data_len.div_ceil(u64::from(h.data_shards)).clamp(
+            ERROR_CORRECTION_MIN_SHARD as u64,
+            ERROR_CORRECTION_MAX_SHARD as u64,
+        );
+        if u64::from(h.shard_size) != expected_shard {
+            return Err(
+                "Error Correction geometry exceeds the supported reconstruction working set"
+                    .to_string(),
+            );
+        }
+        usize::try_from(h.total_data_len)
+            .map_err(|_| "Error Correction protected stream length exceeds usize")?;
         Ok(h)
     }
 }
@@ -790,6 +808,9 @@ pub fn correct_generate_with_progress(
             crate::lock::anchored(Path::new(&sidecar_path)).map_err(|e| e.to_string())?;
         let _out_lock = crate::lock::acquire_destination(&destination, &locked, &source_guard)
             .map_err(|e| e.to_string())?;
+        if out.is_none() {
+            crate::v3::ec::validate_automatic_sidecar_destination(&destination)?;
+        }
         if path != locked {
             let current =
                 std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
@@ -1497,17 +1518,19 @@ mod tests {
     }
     #[test]
     fn review_relative_generate_hashes_once_after_destination_lock() {
-        let dir = tempfile::tempdir_in(".").unwrap();
-        let absolute = dir.path().join("input.bin");
-        let path = absolute
-            .strip_prefix(std::env::current_dir().unwrap())
-            .unwrap()
-            .to_path_buf();
-        std::fs::write(&path, sample(32_000)).unwrap();
-        assert!(path.is_relative());
-        sync::HASH_READS.with(|n| n.set(0));
-        correct_generate(path.to_str().unwrap(), 20, None).unwrap();
-        assert_eq!(sync::HASH_READS.with(|n| n.get()), 1);
+        const KEY: &str = "AEROVAULT_RELATIVE_GENERATE_CHILD";
+        if std::env::var_os(KEY).is_some() {
+            std::fs::write("input.bin", sample(32000)).unwrap();
+            sync::HASH_READS.with(|n| n.set(0));
+            correct_generate("input.bin", 20, None).unwrap();
+            assert_eq!(sync::HASH_READS.with(|n| n.get()), 1);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "error_correction::tests::review_relative_generate_hashes_once_after_destination_lock"])
+            .current_dir(dir.path()).env(KEY, "1").status().unwrap();
+        assert!(status.success(), "{status}");
     }
     #[test]
     fn review_parity_length_matches_generator_and_bounds_every_supported_grid() {
@@ -1586,5 +1609,84 @@ mod tests {
             }
         }
         assert!(parity_payload_bound(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn review_serialized_payload_cap_does_not_authorize_working_set_amplification() {
+        for shard_size in [512 * 1024, 2 * 1024 * 1024] {
+            let header = ErrorCorrectionPayloadHeader {
+                data_shards: 200,
+                parity_shards: 1,
+                shard_size,
+                total_data_len: 1024 * 1024,
+            };
+            let (data, groups) = error_correction_geometry(&header);
+            let length = 32
+                + (data + groups) * ERROR_CORRECTION_SHARD_CKSUM_LEN
+                + groups * shard_size as usize;
+            let mut bytes = vec![0; length];
+            bytes[..32].copy_from_slice(&header.to_bytes());
+            assert!(length as u64 <= parity_payload_bound(header.total_data_len).unwrap());
+            let error = ErrorCorrectionPayload::from_bytes(&bytes).unwrap_err();
+            assert!(error.contains("working set"), "{error}");
+        }
+    }
+
+    #[test]
+    fn review_supported_grids_reconstruct_with_bounded_working_set() {
+        let grids: std::collections::BTreeSet<_> = (ERROR_CORRECTION_MIN_PCT
+            ..=ERROR_CORRECTION_MAX_PCT)
+            .map(error_correction_grid)
+            .chain([(10, 2)])
+            .collect();
+        for (k, p) in grids {
+            for length in [1, 4097, 16385] {
+                let original = vec![0x5a; length];
+                let (bytes, _, _, _) = compute_error_correction_shards_grid(&[&original], k, p);
+                ErrorCorrectionPayload::from_bytes(&bytes).unwrap();
+                let mut blocks = vec![original.clone()];
+                blocks[0][0] ^= 1;
+                assert!(reconstruct_from_error_correction(&mut blocks, &bytes).unwrap() > 0);
+                assert_eq!(blocks[0], original, "{k}/{p}, {length}");
+            }
+        }
+    }
+
+    #[test]
+    fn review_correct_generate_preserves_vault_published_during_destination_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        std::fs::write(&source, sample(32000)).unwrap();
+        let foreign = dir.path().join("foreign.aerozip");
+        crate::v3::VaultV3::create(&crate::v3::CreateOptionsV3::new_plaintext(&foreign)).unwrap();
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        let destination =
+            std::path::PathBuf::from(sidecar::aerocorrect_sidecar_path(source.to_str().unwrap()));
+        let held = crate::lock::acquire(&destination).unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = source.clone();
+            let worker = scope.spawn(move || {
+                crate::lock::ON_LOCK_CONTENTION.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        tx.send(()).unwrap();
+                    }))
+                });
+                correct_generate(path.to_str().unwrap(), 20, None)
+            });
+            let waited = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            if waited {
+                std::fs::write(&destination, &foreign_bytes).unwrap();
+            }
+            drop(held);
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(
+                waited,
+                "generation did not encounter destination contention"
+            );
+            assert!(error.contains("contains a vault"), "{error}");
+        });
+        assert_eq!(std::fs::read(&destination).unwrap(), foreign_bytes);
+        assert!(crate::v3::VaultV3::open_plaintext(&destination).is_ok());
     }
 }

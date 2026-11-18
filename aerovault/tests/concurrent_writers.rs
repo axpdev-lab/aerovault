@@ -32,18 +32,23 @@ fn same_generation_handles_preserve_each_successful_add() {
     let source = dir.path().join("source");
     std::fs::write(&source, b"directed data").unwrap();
     let first = VaultV3::add_files(&mut a, &[(source.clone(), "first".to_string())]);
-    let second = VaultV3::add_files(&mut b, &[(source, "second".to_string())]);
+    let second = VaultV3::add_files(&mut b, &[(source.clone(), "second".to_string())]);
     assert!(first.is_ok());
     let current = VaultV3::open_plaintext(&path).unwrap();
     let entries = VaultV3::summary(&current).entries;
     assert!(entries.iter().any(|e| e.path == "first"));
-    match second {
-        Ok(()) => assert!(entries.iter().any(|e| e.path == "second")),
-        Err(error) => {
-            assert!(documented_refusal(&error), "{error}");
-            assert!(!entries.iter().any(|e| e.path == "second"));
-        }
-    }
+    assert_eq!(
+        second.unwrap_err(),
+        "Vault changed while this write was in progress; retry operation"
+    );
+    assert!(!entries.iter().any(|e| e.path == "second"));
+    let mut fresh = VaultV3::open_plaintext(&path).unwrap();
+    VaultV3::add_files(&mut fresh, &[(source, "second".into())]).unwrap();
+    let reopened = VaultV3::open_plaintext(&path).unwrap();
+    assert!(VaultV3::summary(&reopened)
+        .entries
+        .iter()
+        .any(|e| e.path == "second"));
 }
 
 #[test]

@@ -51,6 +51,8 @@ pub(super) fn journal_path(source: &Path) -> PathBuf {
 struct SavedPermissions {
     unix_mode: Option<u32>,
     readonly: bool,
+    #[serde(default)]
+    windows_dacl: Option<String>,
 }
 impl SavedPermissions {
     fn capture(path: &Path) -> Result<Self, String> {
@@ -65,9 +67,21 @@ impl SavedPermissions {
         Ok(Self {
             unix_mode,
             readonly: p.readonly(),
+            #[cfg(windows)]
+            windows_dacl: Some(super::windows_security::capture(path)?),
+            #[cfg(not(windows))]
+            windows_dacl: None,
         })
     }
     fn apply(&self, path: &Path) -> Result<(), String> {
+        #[cfg(windows)]
+        super::windows_security::apply(
+            path,
+            self.windows_dacl.as_deref().ok_or(
+                "Recovery journal lacks the original Windows DACL; manual recovery required",
+            )?,
+            true,
+        )?;
         #[cfg(unix)]
         if let Some(mode) = self.unix_mode {
             use std::os::unix::fs::PermissionsExt;
@@ -77,6 +91,19 @@ impl SavedPermissions {
         let mut permissions = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
         permissions.set_readonly(self.readonly);
         fs::set_permissions(path, permissions).map_err(|e| e.to_string())
+    }
+    fn published(&self, path: &Path) -> Result<(), String> {
+        #[cfg(windows)]
+        super::windows_security::apply(
+            path,
+            self.windows_dacl
+                .as_deref()
+                .ok_or("Recovery journal lacks the original Windows DACL")?,
+            false,
+        )?;
+        #[cfg(not(windows))]
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -95,15 +122,55 @@ struct Journal {
     old_sidecar_permissions: Option<SavedPermissions>,
 }
 
-pub(super) fn private_dir(parent: &Path, prefix: &str) -> Result<tempfile::TempDir, String> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(prefix);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(fs::Permissions::from_mode(0o700));
+pub(super) struct PrivateDir {
+    path: PathBuf,
+}
+impl PrivateDir {
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
-    builder.tempdir_in(parent).map_err(|e| e.to_string())
+}
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+pub(super) fn private_dir(parent: &Path, prefix: &str) -> Result<PrivateDir, String> {
+    #[cfg(windows)]
+    let path = {
+        use rand::RngCore;
+        let mut created = None;
+        for _ in 0..128 {
+            let mut random = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut random);
+            let path = parent.join(format!("{prefix}{}", hex::encode(random)));
+            match super::windows_security::create_private_directory(&path) {
+                Ok(()) => {
+                    created = Some(path);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("Create private transaction directory: {e}")),
+            }
+        }
+        created.ok_or("Could not reserve private transaction directory")?
+    };
+    #[cfg(not(windows))]
+    let path = {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(prefix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        builder
+            .tempdir_in(parent)
+            .map_err(|e| e.to_string())?
+            .keep()
+    };
+    Ok(PrivateDir { path })
 }
 
 fn private_options() -> fs::OpenOptions {
@@ -155,9 +222,10 @@ fn replace_from(
         return Err("strip rollback copy failed its generation check".to_string());
     }
     let mut input = crate::source::open_regular_no_follow(source).map_err(|e| e.to_string())?;
+    let private = private_dir(output_parent_dir(target), ".aerostrip-restore-")?;
     let mut temp = tempfile::Builder::new()
-        .prefix(".aerostrip-restore-")
-        .tempfile_in(output_parent_dir(target))
+        .prefix("replacement-")
+        .tempfile_in(private.path())
         .map_err(|e| e.to_string())?;
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
     loop {
@@ -182,6 +250,9 @@ fn replace_from(
     // Backups remain private: permissions are restored only on the replacement.
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
     persist_over(temp, target).map_err(|e| e.to_string())?;
+    if let Some(permissions) = permissions {
+        permissions.published(target)?;
+    }
     sync_dir(output_parent_dir(target))
 }
 
@@ -313,10 +384,13 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     let sidecar_now =
         generation(&sidecar).map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
     if vault_now == journal.new_vault && sidecar_now == journal.new_sidecar {
+        // A crash can occur just after rename and before inheritance restoration.
+        restore_published_permissions(source, &sidecar, &journal)?;
         cleanup(path)?;
         return Ok(RecoveryOutcome::Stripped);
     }
     if vault_now == journal.old_vault && sidecar_now == journal.old_sidecar {
+        restore_published_permissions(source, &sidecar, &journal)?;
         cleanup(path)?;
         return Ok(RecoveryOutcome::Original);
     }
@@ -351,6 +425,20 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     }
     cleanup(path)?;
     Ok(RecoveryOutcome::Original)
+}
+
+fn restore_published_permissions(
+    source: &Path,
+    sidecar: &Path,
+    journal: &Journal,
+) -> Result<(), String> {
+    if let Some(permissions) = &journal.old_vault_permissions {
+        permissions.published(source)?;
+    }
+    if let Some(permissions) = &journal.old_sidecar_permissions {
+        permissions.published(sidecar)?;
+    }
+    Ok(())
 }
 
 /// Readers stay lock-free unless a pending strip needs recovery. Writers use
@@ -394,11 +482,7 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
 
 /// The caller has prepared old/new vault and sidecar files in a private temp
 /// directory under the source parent, while holding both namespace guards.
-pub(super) fn publish(
-    source: &Path,
-    prepared: tempfile::TempDir,
-    lock: &WriteLock,
-) -> Result<(), String> {
+pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> Result<(), String> {
     let sidecar = super::ec::default_sidecar_path(source);
     let journal = Journal {
         version: 1,
@@ -417,6 +501,14 @@ pub(super) fn publish(
         return Err(
             "vault or sidecar changed while preparing strip; originals left unchanged".to_string(),
         );
+    }
+    // Both new files stay behind the private directory while their original
+    // DACLs/modes are installed. Refuse before journal publication on failure.
+    if let Some(p) = &journal.old_vault_permissions {
+        p.apply(&prepared.path().join("new-vault"))?;
+    }
+    if let Some(p) = &journal.old_sidecar_permissions {
+        p.apply(&prepared.path().join("new-sidecar"))?;
     }
     let encoded = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
     if encoded.len() > 4096 {
@@ -445,12 +537,18 @@ pub(super) fn publish(
     }
     let result = (|| {
         fs::rename(path.join("new-vault"), source).map_err(|e| e.to_string())?;
+        if let Some(p) = &journal.old_vault_permissions {
+            p.published(source)?;
+        }
         sync_dir(output_parent_dir(source))?;
         #[cfg(test)]
         if let Some(hook) = AFTER_STRIP_VAULT.with(|h| h.borrow_mut().take()) {
             hook();
         }
         fs::rename(path.join("new-sidecar"), &sidecar).map_err(|e| e.to_string())?;
+        if let Some(p) = &journal.old_sidecar_permissions {
+            p.published(&sidecar)?;
+        }
         #[cfg(test)]
         if FAIL_FINAL_SYNC.with(|fail| fail.replace(false)) {
             return Err("injected final directory sync failure".to_string());
