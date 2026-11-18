@@ -81,18 +81,69 @@ fn wait() -> Duration {
 /// Held while a write is in progress; dropping it releases the lock.
 #[derive(Debug)]
 pub(crate) struct WriteLock {
-    /// `None` when there is nothing to lock (see [`acquire`]).
+    /// `None` only for a read-only export from media with no creatable lock.
     _file: Option<File>,
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn test_unlocked_export_guard() -> WriteLock {
+    WriteLock { _file: None }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ON_LOCK_CONTENTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The suffix of every lock file, reserved: no write replaces such a file.
 const LOCK_SUFFIX: &str = ".aerolock";
 
-/// `<vault>.aerolock`: the vault's file name with the lock suffix appended.
+/// Normalize the basename and append the lock suffix, using a bounded digest when it
+/// would exceed 255 native units (bytes on Unix, UTF-16 units on Windows).
+/// Case and canonically equivalent Unicode variants share the digest.
 pub(crate) fn lock_path(vault: &Path) -> PathBuf {
-    let mut name = vault.file_name().unwrap_or_default().to_os_string();
+    use unicode_casefold::UnicodeCaseFold;
+    use unicode_normalization::UnicodeNormalization;
+    let basename = vault.file_name().unwrap_or_default();
+    // Normalize before deciding whether to hash too: equivalent Unicode names
+    // can cross the suffix-length boundary in their original spellings.
+    let normalized = basename.to_str().map(|name| {
+        name.trim_end_matches(['.', ' '])
+            .nfc()
+            .filter(|&c| !ignored_in_names(c))
+            // Pinned Unicode tables make the digest independent of the Rust
+            // toolchain's changing Unicode/case tables (MSRV and stable agree).
+            .case_fold()
+            .nfc()
+            .collect::<String>()
+    });
+    let normalized_name = normalized
+        .as_deref()
+        .map(std::ffi::OsStr::new)
+        .unwrap_or(basename);
+    if name_units(normalized_name) + LOCK_SUFFIX.len() > 255 {
+        let digest = blake3::hash(normalized_name.as_encoded_bytes());
+        return vault.with_file_name(format!(".{}{LOCK_SUFFIX}", digest.to_hex()));
+    }
+    // Use the same spelling on both sides of the length boundary. Otherwise
+    // an ignored-character alias could switch a short original spelling to
+    // a folded spelling that the filesystem does not itself consider equal.
+    let mut name = normalized_name.to_os_string();
     name.push(LOCK_SUFFIX);
     vault.with_file_name(name)
+}
+
+/// Filename limits count native units, not Unicode scalar values.
+fn name_units(name: &std::ffi::OsStr) -> usize {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        name.encode_wide().count()
+    }
+    #[cfg(not(windows))]
+    {
+        name.as_encoded_bytes().len()
+    }
 }
 
 /// Refuse a write that would replace `dest` when its name is the name of a
@@ -198,11 +249,9 @@ fn lock_name_source(vault: &Path) -> io::Result<PathBuf> {
 /// writer. Errors say why: the lock file could not be created or opened,
 /// the lock could not be taken, or another writer kept it too long.
 ///
-/// When `<vault>.aerolock` does not exist and this process may not create files
-/// in the vault's folder (read-only folder or media), it returns a lock that
-/// holds nothing: such a process cannot rename anything over the vault
-/// either, so only a read of it (an export to another folder) can follow, and
-/// a write fails later with its own cause.
+/// A replacing write requires a real lock even when directory permissions
+/// currently forbid replacement: permissions can change before the rename.
+/// Only [`acquire_for_export`] permits an unlocked read of read-only media.
 ///
 /// A `vault` path that is itself a symbolic link is refused: a writer going
 /// through the link and one using its target would lock two different files,
@@ -212,6 +261,17 @@ fn lock_name_source(vault: &Path) -> io::Result<PathBuf> {
 /// a space ([`lock_name_source`]). On Windows a lock file that another
 /// program holds open with delete access is waited for like a held lock.
 pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
+    acquire_with_policy(vault, false)
+}
+
+/// A read-only vault export may proceed without a source lock on read-only
+/// media. Its destination still requires a real write lock, and its source
+/// generation check cannot exclude a writer after that check without a lock.
+pub(crate) fn acquire_for_export(vault: &Path) -> io::Result<WriteLock> {
+    acquire_with_policy(vault, true)
+}
+
+fn acquire_with_policy(vault: &Path, allow_unlocked_read: bool) -> io::Result<WriteLock> {
     refuse_lock_file_name(vault)?;
     if std::fs::symlink_metadata(vault).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(io::Error::other(format!(
@@ -225,7 +285,16 @@ pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
     let file = loop {
         match open_lock_file(&path) {
             Ok(Some(file)) => break file,
-            Ok(None) => return Ok(WriteLock { _file: None }),
+            Ok(None) if allow_unlocked_read => return Ok(WriteLock { _file: None }),
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "cannot create vault lock file {}; refusing an unlocked write",
+                        path.display()
+                    ),
+                ))
+            }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
                 std::thread::sleep(POLL)
             }
@@ -239,7 +308,13 @@ pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
                 trace("lock");
                 return Ok(WriteLock { _file: Some(file) });
             }
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(POLL),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                #[cfg(test)]
+                if let Some(hook) = ON_LOCK_CONTENTION.with(|h| h.borrow_mut().take()) {
+                    hook();
+                }
+                std::thread::sleep(POLL);
+            }
             Err(TryLockError::WouldBlock) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -326,20 +401,49 @@ pub(crate) fn refuse_destination(out: &Path, source: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn destination_name_fits(out: &Path) -> bool {
+    name_units(out.file_name().unwrap_or_default()) <= 255
+}
+
 /// Take the write lock of `out`, a destination the caller named for a file
 /// built from `held` (already locked by the caller): `export-parity --out`,
 /// `correct gen --out`. A vault at `out` is then replaced only while none of
 /// its writers holds its lock. `None` when `out` is a symbolic link (other
-/// than the input link itself): the rename replaces the link, never the file
+/// than the input link itself), or when the real source guard already covers
+/// the same normalized namespace: the rename replaces the link, never the file
 /// it names, so there is nothing of a writer's to protect. Refused when `out`
 /// names a lock file or is `held` itself, before any missing parent folder of
 /// `out` is created.
-pub(crate) fn acquire_destination(out: &Path, held: &Path) -> io::Result<Option<WriteLock>> {
+pub(crate) fn acquire_destination(
+    out: &Path,
+    held: &Path,
+    source_guard: &WriteLock,
+) -> io::Result<Option<WriteLock>> {
     refuse_destination(out, held)?;
+    if !destination_name_fits(out) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination basename exceeds 255 native units",
+        ));
+    }
     if std::fs::symlink_metadata(out).is_ok_and(|m| m.file_type().is_symlink()) {
         return Ok(None);
     }
-    let _ = lock_name_source(out)?;
+    let out_lock_path = lock_path(&lock_name_source(out)?);
+    let held_lock_path = lock_path(&lock_name_source(held)?);
+    // Distinct case-sensitive filenames may conservatively share a normalized
+    // lock namespace. Its already-held real guard protects both paths; taking
+    // it again would deadlock. A lock-less read-only export cannot use this.
+    if source_guard._file.is_some() {
+        if let (Ok(a), Ok(b)) = (
+            std::fs::canonicalize(&out_lock_path),
+            std::fs::canonicalize(&held_lock_path),
+        ) {
+            if a == b {
+                return Ok(None);
+            }
+        }
+    }
     std::fs::create_dir_all(parent_or_dot(out))?;
     acquire(out).map(Some)
 }
@@ -455,6 +559,9 @@ fn open_error(path: &Path, e: io::Error) -> io::Error {
 pub(crate) fn remove_vault_and_lock(vault: &Path) {
     let _ = std::fs::remove_file(vault);
     let _ = std::fs::remove_file(lock_path(vault));
+    let mut sidecar = vault.as_os_str().to_os_string();
+    sidecar.push(".aerocorrect");
+    let _ = std::fs::remove_file(lock_path(Path::new(&sidecar)));
     assert!(!vault.exists(), "vault left behind: {}", vault.display());
     assert!(
         !lock_path(vault).exists(),
@@ -471,6 +578,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aerovault-lock-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn review_aliases_share_lock_across_length_cutoff() {
+        let name = format!("{}.aerozip", "ß".repeat(116));
+        let alias = format!("{}\u{200c}\u{200c}\u{200c}.aerozip", "ß".repeat(116));
+        assert_eq!(lock_path(Path::new(&name)), lock_path(Path::new(&alias)));
+        assert_eq!(
+            lock_path(Path::new("VAULT.aerozip")),
+            lock_path(Path::new("vault.aerozip"))
+        );
+        assert_eq!(
+            lock_path(Path::new("vault.aerozip. ")),
+            lock_path(Path::new("vault.aerozip"))
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(&name);
+            let alias_path = dir.path().join(&alias);
+            std::fs::write(&path, b"vault").unwrap();
+            if alias_path.exists() {
+                set_short_wait_for_this_thread();
+                let held = acquire(&path).unwrap();
+                assert!(acquire(&alias_path).is_err());
+                drop(held);
+            }
+        }
+    }
+
+    #[test]
+    fn review_long_lock_names_are_bounded_and_normalized() {
+        let upper = PathBuf::from("K".repeat(247));
+        let lower = PathBuf::from("k".repeat(247));
+        assert_eq!(lock_path(&upper), lock_path(&lower));
+        assert_eq!(
+            lock_path(Path::new(&"Σ".repeat(247))),
+            lock_path(Path::new(&"ς".repeat(247)))
+        );
+        assert_ne!(lock_path(&lower), lock_path(Path::new(&"x".repeat(247))));
+        assert!(name_units(lock_path(&lower).file_name().unwrap()) <= 255);
+        assert_eq!(
+            lock_path(Path::new(&"é".repeat(127))),
+            lock_path(Path::new(&"e\u{301}".repeat(127)))
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            lock_path(Path::new(&"K".repeat(84))),
+            lock_path(Path::new(&"k".repeat(84)))
+        );
     }
 
     #[test]
@@ -509,7 +666,8 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
             return;
         }
-        let res = acquire(&vault);
+        let res = acquire_for_export(&vault);
+        assert!(acquire(&vault).is_err());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(res.unwrap()._file.is_none());
         assert!(!lock_path(&vault).exists());

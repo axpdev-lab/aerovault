@@ -8,7 +8,7 @@
 //! SPDX-License-Identifier: MPL-2.0
 
 use std::path::Path;
-use std::sync::{Arc, Barrier};
+use std::sync::mpsc;
 
 use aerovault::v3::{CreateOptionsV3, VaultV3};
 
@@ -22,35 +22,47 @@ fn trial(dir: &Path, t: usize) -> (usize, usize, usize) {
     VaultV3::create(&CreateOptionsV3::new_plaintext(&vault)).unwrap();
     let src = dir.join(format!("src{t}.bin"));
     std::fs::write(&src, vec![7u8; 200_000]).unwrap();
-    let start = Arc::new(Barrier::new(WRITERS));
-    let writers: Vec<_> = (0..WRITERS)
-        .map(|w| {
-            let (vault, src, start) = (vault.clone(), src.clone(), start.clone());
-            std::thread::spawn(move || {
-                start.wait();
-                let (mut ok, mut refused) = (Vec::new(), 0);
-                for i in 0..ADDS {
-                    let name = format!("w{w}-{i}.bin");
-                    let res = VaultV3::open_plaintext(&vault).and_then(|mut v| {
-                        VaultV3::add_files(&mut v, &[(src.clone(), name.clone())])
-                    });
-                    match res {
-                        Ok(()) => ok.push(name),
-                        // A refusal is a correct outcome; a lost update is not.
-                        Err(e) if e.contains("changed") || e.contains("locked") => refused += 1,
-                        Err(e) => panic!("unexpected error: {e}"),
+    let (ok, refused) = std::thread::scope(|scope| {
+        // If a later spawn panics, dropping these senders cancels every worker
+        // already started before thread::scope waits for it.
+        let mut gates = Vec::new();
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let (vault, src) = (vault.clone(), src.clone());
+                let (start, ready) = mpsc::channel();
+                gates.push(start);
+                scope.spawn(move || {
+                    if ready.recv().is_err() {
+                        return (Vec::new(), 0);
                     }
-                }
-                (ok, refused)
+                    let (mut ok, mut refused) = (Vec::new(), 0);
+                    for i in 0..ADDS {
+                        let name = format!("w{w}-{i}.bin");
+                        let res = VaultV3::open_plaintext(&vault).and_then(|mut v| {
+                            VaultV3::add_files(&mut v, &[(src.clone(), name.clone())])
+                        });
+                        match res {
+                            Ok(()) => ok.push(name),
+                            // A refusal is a correct outcome; a lost update is not.
+                            Err(e) if e.contains("changed") || e.contains("locked") => refused += 1,
+                            Err(e) => panic!("unexpected error: {e}"),
+                        }
+                    }
+                    (ok, refused)
+                })
             })
-        })
-        .collect();
-    let (mut ok, mut refused) = (Vec::new(), 0);
-    for w in writers {
-        let (o, r) = w.join().unwrap();
-        ok.extend(o);
-        refused += r;
-    }
+            .collect();
+        for start in gates {
+            start.send(()).unwrap();
+        }
+        let (mut ok, mut refused) = (Vec::new(), 0);
+        for w in writers {
+            let (o, r) = w.join().unwrap();
+            ok.extend(o);
+            refused += r;
+        }
+        (ok, refused)
+    });
     let v = VaultV3::open_plaintext(&vault).unwrap();
     let present: Vec<String> = VaultV3::summary(&v)
         .entries
@@ -63,19 +75,14 @@ fn trial(dir: &Path, t: usize) -> (usize, usize, usize) {
 
 #[test]
 fn concurrent_writers_lose_no_update() {
-    let dir = std::env::temp_dir().join(format!(
-        "aerovault-concurrent-writers-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let (mut ok, mut refused, mut lost) = (0, 0, 0);
     for t in 0..TRIALS {
-        let (o, r, l) = trial(&dir, t);
+        let (o, r, l) = trial(dir.path(), t);
         ok += o;
         refused += r;
         lost += l;
     }
-    std::fs::remove_dir_all(&dir).ok();
     eprintln!(
         "{TRIALS} trials x {WRITERS} writers x {ADDS} adds: ok={ok} refused={refused} lost={lost}"
     );

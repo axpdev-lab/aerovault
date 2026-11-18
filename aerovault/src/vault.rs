@@ -218,7 +218,7 @@ impl Vault {
         let path = path.into();
         let pwd = SecretString::from(password.into());
 
-        let file = File::open(&path)?;
+        let file = crate::source::open_regular(&path)?;
         let mut reader = BufReader::new(file);
 
         // Read header
@@ -247,7 +247,7 @@ impl Vault {
 
     /// Check if a file is an AeroVault v2 container (reads only the first 11 bytes).
     pub fn is_vault(path: impl AsRef<Path>) -> bool {
-        let Ok(file) = File::open(path.as_ref()) else {
+        let Ok(file) = crate::source::open_regular(path.as_ref()) else {
             return false;
         };
         let mut buf = [0u8; 11];
@@ -263,7 +263,7 @@ impl Vault {
     /// Returns basic metadata (version, encryption mode, chunk size) that is
     /// stored unencrypted in the header. Useful for UI display before unlock.
     pub fn peek(path: impl AsRef<Path>) -> crate::Result<PeekInfo> {
-        let file = File::open(path.as_ref())?;
+        let file = crate::source::open_regular(path.as_ref())?;
         let mut reader = BufReader::new(file);
         let mut header_buf = [0u8; HEADER_SIZE];
         reader.read_exact(&mut header_buf)?;
@@ -362,7 +362,7 @@ impl Vault {
         let bind_chunks = self.header.version >= VERSION;
 
         // Read current vault state
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -408,7 +408,7 @@ impl Vault {
 
         for file_path in file_paths {
             let file_path = file_path.as_ref();
-            let source = File::open(file_path)?;
+            let source = crate::source::open_regular(file_path)?;
             let metadata = source.metadata()?;
 
             let filename = file_path
@@ -433,7 +433,7 @@ impl Vault {
                 continue;
             }
 
-            let mut source_reader = BufReader::new(source);
+            let mut source_reader = source;
             let mut chunk_count = 0u32;
             let chunk_total = if metadata.len() == 0 {
                 0
@@ -453,13 +453,16 @@ impl Vault {
             };
             let entry_offset = data_offset;
 
-            loop {
-                let mut chunk = vec![0u8; chunk_size];
-                let bytes_read = source_reader.read(&mut chunk)?;
-                if bytes_read == 0 {
-                    break;
+            let mut remaining = metadata.len();
+            while remaining > 0 {
+                let bytes_read = remaining.min(chunk_size as u64) as usize;
+                let mut chunk = Zeroizing::new(vec![0u8; bytes_read]);
+                source_reader.read_exact(&mut chunk)?;
+                remaining -= bytes_read as u64;
+                #[cfg(test)]
+                if let Some(hook) = AFTER_ADD_SOURCE_CHUNK.with(|h| h.borrow_mut().take()) {
+                    hook();
                 }
-                chunk.truncate(bytes_read);
 
                 let encrypted_chunk = if cascade_mode {
                     crypto::encrypt_chunk_cascade_bound(
@@ -490,6 +493,13 @@ impl Vault {
                     .ok_or_else(|| crate::Error::Manifest("chunk count overflow".into()))?;
 
                 chunk.zeroize();
+            }
+
+            let mut extra = Zeroizing::new([0u8; 1]);
+            if source_reader.read(&mut *extra)? != 0 {
+                return Err(crate::Error::Manifest(
+                    "source changed size during add; aborting".into(),
+                ));
             }
 
             // The v3+ chunk AAD binds `chunk_total`, derived from the pre-stream
@@ -557,7 +567,7 @@ impl Vault {
             return Err(crate::Error::InvalidPath("directory name too long".into()));
         }
 
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -667,7 +677,7 @@ impl Vault {
         };
 
         // Open vault and seek to data section
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         // Skip header
@@ -724,7 +734,7 @@ impl Vault {
             let mut encrypted_chunk = vec![0u8; chunk_len];
             reader.read_exact(&mut encrypted_chunk)?;
 
-            let mut plaintext = if cascade_mode {
+            let mut plaintext = Zeroizing::new(if cascade_mode {
                 crypto::decrypt_chunk_cascade_bound(
                     self.master_key.expose_secret(),
                     &chacha_key,
@@ -741,7 +751,7 @@ impl Vault {
                     entry.file_id.as_ref(),
                     entry.chunk_count,
                 )?
-            };
+            });
 
             writer.write_all(&plaintext)?;
             plaintext.zeroize();
@@ -774,7 +784,7 @@ impl Vault {
     pub fn delete_entry(&self, entry_name: &str) -> crate::Result<()> {
         // Held from the read of the vault to the rename (see `crate::lock`).
         let _lock = crate::lock::acquire(&self.path)?;
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -821,7 +831,7 @@ impl Vault {
     pub fn delete_entries(&self, names: &[&str], recursive: bool) -> crate::Result<u32> {
         // Held from the read of the vault to the rename (see `crate::lock`).
         let _lock = crate::lock::acquire(&self.path)?;
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -906,7 +916,7 @@ impl Vault {
             return Err(crate::Error::InvalidPath("path too long".into()));
         }
 
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1060,7 +1070,7 @@ impl Vault {
             return Err(crate::Error::InvalidPath("path too long".into()));
         }
 
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1169,7 +1179,7 @@ impl Vault {
         let original_size = std::fs::metadata(&self.path)?.len();
 
         // Read header + manifest
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1196,7 +1206,7 @@ impl Vault {
         };
 
         // Re-open for seek-based reads
-        let orig_file = File::open(&self.path)?;
+        let orig_file = crate::source::open_regular(&self.path)?;
         let mut orig_reader = BufReader::new(orig_file);
 
         let mut compacted_data: Vec<u8> = Vec::new();
@@ -1229,7 +1239,7 @@ impl Vault {
                 let mut encrypted_chunk = vec![0u8; encrypted_chunk_len];
                 orig_reader.read_exact(&mut encrypted_chunk)?;
 
-                let mut plaintext = if cascade_mode {
+                let mut plaintext = Zeroizing::new(if cascade_mode {
                     crypto::decrypt_chunk_cascade_bound(
                         self.master_key.expose_secret(),
                         &chacha_key,
@@ -1246,7 +1256,7 @@ impl Vault {
                         entry.file_id.as_ref(),
                         entry.chunk_count,
                     )?
-                };
+                });
 
                 encrypted_chunk.zeroize();
 
@@ -1328,7 +1338,7 @@ impl Vault {
         // Held from the read of the vault to the rename (see `crate::lock`).
         let _lock = crate::lock::acquire(&self.path)?;
 
-        let mut vault_data = std::fs::read(&self.path)?;
+        let mut vault_data = crate::source::read_regular(&self.path)?;
 
         if vault_data.len() < HEADER_SIZE {
             return Err(FormatError::TooSmall {
@@ -1413,7 +1423,7 @@ impl Vault {
 
     /// Read and decrypt the vault manifest.
     fn read_manifest(&self) -> crate::Result<VaultManifest> {
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1724,6 +1734,11 @@ fn rename_into_place(tmp_path: &Path, final_path: &Path) -> std::io::Result<()> 
 
 #[cfg(test)]
 thread_local! {
+    static AFTER_ADD_SOURCE_CHUNK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test seam: makes the next commit rename fail.
     static FAIL_NEXT_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1754,6 +1769,80 @@ mod tests {
             rand::random::<u64>()
         ));
         path
+    }
+
+    #[test]
+    fn review_legacy_source_truncation_with_same_chunk_count_is_refused() {
+        for mode in [EncryptionMode::Standard, EncryptionMode::Cascade] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("legacy.aerovault");
+            let vault = Vault::create(
+                CreateOptions::new(&path, "test-password-123")
+                    .with_mode(mode)
+                    .with_chunk_size(4096),
+            )
+            .unwrap();
+            let source = dir.path().join("source.bin");
+            std::fs::write(&source, vec![7; 8192]).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let truncate = source.clone();
+            AFTER_ADD_SOURCE_CHUNK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(truncate)
+                        .unwrap()
+                        .set_len(4097)
+                        .unwrap();
+                }))
+            });
+            assert!(vault.add_files(&[&source]).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            // Same file now stable with a valid partial final chunk.
+            vault.add_files(&[&source]).unwrap();
+            let out = dir.path().join("out");
+            vault.extract("source.bin", &out).unwrap();
+            assert_eq!(
+                std::fs::read(out.join("source.bin")).unwrap(),
+                vec![7; 4097]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_fifo_source_is_refused_without_holding_other_writers() {
+        use crate::source::fifo_test;
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(dir) = fifo_test::child_path() {
+            let vault = Vault::open(dir.join("legacy.aerovault"), "test-password-123").unwrap();
+            fifo_test::ready(&dir);
+            let error = vault
+                .add_files(&[dir.join("fifo")])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("regular file"), "{error}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.aerovault");
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        assert!(
+            fifo_test::run(
+                "vault::tests::review_fifo_source_is_refused_without_holding_other_writers",
+                dir.path(),
+                "legacy-source",
+                || {}
+            ),
+            "FIFO child failed or exceeded deadline"
+        );
+        Vault::open(&path, "test-password-123")
+            .unwrap()
+            .create_directory("after-fifo")
+            .unwrap();
     }
 
     #[test]

@@ -31,9 +31,11 @@ fn create_during(
     tool: impl FnOnce(&str, &mut dyn FnMut(u64, u64)) -> Result<(), String>,
 ) {
     let mut created = None;
+    let mut created_bytes = None;
     let mut progress = |_: u64, _: u64| {
         if created.is_none() {
             created = Some(VaultV3::create(&CreateOptionsV3::new_plaintext(file)));
+            created_bytes = Some(std::fs::read(file).unwrap());
         }
     };
     let result = tool(file.to_str().unwrap(), &mut progress);
@@ -42,6 +44,7 @@ fn create_during(
         .expect("creating the vault");
     let err = result.expect_err("the tool wrote although the file changed after it read it");
     assert!(err.contains("changed while it was being read"), "{err}");
+    assert_eq!(std::fs::read(file).unwrap(), created_bytes.unwrap());
     let vault = VaultV3::open_plaintext(file).expect("the created vault is still there");
     assert!(VaultV3::summary(&vault).entries.is_empty());
 }

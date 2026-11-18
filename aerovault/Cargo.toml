@@ -51,3 +51,5 @@ walkdir = { workspace = true }
 hkdf = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-casefold = { workspace = true }

@@ -93,6 +93,8 @@ pub mod error;
 pub mod error_correction;
 pub mod format;
 pub(crate) mod lock;
+mod secret;
+mod source;
 pub mod v3;
 pub mod vault;
 

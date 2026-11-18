@@ -9,7 +9,6 @@
 //! both route here (M7 convergence: the app no longer keeps a forked copy). Sidecar bytes
 //! are byte-identical to the app's prior output (cross-impl golden T5).
 use sha2::{Digest, Sha256};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -279,8 +278,8 @@ fn generate_sync_sidecar_for_file_capped_windowed(
             });
         }
     }
-    let mut file =
-        File::open(path).map_err(|e| format!("open AeroSync EC source {}: {e}", path.display()))?;
+    let mut file = crate::source::open_regular(path)
+        .map_err(|e| format!("open AeroSync EC source {}: {e}", path.display()))?;
     let (k, p) = error_correction_grid(pct);
     let mut hasher = Sha256::new();
     let mut segments = Vec::new();
@@ -378,8 +377,8 @@ pub fn verify_repair_sync_bytes(
 /// Stream a file and return its SHA-256 with bounded memory (one `HASH_READ_CHUNK`
 /// buffer at a time). Shared by the verify fast path and the standalone verify.
 fn hash_file_streaming(path: &Path) -> Result<[u8; 32], String> {
-    let mut file =
-        File::open(path).map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
+    let mut file = crate::source::open_regular(path)
+        .map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_READ_CHUNK];
     loop {
@@ -406,18 +405,33 @@ pub(crate) fn write_if_unchanged(
     read_sha256: &[u8; 32],
     write: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
+    write_if_unchanged_with_lock(path, read_sha256, |_| write())
+}
+
+pub(crate) fn write_if_unchanged_with_lock(
+    path: &Path,
+    read_sha256: &[u8; 32],
+    write: impl FnOnce(&crate::lock::WriteLock) -> Result<(), String>,
+) -> Result<(), String> {
     #[cfg(test)]
     run_hook(&BEFORE_WRITE_LOCK);
     let _lock = crate::lock::acquire(path).map_err(|e| e.to_string())?;
+    assert_unchanged(path, read_sha256)?;
+    #[cfg(test)]
+    run_hook(&IN_WRITE_WINDOW);
+    write(&_lock)
+}
+
+/// Recheck after acquiring any additional destination guard, without taking
+/// the already held source lock recursively.
+pub(crate) fn assert_unchanged(path: &Path, read_sha256: &[u8; 32]) -> Result<(), String> {
     if hash_file_streaming(path)? != *read_sha256 {
         return Err(format!(
             "{} changed while it was being read; retry",
             path.display()
         ));
     }
-    #[cfg(test)]
-    run_hook(&IN_WRITE_WINDOW);
-    write()
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,8 +480,8 @@ pub fn verify_repair_sync_file(
             parent.display()
         )
     })?;
-    let mut src =
-        File::open(path).map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
+    let mut src = crate::source::open_regular(path)
+        .map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut read_hasher = Sha256::new();
     let mut recovered_shards = 0usize;
@@ -600,8 +614,8 @@ fn repair_streamed(
             parent.display()
         )
     })?;
-    let mut src =
-        File::open(path).map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
+    let mut src = crate::source::open_regular(path)
+        .map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut read_hasher = Sha256::new();
     let mut recovered_shards = 0usize;
@@ -738,7 +752,8 @@ pub fn scan_standalone_file_streamed(
     )
     .map_err(|e| format!("Standalone EC sidecar for {rel_path}: {e}"))?;
 
-    let mut src = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut src =
+        crate::source::open_regular(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut health = ShardHealth::default();
     for idx in 0..reader.segments().len() {
@@ -824,6 +839,116 @@ mod tests {
         }
         out.truncate(len);
         out
+    }
+
+    fn generate_during_destination_wait(
+        source: &Path,
+        out: &Path,
+        edit: impl FnOnce(),
+    ) -> Result<super::super::CorrectGenerateReport, String> {
+        let guard = crate::lock::acquire(out).unwrap();
+        let (waiting, seen) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                crate::lock::ON_LOCK_CONTENTION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || waiting.send(()).unwrap()))
+                });
+                super::super::correct_generate(
+                    source.to_str().unwrap(),
+                    20,
+                    Some(out.to_str().unwrap()),
+                )
+            });
+            let encountered_held_lock =
+                seen.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            if encountered_held_lock {
+                edit();
+            }
+            drop(guard);
+            let result = worker.join().unwrap();
+            assert!(
+                encountered_held_lock,
+                "writer never encountered the held destination lock"
+            );
+            result
+        })
+    }
+
+    #[test]
+    fn review_generate_rechecks_after_destination_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        std::fs::write(&source, b"original source").unwrap();
+        let out = dir.path().join("out.aerocorrect");
+        std::fs::write(&out, b"keep previous parity").unwrap();
+        let err = generate_during_destination_wait(&source, &out, || {
+            std::fs::write(&source, b"edited source").unwrap()
+        })
+        .unwrap_err();
+        assert!(err.contains("changed"), "{err}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep previous parity");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_generate_refuses_retargeted_input_link() {
+        for parent_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            std::fs::create_dir(&a).unwrap();
+            std::fs::create_dir(&b).unwrap();
+            std::fs::write(
+                a.join("source.bin"),
+                b"same contents, different writer namespace",
+            )
+            .unwrap();
+            std::fs::copy(a.join("source.bin"), b.join("source.bin")).unwrap();
+            let link = dir.path().join("link");
+            let (target_a, target_b, input) = if parent_link {
+                (a.clone(), b.clone(), link.join("source.bin"))
+            } else {
+                (a.join("source.bin"), b.join("source.bin"), link.clone())
+            };
+            std::os::unix::fs::symlink(&target_a, &link).unwrap();
+            let out = dir.path().join("out.aerocorrect");
+            std::fs::write(&out, b"keep previous parity").unwrap();
+            let err = generate_during_destination_wait(&input, &out, || {
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(&target_b, &link).unwrap();
+            })
+            .unwrap_err();
+            assert!(err.contains("changed target"), "{err}");
+            assert_eq!(std::fs::read(&out).unwrap(), b"keep previous parity");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_replacement_requires_a_real_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, b"original").unwrap();
+        let hash = hash_file_streaming(&path).unwrap();
+        let staged = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(staged.path(), b"replacement").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"").is_ok() {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let mut ran = false;
+        let result = write_if_unchanged(&path, &hash, || {
+            ran = true;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(staged.path(), &path).unwrap();
+            Ok(())
+        });
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "replacement accepted without a real lock");
+        assert!(!ran);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
     }
 
     #[test]

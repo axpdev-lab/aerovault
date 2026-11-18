@@ -41,3 +41,5 @@ walkdir = "2"
 hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 libc = "0.2"
+unicode-normalization = "=0.1.26"
+unicode-casefold = "=0.2.0"

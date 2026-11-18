@@ -706,7 +706,7 @@ pub(crate) struct AeroCorrectSegmentRef {
     pub(crate) window_offset: u64,
     pub(crate) window_len: u64,
     avec_file_offset: u64,
-    avec_len: u64,
+    pub(crate) avec_len: u64,
     geom: Option<[u8; GEOM_LEN]>,
 }
 
@@ -726,7 +726,7 @@ pub(crate) struct AeroCorrectSidecarReader {
 
 impl AeroCorrectSidecarReader {
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        let mut file = File::open(path)
+        let mut file = crate::source::open_regular(path)
             .map_err(|e| format!("open aerocorrect sidecar {}: {e}", path.display()))?;
         let file_len = file
             .metadata()
@@ -939,6 +939,14 @@ impl AeroCorrectSidecarReader {
     /// the in-payload geometry header is healed from the directory's protected copy before
     /// the bytes are returned, so a rotted header cannot block reconstruction.
     pub(crate) fn read_segment_avec(&mut self, index: usize) -> Result<Vec<u8>, String> {
+        self.read_segment_avec_bounded(index, usize::MAX)
+    }
+
+    pub(crate) fn read_segment_avec_bounded(
+        &mut self,
+        index: usize,
+        max: usize,
+    ) -> Result<Vec<u8>, String> {
         let seg = *self
             .segments
             .get(index)
@@ -946,6 +954,9 @@ impl AeroCorrectSidecarReader {
         let off = seg.avec_file_offset;
         let len = usize::try_from(seg.avec_len)
             .map_err(|_| "aerocorrect segment length exceeds usize".to_string())?;
+        if len > max {
+            return Err("aerocorrect parity exceeds expected recovery geometry".to_string());
+        }
         self.file
             .seek(SeekFrom::Start(off))
             .map_err(|e| format!("seek aerocorrect segment avec: {e}"))?;

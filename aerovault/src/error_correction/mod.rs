@@ -729,22 +729,25 @@ pub fn correct_generate_with_progress(
     // `file` may be a link: the sidecar goes next to the link, as before, but
     // the lock and the check are those of the file it names, so a link to a
     // vault shares that vault's lock. Nothing is written over the link itself.
-    let locked = if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?
-    } else {
-        path.to_path_buf()
-    };
-    sync::write_if_unchanged(&locked, &generated.file_sha256, || {
-        // A chosen output path may be a vault: replace it only under its own
-        // lock too (the default sidecar is covered by the file's lock).
-        let _out_lock = match out {
-            Some(o) if o != sidecar::aerocorrect_sidecar_path(file) => {
-                crate::lock::refuse_destination(Path::new(o), path).map_err(|e| e.to_string())?;
-                crate::lock::acquire_destination(Path::new(o), &locked)
-                    .map_err(|e| e.to_string())?
+    let locked = std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
+    sync::write_if_unchanged_with_lock(&locked, &generated.file_sha256, |source_guard| {
+        // Every destination can hold a vault, including the default sidecar.
+        crate::lock::refuse_destination(Path::new(&sidecar_path), path)
+            .map_err(|e| e.to_string())?;
+        let _out_lock =
+            crate::lock::acquire_destination(Path::new(&sidecar_path), &locked, source_guard)
+                .map_err(|e| e.to_string())?;
+        sync::assert_unchanged(&locked, &generated.file_sha256)?;
+        if path != locked {
+            let current =
+                std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
+            if current != locked {
+                return Err(format!(
+                    "{file} changed target while it was being read; retry"
+                ));
             }
-            _ => None,
-        };
+            sync::assert_unchanged(path, &generated.file_sha256)?;
+        }
         crate::v3::vault::atomic_write(Path::new(&sidecar_path), &generated.sidecar_bytes)
             .map_err(|e| format!("write sidecar {sidecar_path}: {e}"))
     })?;

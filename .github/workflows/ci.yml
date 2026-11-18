@@ -40,4 +40,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --no-fail-fast
+
+  msrv:
+    name: Test Rust 1.89
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.89
+      - run: cargo test --workspace --release --no-fail-fast
