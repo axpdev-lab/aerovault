@@ -692,7 +692,7 @@ pub fn correct_generate_with_progress(
     // Refused before the file is read: the write at the end would refuse it.
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
     if let Some(out) = out {
-        crate::lock::refuse_lock_file_name(Path::new(out)).map_err(|e| e.to_string())?;
+        crate::lock::refuse_destination(Path::new(out), path).map_err(|e| e.to_string())?;
     }
     let rel = rel_name(file);
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
@@ -739,6 +739,7 @@ pub fn correct_generate_with_progress(
         // lock too (the default sidecar is covered by the file's lock).
         let _out_lock = match out {
             Some(o) if o != sidecar::aerocorrect_sidecar_path(file) => {
+                crate::lock::refuse_destination(Path::new(o), path).map_err(|e| e.to_string())?;
                 crate::lock::acquire_destination(Path::new(o), &locked)
                     .map_err(|e| e.to_string())?
             }
@@ -1142,7 +1143,11 @@ mod tests {
         std::fs::write(&named, vec![3u8; 50_000]).unwrap();
         std::fs::write(&plain, vec![3u8; 50_000]).unwrap();
         let out = dir.path().join("w.aerolock");
-        for (file, out) in [(&named, None), (&plain, Some(out.to_str().unwrap()))] {
+        for (file, out) in [
+            (&named, None),
+            (&plain, Some(out.to_str().unwrap())),
+            (&plain, Some(plain.to_str().unwrap())),
+        ] {
             let mut read = false;
             let err =
                 correct_generate_with_progress(file.to_str().unwrap(), 10, out, &mut |_, _| {
@@ -1150,10 +1155,14 @@ mod tests {
                 })
                 .map(drop)
                 .unwrap_err();
-            assert!(err.contains("vault lock file"), "{err}");
+            assert!(
+                err.contains("vault lock file") || err.contains("the file it is built from"),
+                "{err}"
+            );
             assert!(!read, "the file was read before the refusal");
         }
         assert!(!out.exists());
+        assert!(!crate::lock::lock_path(&plain).exists());
     }
 
     #[test]

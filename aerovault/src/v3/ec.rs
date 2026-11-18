@@ -336,6 +336,9 @@ pub(super) fn export_parity(
     password: &str,
     out_path: Option<&Path>,
 ) -> Result<ExportParityResult, String> {
+    if let Some(p) = out_path {
+        crate::lock::refuse_destination(p, vault_path).map_err(|e| e.to_string())?;
+    }
     let lock = super::vault::write_lock(vault_path)?;
     export_parity_locked(vault_path, password, out_path, &lock)
 }

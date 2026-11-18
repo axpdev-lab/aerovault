@@ -3325,9 +3325,31 @@ mod tests {
         assert!(err.contains("locked by another writer"), "export: {err}");
         assert_eq!(std::fs::read(&b).unwrap(), b_before);
         drop(held);
-        // Without another writer the chosen output is written, as before.
+        // Without another writer the chosen output is written, as before,
+        // including into a missing parent folder.
         VaultV3::export_parity(&c, PW, Some(&b)).unwrap();
         assert_ne!(std::fs::read(&b).unwrap(), b_before);
+        let new_export = dir.join("new_a").join("sub").join("c.aerocorrect");
+        let new_gen = dir.join("new_b").join("sub").join("plain.aerocorrect");
+        VaultV3::export_parity(&c, PW, Some(&new_export)).unwrap();
+        crate::error_correction::correct_generate(plain.to_str().unwrap(), 10, new_gen.to_str())
+            .unwrap();
+        assert!(new_export.exists() && new_gen.exists());
+        // A refused `--out` makes no folder, takes no lock and derives no key.
+        std::fs::remove_file(crate::lock::lock_path(&c)).unwrap();
+        crate::lock::take_trace();
+        for bad in [&c, &dir.join("new_bad").join("sub").join("x.aerolock")] {
+            let err = VaultV3::export_parity(&c, PW, Some(bad))
+                .map(drop)
+                .unwrap_err();
+            assert!(
+                err.contains("the file it is built from") || err.contains("vault lock file"),
+                "{err}"
+            );
+        }
+        assert!(crate::lock::take_trace().is_empty());
+        assert!(!crate::lock::lock_path(&c).exists());
+        assert!(!dir.join("new_bad").exists());
         // An output that is the file it is built from is refused at once.
         let err =
             crate::error_correction::correct_generate(plain.to_str().unwrap(), 10, plain.to_str())
@@ -3335,6 +3357,23 @@ mod tests {
                 .unwrap_err();
         assert!(err.contains("the file it is built from"), "{err}");
         assert_eq!(std::fs::read(&plain).unwrap(), vec![9u8; 20_000]);
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.bin");
+            std::os::unix::fs::symlink(&plain, &link).unwrap();
+            let err = crate::error_correction::correct_generate(
+                link.to_str().unwrap(),
+                10,
+                link.to_str(),
+            )
+            .map(drop)
+            .unwrap_err();
+            assert!(err.contains("the file it is built from"), "{err}");
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
