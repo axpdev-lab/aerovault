@@ -3377,6 +3377,51 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_output_that_is_another_name_of_the_source_is_refused_at_once() {
+        // A hard link of the source (or, on a case-insensitive file system, the
+        // source in another case) is a path the name check cannot match: it is
+        // refused by file identity, before the source is read or locked.
+        let dir = scratch_dir();
+        let plain = dir.join("plain.bin");
+        let plain_link = dir.join("plain-other-name.bin");
+        let c = dir.join("c.aerovault");
+        let c_link = dir.join("c-other-name.aerovault");
+        std::fs::write(&plain, vec![7u8; 20_000]).unwrap();
+        std::fs::hard_link(&plain, &plain_link).unwrap();
+        VaultV3::create(&CreateOptionsV3::new(&c, PW)).unwrap();
+        std::fs::hard_link(&c, &c_link).unwrap();
+        std::fs::remove_file(crate::lock::lock_path(&c)).unwrap();
+        let c_before = std::fs::read(&c).unwrap();
+        crate::lock::take_trace();
+        let mut read = false;
+        let err = crate::error_correction::correct_generate_with_progress(
+            plain.to_str().unwrap(),
+            10,
+            plain_link.to_str(),
+            &mut |_, _| read = true,
+        )
+        .map(drop)
+        .unwrap_err();
+        assert!(err.contains("the file it is built from"), "gen: {err}");
+        assert!(!read, "the source was read before the refusal");
+        let err = VaultV3::export_parity(&c, PW, Some(&c_link))
+            .map(drop)
+            .unwrap_err();
+        assert!(err.contains("the file it is built from"), "export: {err}");
+        assert!(
+            crate::lock::take_trace().is_empty(),
+            "locked or derived before the refusal"
+        );
+        for p in [&plain, &plain_link, &c, &c_link] {
+            assert!(!crate::lock::lock_path(p).exists(), "{}", p.display());
+        }
+        assert_eq!(std::fs::read(&plain_link).unwrap(), vec![7u8; 20_000]);
+        assert_eq!(std::fs::read(&c_link).unwrap(), c_before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_vault_lock_file_is_never_written_over() {
         // Vault paths `p` and `p.aerolock`: while writer A holds the lock of

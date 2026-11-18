@@ -444,6 +444,7 @@ pub fn verify_repair_sync_file(
     path: &Path,
     sidecar_bytes: &[u8],
 ) -> Result<SyncEcRepairResult, String> {
+    crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
         .len();
@@ -559,6 +560,7 @@ fn repair_streamed(
     sidecar_path: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcRepairResult, String> {
+    crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
     let file_size = std::fs::metadata(path)
         .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
         .len();

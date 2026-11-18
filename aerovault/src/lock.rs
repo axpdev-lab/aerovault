@@ -266,22 +266,54 @@ fn parent_or_dot(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+#[derive(PartialEq, Eq)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Inode(u64, u64),
+    Path(PathBuf, std::ffi::OsString),
+}
+
 /// Refuse `out` when it names a lock file or is `source` itself (the file
 /// being read, or the link passed to read it). When `out` is a symbolic link
 /// to `source`, the rename replaces the link and not `source`, so only a link
-/// that is `source` itself is refused.
+/// that is `source` itself is refused. On Unix an existing `out` is also
+/// compared with `source` by device and inode, so a hard link of `source` or
+/// another case on a case-insensitive file system is refused too (on Windows
+/// `canonicalize` resolves case and short names; a hard link is a separate
+/// name, as for vault writes).
 pub(crate) fn refuse_destination(out: &Path, source: &Path) -> io::Result<()> {
     refuse_lock_file_name(out)?;
     let out_is_link = std::fs::symlink_metadata(out).is_ok_and(|m| m.file_type().is_symlink());
-    let key = |p: &Path, follow_leaf: bool| -> Option<(PathBuf, std::ffi::OsString)> {
+    let key = |p: &Path, follow_leaf: bool| -> Option<FileIdentity> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = if follow_leaf {
+                std::fs::metadata(p)
+            } else {
+                std::fs::symlink_metadata(p)
+            };
+            if let Ok(m) = meta {
+                return Some(FileIdentity::Inode(m.dev(), m.ino()));
+            }
+        }
         if follow_leaf {
             if let Ok(real) = std::fs::canonicalize(p) {
-                return Some((real, std::ffi::OsString::new()));
+                return Some(FileIdentity::Path(real, std::ffi::OsString::new()));
             }
         }
         let dir = std::fs::canonicalize(parent_or_dot(p))
             .unwrap_or_else(|_| parent_or_dot(p).to_path_buf());
-        Some((dir, p.file_name()?.to_os_string()))
+        let leaf = p.file_name()?;
+        #[cfg(windows)]
+        let leaf = std::ffi::OsString::from(
+            leaf.to_string_lossy()
+                .trim_end_matches(['.', ' '])
+                .to_lowercase(),
+        );
+        #[cfg(not(windows))]
+        let leaf = leaf.to_os_string();
+        Some(FileIdentity::Path(dir, leaf))
     };
     if let (Some(a), Some(b)) = (key(out, !out_is_link), key(source, !out_is_link)) {
         if a == b {

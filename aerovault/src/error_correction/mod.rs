@@ -1163,6 +1163,36 @@ mod tests {
         }
         assert!(!out.exists());
         assert!(!crate::lock::lock_path(&plain).exists());
+        // `correct repair` (and `verify_repair_sync_file`) also refuses a
+        // lock-named file before reading it, whether intact or damaged.
+        let report = correct_generate(plain.to_str().unwrap(), 25, None).unwrap();
+        let sidecar_bytes = std::fs::read(&report.sidecar).unwrap();
+        let expected: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(vec![3u8; 50_000]).into()
+        };
+        for damaged in [false, true] {
+            let mut bytes = vec![3u8; 50_000];
+            if damaged {
+                bytes[200..400].fill(0xAA);
+            }
+            std::fs::write(&named, &bytes).unwrap();
+            let mut read = false;
+            let err = correct_repair_anchored_with_progress(
+                named.to_str().unwrap(),
+                Some(&report.sidecar),
+                None,
+                &mut |_, _| read = true,
+            )
+            .map(drop)
+            .unwrap_err();
+            assert!(err.contains("vault lock file"), "{err}");
+            assert!(!read, "repair read the lock-named file before refusing");
+            let err = sync::verify_repair_sync_file("plain.bin", &expected, &named, &sidecar_bytes)
+                .map(drop)
+                .unwrap_err();
+            assert!(err.contains("vault lock file"), "{err}");
+        }
     }
 
     #[test]
