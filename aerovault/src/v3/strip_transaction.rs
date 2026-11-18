@@ -163,13 +163,11 @@ fn recorded_source(parent: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     #[cfg(windows)]
     let name = {
         use std::os::windows::ffi::OsStringExt;
-        if bytes.len() % 2 != 0 {
+        let (pairs, remainder) = bytes.as_chunks::<2>();
+        if !remainder.is_empty() {
             return Err("invalid strip journal source name".to_string());
         }
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect();
+        let units: Vec<u16> = pairs.iter().map(|b| u16::from_le_bytes(*b)).collect();
         std::ffi::OsString::from_wide(&units)
     };
     let leaf = Path::new(&name);
