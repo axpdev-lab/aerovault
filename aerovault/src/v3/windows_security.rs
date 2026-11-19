@@ -24,6 +24,18 @@ unsafe extern "system" {
         acl: *mut *mut c_void,
         defaulted: *mut i32,
     ) -> i32;
+    fn GetSecurityDescriptorControl(
+        descriptor: *const c_void,
+        control: *mut u16,
+        revision: *mut u32,
+    ) -> i32;
+    fn GetAclInformation(
+        acl: *const c_void,
+        information: *mut AclSize,
+        size: u32,
+        class: u32,
+    ) -> i32;
+    fn GetAce(acl: *const c_void, index: u32, ace: *mut *mut c_void) -> i32;
     fn GetSecurityDescriptorOwner(
         descriptor: *const c_void,
         owner: *mut *mut c_void,
@@ -63,6 +75,78 @@ struct SecurityAttributes {
     length: u32,
     descriptor: *mut c_void,
     inherit_handle: i32,
+}
+
+#[repr(C)]
+struct AclSize {
+    count: u32,
+    in_use: u32,
+    free: u32,
+}
+
+/// Compare all ACE bytes and DACL protection, independently of SDDL formatting
+/// and Windows' informational auto-inheritance control flags.
+fn protected_aces(sddl: &str) -> Result<Vec<Vec<u8>>, String> {
+    if sddl.len() > 65536 || sddl.contains('\0') {
+        return Err("Invalid bounded DACL text".into());
+    }
+    let text: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            text.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let descriptor = Local(descriptor);
+    let mut control = 0u16;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0
+        || control & 0x1000 == 0
+    {
+        return Err("Private directory DACL is not protected".into());
+    }
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut acl = std::ptr::null_mut();
+    if unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted) }
+        == 0
+        || present == 0
+        || acl.is_null()
+    {
+        return Err("Private directory has no restrictive DACL".into());
+    }
+    let mut size = AclSize {
+        count: 0,
+        in_use: 0,
+        free: 0,
+    };
+    if unsafe { GetAclInformation(acl, &mut size, std::mem::size_of::<AclSize>() as u32, 2) } == 0
+        || size.count > 4096
+        || size.in_use > 65536
+    {
+        return Err("Private directory ACL exceeds bounds".into());
+    }
+    let mut aces = Vec::with_capacity(size.count as usize);
+    for index in 0..size.count {
+        let mut ace = std::ptr::null_mut();
+        if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+            return Err("Cannot inspect private directory ACE".into());
+        }
+        // Windows validated this ACE; its first four bytes are ACE_HEADER.
+        let header = unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), 4) };
+        let len = u16::from_le_bytes([header[2], header[3]]) as usize;
+        if len < 4 || len > size.in_use as usize {
+            return Err("Invalid private directory ACE size".into());
+        }
+        aces.push(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), len) }.to_vec());
+    }
+    Ok(aces)
 }
 
 struct Local(*mut c_void);
@@ -238,17 +322,22 @@ pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
     }
     // Refuse filesystems that do not preserve the requested security. The
     // directory is still empty; no vault or rollback bytes have been written.
-    match capture(path) {
-        Ok(actual) if actual.split("D:").nth(1) == Some("P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)") => {
+    let verified = capture(path).and_then(|actual| {
+        let actual = protected_aces(&actual)?;
+        let expected = protected_aces("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)")?;
+        if actual == expected {
             Ok(())
+        } else {
+            Err("Private directory ACEs differ from requested access".into())
         }
-        _ => {
-            let _ = std::fs::remove_dir(path);
-            Err(std::io::Error::other(
-                "Filesystem did not preserve private directory DACL",
-            ))
-        }
+    });
+    if let Err(error) = verified {
+        let _ = std::fs::remove_dir(path);
+        return Err(std::io::Error::other(format!(
+            "Filesystem did not preserve private directory DACL: {error}"
+        )));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -313,4 +402,26 @@ pub(super) fn guest_effective_rights(path: &Path) -> Result<u32, String> {
         return Err(std::io::Error::from_raw_os_error(error as i32).to_string());
     }
     Ok(rights)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protected_aces;
+    #[test]
+    fn private_dacl_comparison_ignores_formatting_but_rejects_access_changes() {
+        let expected = protected_aces("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)").unwrap();
+        assert_eq!(
+            expected,
+            protected_aces("D:PAI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)").unwrap()
+        );
+        assert_ne!(
+            expected,
+            protected_aces("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FR;;;BG)").unwrap()
+        );
+        assert_ne!(
+            expected,
+            protected_aces("D:P(A;OICI;FR;;;OW)(A;OICI;FA;;;SY)").unwrap()
+        );
+        assert!(protected_aces("D:AI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)").is_err());
+    }
 }

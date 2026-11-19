@@ -2470,6 +2470,12 @@ fn open_vault_with_guard(
         Ok(m) => (m, false),
         Err(orig) => {
             if recovery_guard.is_none() {
+                // The retry reads another complete data section. Release this
+                // attempt's payload and metadata before acquiring/reopening.
+                drop(data);
+                drop(encrypted_manifest);
+                drop(extension_json);
+                drop(extensions);
                 drop(file);
                 return retry_open_for_recovery(&path, password, encrypted_only);
             }
@@ -5414,6 +5420,51 @@ mod tests {
         );
         eprintln!(
             "8.3 vault leaf exercised: {short_leaf:?}; sidecar and password recovery verified"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_manifest_recovery_retry_releases_first_data_buffer_under_memory_limit() {
+        const KEY: &str = "AEROVAULT_MANIFEST_RETRY_MEMORY_PATH";
+        const DATA_LEN: usize = 768 * 1024 * 1024;
+        if let Some(path) = std::env::var_os(KEY) {
+            crate::source::memory_test::limit();
+            let opened = VaultV3::open_plaintext(PathBuf::from(path)).unwrap();
+            assert!(opened.manifest_repaired_on_open);
+            assert_eq!(opened.data.len(), DATA_LEN);
+            assert_eq!(opened.data[0], 0);
+            assert_eq!(opened.data[DATA_LEN - 1], 0);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-manifest.aerozip");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&path),
+            super::super::ec::RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        vault.data.resize(DATA_LEN, 0);
+        save_open_vault(&mut vault).unwrap();
+        let manifest_at = vault.header.manifest_offset;
+        drop(vault);
+        super::super::ec::export_parity(&path, "", None).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut byte = [0];
+        file.seek(std::io::SeekFrom::Start(manifest_at)).unwrap();
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xff;
+        file.seek(std::io::SeekFrom::Start(manifest_at)).unwrap();
+        std::io::Write::write_all(&mut file, &byte).unwrap();
+        drop(file);
+        crate::source::memory_test::run(
+            "v3::vault::tests::review_manifest_recovery_retry_releases_first_data_buffer_under_memory_limit", KEY, &path,
         );
     }
 
