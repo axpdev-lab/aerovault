@@ -81,6 +81,26 @@ impl SavedPermissions {
             windows_dacl: None,
         })
     }
+    /// Capture how a new file would be created in its actual destination
+    /// directory, using an empty probe rather than exposing staged vault bytes.
+    fn new_destination(path: &Path) -> Result<Option<Self>, String> {
+        if path.try_exists().map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        #[cfg(windows)]
+        {
+            let probe = tempfile::Builder::new()
+                .prefix(".aerovault-security-")
+                .tempfile_in(output_parent_dir(path))
+                .map_err(|e| e.to_string())?;
+            Self::capture(probe.path()).map(Some)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(None)
+        }
+    }
+
     fn apply(&self, path: &Path) -> Result<(), String> {
         #[cfg(windows)]
         super::windows_security::apply(
@@ -128,6 +148,10 @@ struct Journal {
     old_vault_permissions: Option<SavedPermissions>,
     #[serde(default)]
     old_sidecar_permissions: Option<SavedPermissions>,
+    #[serde(default)]
+    new_vault_permissions: Option<SavedPermissions>,
+    #[serde(default)]
+    new_sidecar_permissions: Option<SavedPermissions>,
 }
 
 pub(super) struct PrivateDir {
@@ -393,12 +417,12 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         .map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
     if vault_now == Some(journal.new_vault) && sidecar_now == Some(journal.new_sidecar) {
         // A crash can occur just after rename and before inheritance restoration.
-        restore_published_permissions(source, &sidecar, &journal)?;
+        restore_published_permissions(source, &sidecar, &journal, true)?;
         cleanup(path)?;
         return Ok(RecoveryOutcome::Stripped);
     }
     if vault_now == journal.old_vault && sidecar_now == journal.old_sidecar {
-        restore_published_permissions(source, &sidecar, &journal)?;
+        restore_published_permissions(source, &sidecar, &journal, false)?;
         cleanup(path)?;
         return Ok(RecoveryOutcome::Original);
     }
@@ -467,12 +491,43 @@ fn restore_published_permissions(
     source: &Path,
     sidecar: &Path,
     journal: &Journal,
+    new_pair: bool,
 ) -> Result<(), String> {
+    if new_pair {
+        publish_security(
+            source,
+            journal
+                .new_vault_permissions
+                .as_ref()
+                .or(journal.old_vault_permissions.as_ref()),
+        )?;
+        publish_security(
+            sidecar,
+            journal
+                .new_sidecar_permissions
+                .as_ref()
+                .or(journal.old_sidecar_permissions.as_ref()),
+        )?;
+        return Ok(());
+    }
     if let Some(permissions) = &journal.old_vault_permissions {
         permissions.published(source)?;
     }
     if let Some(permissions) = &journal.old_sidecar_permissions {
         permissions.published(sidecar)?;
+    }
+    Ok(())
+}
+
+fn publish_security(path: &Path, permissions: Option<&SavedPermissions>) -> Result<(), String> {
+    #[cfg(windows)]
+    if permissions.is_none() {
+        return Err(
+            "Recovery journal lacks the intended Windows DACL; manual recovery required".into(),
+        );
+    }
+    if let Some(permissions) = permissions {
+        permissions.published(path)?;
     }
     Ok(())
 }
@@ -523,6 +578,8 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
     let journal = Journal {
         version: 2,
         source_name: native_name(source),
+        new_vault_permissions: SavedPermissions::new_destination(source)?,
+        new_sidecar_permissions: SavedPermissions::new_destination(&sidecar)?,
         old_vault: generation_if_present(&prepared.path().join("old-vault"))?,
         new_vault: generation(&prepared.path().join("new-vault"))?,
         old_sidecar: generation_if_present(&prepared.path().join("old-sidecar"))?,
@@ -581,18 +638,30 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
     }
     let result = (|| {
         fs::rename(path.join("new-vault"), source).map_err(|e| e.to_string())?;
-        if let Some(p) = &journal.old_vault_permissions {
-            p.published(source)?;
-        }
+        publish_security(
+            source,
+            journal
+                .new_vault_permissions
+                .as_ref()
+                .or(journal.old_vault_permissions.as_ref()),
+        )?;
         sync_dir(output_parent_dir(source))?;
         #[cfg(test)]
         if let Some(hook) = AFTER_STRIP_VAULT.with(|h| h.borrow_mut().take()) {
             hook();
         }
         fs::rename(path.join("new-sidecar"), &sidecar).map_err(|e| e.to_string())?;
-        if let Some(p) = &journal.old_sidecar_permissions {
-            p.published(&sidecar)?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_STRIP_SECOND_RENAME.with(|h| h.borrow_mut().take()) {
+            hook();
         }
+        publish_security(
+            &sidecar,
+            journal
+                .new_sidecar_permissions
+                .as_ref()
+                .or(journal.old_sidecar_permissions.as_ref()),
+        )?;
         #[cfg(test)]
         if FAIL_FINAL_SYNC.with(|fail| fail.replace(false)) {
             return Err("injected final directory sync failure".to_string());
@@ -620,6 +689,7 @@ thread_local! {
     pub(super) static BEFORE_STRIP_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_STRIP_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_STRIP_VAULT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_STRIP_SECOND_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_STRIP_SIDECAR: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 

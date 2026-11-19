@@ -50,6 +50,10 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cargo test --release -p aerovault --lib review_windows_strip_preserves_second_principal_effective_access -- --nocapture
 
+      - name: Windows fresh-file inheritance restart regression
+        if: matrix.os == 'windows-latest'
+        run: cargo test --release -p aerovault --lib review_windows_fresh_pair_inherits_destination_security_after_restart -- --nocapture
+
       - name: HFS+ filename and sidecar lock regression
         if: matrix.os == 'macos-latest'
         shell: bash

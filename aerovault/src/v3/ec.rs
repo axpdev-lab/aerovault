@@ -3280,4 +3280,79 @@ mod tests {
             }
         }
     }
+    #[cfg(windows)]
+    #[test]
+    fn review_windows_fresh_pair_inherits_destination_security_after_restart() {
+        use super::super::{strip_transaction as tx, windows_security as acl};
+        const CHILD: &str = "AEROVAULT_FRESH_PAIR_CRASH_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let journal = tx::journal_path(&path);
+            tx::AFTER_STRIP_JOURNAL.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    for name in ["new-vault", "new-sidecar"] {
+                        assert_eq!(
+                            acl::guest_effective_rights(&journal.join(name)).unwrap() & 1,
+                            0
+                        );
+                    }
+                }))
+            });
+            tx::AFTER_STRIP_SECOND_RENAME.with(|h| {
+                *h.borrow_mut() = Some(Box::new(|| {
+                    std::process::exit(77);
+                }))
+            });
+            let placement = if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("detached")
+            {
+                RecoveryPlacement::Detached
+            } else {
+                RecoveryPlacement::Both
+            };
+            VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
+                .unwrap();
+            panic!("crash seam was not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        acl::apply(
+            dir.path(),
+            "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+            true,
+        )
+        .unwrap();
+        for (name, placement) in [
+            ("detached", RecoveryPlacement::Detached),
+            ("both", RecoveryPlacement::Both),
+        ] {
+            let ordinary = dir.path().join(format!("normal-{name}.aerovault"));
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&ordinary, PW),
+                placement,
+                20,
+            )
+            .unwrap();
+            for file in [&ordinary, &default_sidecar_path(&ordinary)] {
+                assert_ne!(acl::guest_effective_rights(file).unwrap() & 1, 0);
+            }
+            let path = dir.path().join(format!("{name}-crash.aerovault"));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "v3::ec::tests::review_windows_fresh_pair_inherits_destination_security_after_restart", "--nocapture"])
+                .env(CHILD, &path).status().unwrap();
+            assert_eq!(status.code(), Some(77));
+            let sidecar = default_sidecar_path(&path);
+            assert!(tx::journal_path(&path).is_dir());
+            // The second rename happened, but its publication permissions did
+            // not. Reopen must restore the recorded intent before cleanup.
+            assert_eq!(acl::guest_effective_rights(&sidecar).unwrap() & 1, 0);
+            assert!(VaultV3::open(&path, PW).is_ok());
+            for file in [&path, &sidecar] {
+                assert_ne!(acl::guest_effective_rights(file).unwrap() & 1, 0);
+            }
+            assert!(!tx::journal_path(&path).exists());
+        }
+        eprintln!("Windows fresh pair: private staging and destination inheritance after publication/restart verified");
+    }
 }
