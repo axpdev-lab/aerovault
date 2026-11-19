@@ -2,7 +2,7 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
-## [0.6.9] - Unreleased
+## [0.6.9] - 2026-11-19
 
 ### Security
 
