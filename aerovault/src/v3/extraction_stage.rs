@@ -32,7 +32,15 @@ mod platform {
         directory: File,
         name: CString,
         file: File,
+        published: bool,
     }
+
+    enum Replacement {
+        Exchange,
+        Link(CString),
+    }
+
+    type Identity = (libc::dev_t, libc::ino_t);
 
     impl Stage {
         pub(crate) fn new(directory: &File, _: &Path) -> io::Result<Self> {
@@ -69,6 +77,7 @@ mod platform {
                     directory,
                     name: leaf,
                     file,
+                    published: false,
                 };
                 #[cfg(target_os = "macos")]
                 crate::v3::unix_security::clear_extraction_acl(&stage.file)?;
@@ -85,53 +94,203 @@ mod platform {
         }
 
         pub(crate) fn verify(&self) -> io::Result<()> {
-            use std::os::unix::fs::MetadataExt;
-            let fd = unsafe {
-                libc::openat(
-                    self.directory.as_raw_fd(),
-                    self.name.as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-                )
-            };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let current = unsafe { File::from_raw_fd(fd) }.metadata()?;
-            let opened = self.file.metadata()?;
-            if !current.is_file() || (current.dev(), current.ino()) != (opened.dev(), opened.ino())
-            {
+            self.verify_leaf(&self.name)
+        }
+
+        fn verify_leaf(&self, leaf: &CStr) -> io::Result<()> {
+            let opened = stat(|metadata| unsafe { libc::fstat(self.file.as_raw_fd(), metadata) })?;
+            if identity_at(self.directory.as_raw_fd(), leaf)? != identity(&opened) {
                 return Err(io::Error::other("Extraction staging file changed"));
             }
             Ok(())
         }
 
-        pub(crate) fn publish(&mut self, target: &Path, overwrite: bool) -> io::Result<()> {
+        pub(crate) fn publish(
+            &mut self,
+            target: &Path,
+            overwrite: bool,
+            check_parent: impl Fn() -> io::Result<()>,
+        ) -> io::Result<()> {
             let target = name(
                 target
                     .file_name()
                     .ok_or_else(|| io::Error::other("Missing output basename"))?,
             )?;
             let directory = self.directory.as_raw_fd();
-            if overwrite {
-                let result = unsafe {
-                    libc::renameat(directory, self.name.as_ptr(), directory, target.as_ptr())
-                };
-                return if result == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                };
+            self.verify()?;
+            check_parent()?;
+            if !overwrite {
+                rename_noclobber(directory, &self.name, &target)?;
+                if let Err(error) = check_parent() {
+                    if self.verify_leaf(&target).is_ok() {
+                        let _ = unlink(directory, &target);
+                    }
+                    return Err(error);
+                }
+                self.published = true;
+                return Ok(());
             }
-            rename_noclobber(directory, &self.name, &target)
+
+            // Retain the original inode until the post-rename containment
+            // check. A parent move can occur inside either rename syscall.
+            let original = stat_at(directory, &target)?;
+            if original.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err(io::Error::other(
+                    "Extraction destination is no longer a regular file",
+                ));
+            }
+            let original = identity(&original);
+            let replacement = match rename_exchange(directory, &self.name, &target) {
+                Ok(()) => Replacement::Exchange,
+                Err(error) if unsupported_rename(&error) => {
+                    let backup = CString::new([self.name.to_bytes(), b".previous"].concat())
+                        .map_err(io::Error::other)?;
+                    link(directory, &target, &backup)?;
+                    if let Err(error) =
+                        check_parent().and_then(|()| rename(directory, &self.name, &target))
+                    {
+                        let _ = unlink(directory, &backup);
+                        return Err(error);
+                    }
+                    Replacement::Link(backup)
+                }
+                Err(error) => return Err(error),
+            };
+            let backup = match &replacement {
+                Replacement::Exchange => &self.name,
+                Replacement::Link(backup) => backup,
+            };
+            let verify_original = || {
+                if identity_at(directory, backup)? != original {
+                    return Err(io::Error::other("Original extraction destination changed"));
+                }
+                Ok(())
+            };
+            if let Err(error) = check_parent() {
+                let restored = self
+                    .verify_leaf(&target)
+                    .and_then(|()| verify_original())
+                    .and_then(|()| match &replacement {
+                        Replacement::Exchange => rename_exchange(directory, backup, &target),
+                        Replacement::Link(_) => rename(directory, backup, &target),
+                    });
+                return Err(match restored {
+                    Ok(()) => error,
+                    Err(restore) => io::Error::other(format!(
+                        "{error}. Cannot restore the original destination: {restore}. \
+                         Retained recovery name {} in the validated directory",
+                        backup.to_string_lossy()
+                    )),
+                });
+            }
+            self.published = true;
+            verify_original()
+                .and_then(|()| unlink(directory, backup))
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "Destination published. Cannot remove the previous output {}: {error}",
+                        backup.to_string_lossy()
+                    ))
+                })
         }
     }
 
     impl Drop for Stage {
         fn drop(&mut self) {
+            if !self.published {
+                let _ = self.file.set_len(0);
+            }
             if self.verify().is_ok() {
-                unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+                let _ = unlink(self.directory.as_raw_fd(), &self.name);
             }
         }
+    }
+
+    fn stat(read: impl FnOnce(*mut libc::stat) -> libc::c_int) -> io::Result<libc::stat> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        unix_result(read(metadata.as_mut_ptr()))?;
+        Ok(unsafe { metadata.assume_init() })
+    }
+
+    fn stat_at(directory: libc::c_int, name: &CStr) -> io::Result<libc::stat> {
+        stat(|metadata| unsafe {
+            libc::fstatat(
+                directory,
+                name.as_ptr(),
+                metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })
+    }
+
+    fn identity(metadata: &libc::stat) -> Identity {
+        (metadata.st_dev, metadata.st_ino)
+    }
+
+    fn identity_at(directory: libc::c_int, name: &CStr) -> io::Result<Identity> {
+        stat_at(directory, name).map(|metadata| identity(&metadata))
+    }
+
+    fn unix_result(result: libc::c_int) -> io::Result<()> {
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn rename(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        unix_result(unsafe { libc::renameat(directory, source.as_ptr(), directory, dest.as_ptr()) })
+    }
+
+    fn link(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        unix_result(unsafe {
+            libc::linkat(directory, source.as_ptr(), directory, dest.as_ptr(), 0)
+        })
+    }
+
+    fn unlink(directory: libc::c_int, leaf: &CStr) -> io::Result<()> {
+        unix_result(unsafe { libc::unlinkat(directory, leaf.as_ptr(), 0) })
+    }
+
+    fn unsupported_rename(error: &io::Error) -> bool {
+        error.kind() == io::ErrorKind::Unsupported
+            || matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::ENOTSUP | libc::EINVAL)
+            )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rename_exchange(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        unix_result(unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                directory,
+                source.as_ptr(),
+                directory,
+                dest.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            ) as libc::c_int
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn rename_exchange(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        unix_result(unsafe {
+            libc::renameatx_np(
+                directory,
+                source.as_ptr(),
+                directory,
+                dest.as_ptr(),
+                libc::RENAME_SWAP,
+            )
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn rename_exchange(_: libc::c_int, _: &CStr, _: &CStr) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     fn rename_noclobber(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
@@ -162,22 +321,13 @@ mod platform {
                 return Ok(());
             }
             let error = io::Error::last_os_error();
-            if !matches!(
-                error.raw_os_error(),
-                Some(libc::ENOSYS | libc::ENOTSUP | libc::EINVAL)
-            ) {
+            if !unsupported_rename(&error) {
                 return Err(error);
             }
         }
         // Filesystems without an atomic no-replace rename can atomically
         // create a hard link. The stage's normal cleanup removes the old name.
-        let linked =
-            unsafe { libc::linkat(directory, source.as_ptr(), directory, dest.as_ptr(), 0) };
-        if linked == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        link(directory, source, dest)
     }
 
     #[cfg(all(test, target_os = "macos"))]
@@ -201,7 +351,7 @@ mod platform {
         assert_eq!(stage.file().metadata().unwrap().len(), 0);
         assert!(capture(&staged).unwrap().is_empty());
         let published = dir.path().join("published");
-        stage.publish(&published, false).unwrap();
+        stage.publish(&published, false, || Ok(())).unwrap();
         assert!(capture(&published).unwrap().is_empty());
     }
 }
@@ -267,7 +417,14 @@ mod platform {
             Ok(())
         }
 
-        pub(crate) fn publish(&mut self, target: &Path, overwrite: bool) -> io::Result<()> {
+        pub(crate) fn publish(
+            &mut self,
+            target: &Path,
+            overwrite: bool,
+            check_parent: impl Fn() -> io::Result<()>,
+        ) -> io::Result<()> {
+            self.verify()?;
+            check_parent()?;
             let temp = self.temp.take().expect("unpublished stage");
             let result = if overwrite {
                 temp.persist(target)

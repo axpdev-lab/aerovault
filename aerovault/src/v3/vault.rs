@@ -1785,6 +1785,23 @@ impl ExtractionParent {
                 let _ = stage.file().set_len(0);
             })
     }
+
+    fn check_publication(&self, _overwrite: bool) -> std::io::Result<()> {
+        self.recheck().map_err(std::io::Error::other)?;
+        #[cfg(all(test, unix))]
+        AFTER_EXTRACTION_PUBLICATION_CHECK.with(|slot| {
+            let mut pending = slot.borrow_mut();
+            if pending
+                .as_ref()
+                .is_some_and(|(expected, _)| *expected == _overwrite)
+            {
+                if let Some((_, hook)) = pending.take() {
+                    hook();
+                }
+            }
+        });
+        Ok(())
+    }
 }
 
 fn prepare_output_parent(root: &Path, output: &Path) -> Result<ExtractionParent, String> {
@@ -1834,6 +1851,14 @@ thread_local! {
     static AFTER_EXTRACTION_PARENT: ExtractionHook = const { std::cell::RefCell::new(None) };
     static AFTER_EXTRACTION_STAGE: ExtractionHook = const { std::cell::RefCell::new(None) };
     static BEFORE_EXTRACTION_PUBLISH: ExtractionHook = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+type PublicationHook = std::cell::RefCell<Option<(bool, Box<dyn FnOnce()>)>>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static AFTER_EXTRACTION_PUBLICATION_CHECK: PublicationHook = const { std::cell::RefCell::new(None) };
 }
 
 fn extract_file_entry(
@@ -2033,17 +2058,19 @@ fn extract_file_entry(
     // is empty, so an empty entry over an empty file (extracting the same
     // folder again) has nothing to write and keeps the file that is there.
     if let Some(guard) = guard {
-        match tmp.publish(guard.source_path(), false) {
+        match tmp.publish(guard.source_path(), false, || {
+            parent.check_publication(false)
+        }) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 guard_extraction_replacement(guard.source_path())?;
                 parent.recheck_stage(&tmp)?;
-                tmp.publish(guard.source_path(), true)
+                tmp.publish(guard.source_path(), true, || parent.check_publication(true))
                     .map_err(|e| format!("Persist extracted file: {e}"))?;
             }
             Err(e) => return Err(format!("Persist extracted file: {e}")),
         }
-    } else if let Err(e) = tmp.publish(&destination, false) {
+    } else if let Err(e) = tmp.publish(&destination, false, || parent.check_publication(false)) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(format!("Persist vault: {e}"));
         }
@@ -6384,13 +6411,22 @@ mod tests {
             &AFTER_EXTRACTION_STAGE,
             &BEFORE_EXTRACTION_PUBLISH,
         ] {
-            assert_extraction_rejects_moved_parent(hook);
+            assert_extraction_rejects_moved_parent(Some(hook), false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_rolls_back_a_parent_move_after_the_publication_check() {
+        for overwrite in [false, true] {
+            assert_extraction_rejects_moved_parent(None, overwrite);
         }
     }
 
     #[cfg(unix)]
     fn assert_extraction_rejects_moved_parent(
-        hook: &'static std::thread::LocalKey<ExtractionHook>,
+        hook: Option<&'static std::thread::LocalKey<ExtractionHook>>,
+        overwrite: bool,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
@@ -6404,15 +6440,26 @@ mod tests {
         let mut vault = VaultV3::open_plaintext(&archive).unwrap();
         VaultV3::add_files(&mut vault, &[(input, "subdir/file".into())]).unwrap();
         let subdir = root.join("subdir");
+        let original_bytes = b"existing output to preserve";
+        let original = overwrite.then(|| {
+            std::fs::create_dir(&subdir).unwrap();
+            let path = subdir.join("file");
+            std::fs::write(&path, original_bytes).unwrap();
+            same_file::Handle::from_path(path).unwrap()
+        });
         let moved = outside.join("moved");
         let moved_destination = moved.clone();
         let redirect = outside.clone();
-        hook.with(|h| {
-            *h.borrow_mut() = Some(Box::new(move || {
-                std::fs::rename(&subdir, moved_destination).unwrap();
-                std::os::unix::fs::symlink(redirect, subdir).unwrap();
-            }));
+        let move_parent = Box::new(move || {
+            std::fs::rename(&subdir, moved_destination).unwrap();
+            std::os::unix::fs::symlink(redirect, subdir).unwrap();
         });
+        if let Some(hook) = hook {
+            hook.with(|slot| *slot.borrow_mut() = Some(move_parent));
+        } else {
+            AFTER_EXTRACTION_PUBLICATION_CHECK
+                .with(|slot| *slot.borrow_mut() = Some((overwrite, move_parent)));
+        }
         let error = VaultV3::extract_all(&vault, &root).unwrap_err();
         assert!(
             error.contains("validated output directory changed"),
@@ -6423,8 +6470,18 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .collect();
         assert_eq!(outside_entries, std::slice::from_ref(&moved));
+        let moved_output = moved.join("file");
+        if let Some(original) = original {
+            assert_eq!(std::fs::read(&moved_output).unwrap(), original_bytes);
+            assert!(same_file::Handle::from_path(&moved_output).unwrap() == original);
+        } else {
+            assert!(!moved_output.exists());
+        }
         for entry in std::fs::read_dir(moved).unwrap() {
             let entry = entry.unwrap();
+            if overwrite && entry.path() == moved_output {
+                continue;
+            }
             assert_eq!(entry.file_name(), "file.aerolock");
             assert_eq!(entry.metadata().unwrap().len(), 0);
         }
