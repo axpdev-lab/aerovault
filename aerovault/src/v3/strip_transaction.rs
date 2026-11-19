@@ -659,7 +659,7 @@ impl<'a> TrustedJournal<'a> {
             drop(journal_handle);
             let result = cleanup(path);
             drop(ancestors);
-            result
+            result.map_err(|e| format!("Retire verified strip journal: {e}"))
         }
         #[cfg(not(windows))]
         cleanup(path)
@@ -680,8 +680,15 @@ fn validate_private_journal_directory(path: &Path, opened: &fs::File) -> Result<
     if !super::unix_security::capture(path)?.is_empty() {
         return Err("strip journal directory has an extended access ACL".into());
     }
+    validate_journal_ancestry(output_parent_dir(path))
+}
+
+#[cfg(unix)]
+fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let user = unsafe { libc::geteuid() };
     // An untrusted parent must not be able to replace the checked journal entry.
-    for ancestor in path.ancestors().skip(1) {
+    for ancestor in parent.ancestors() {
         let metadata = fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
         if !metadata.is_dir()
             || (metadata.uid() != user && metadata.uid() != 0)
@@ -811,8 +818,12 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         return Err(conflict(path, "newer or damaged vault or sidecar"));
     }
     // Verify both copies before replacing either original.
-    let old_vault = trusted.backup("old-vault", journal.old_vault)?;
-    let old_sidecar = trusted.backup("old-sidecar", journal.old_sidecar)?;
+    let mut old_vault = trusted
+        .backup("old-vault", journal.old_vault)
+        .map_err(|e| conflict(path, &format!("vault rollback input: {e}")))?;
+    let mut old_sidecar = trusted
+        .backup("old-sidecar", journal.old_sidecar)
+        .map_err(|e| conflict(path, &format!("sidecar rollback input: {e}")))?;
     trusted.recheck()?;
     let rollback = path.join("rollback-intent");
     if !rollback.try_exists().map_err(|e| e.to_string())? {
@@ -823,11 +834,21 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         sync_dir(path)?;
     }
     if vault_now != journal.old_vault {
-        restore_original(old_vault, source, journal.old_vault, vault_now)?;
+        restore_original(old_vault.take(), source, journal.old_vault, vault_now)
+            .map_err(|e| format!("Restore verified original vault: {e}"))?;
     }
     if sidecar_now != journal.old_sidecar {
-        restore_original(old_sidecar, &sidecar, journal.old_sidecar, sidecar_now)?;
+        restore_original(
+            old_sidecar.take(),
+            &sidecar,
+            journal.old_sidecar,
+            sidecar_now,
+        )
+        .map_err(|e| format!("Restore verified original sidecar: {e}"))?;
     }
+    // Windows can deny moving the containing directory while an untouched
+    // rollback input still has an open handle.
+    drop((old_vault, old_sidecar));
     #[cfg(test)]
     if let Some(hook) = AFTER_ROLLBACK_RESTORE.with(|h| h.borrow_mut().take()) {
         hook();
@@ -1066,6 +1087,11 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
 /// The caller has prepared old/new vault and sidecar files in a private temp
 /// directory under the source parent, while holding both namespace guards.
 pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> Result<(), String> {
+    #[cfg(unix)]
+    let trusted_parent = fs::canonicalize(output_parent_dir(source)).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    validate_journal_ancestry(&trusted_parent)
+        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
     let sidecar = super::ec::default_sidecar_path(source);
     let journal = Journal {
         version: 4,
@@ -1122,6 +1148,9 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
     if let Some(hook) = BEFORE_STRIP_JOURNAL.with(|h| h.borrow_mut().take()) {
         hook();
     }
+    #[cfg(unix)]
+    validate_journal_ancestry(&trusted_parent)
+        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
     fs::rename(prepared.path(), &path).map_err(|e| format!("publish strip journal: {e}"))?;
     sync_dir(output_parent_dir(source))?;
     #[cfg(test)]
@@ -1318,6 +1347,45 @@ mod tests {
             assert!(journal_path(&source).is_dir());
             assert_eq!(fs::read(target).unwrap(), edited);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_ancestry_refuses_pair_before_publication_and_reopens_original() {
+        use super::super::{
+            ec::RecoveryPlacement,
+            vault::{CreateOptionsV3, VaultV3},
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let source = shared.join("source.aerovault");
+        let sidecar = super::super::ec::default_sidecar_path(&source);
+        let password = "existing-password-123";
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&source, password),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        let old_vault = fs::read(&source).unwrap();
+        let old_sidecar = fs::read(&sidecar).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let mut opened = VaultV3::open(&source, password).unwrap();
+        let error = VaultV3::change_password(&mut opened, "different-password-123").unwrap_err();
+        assert!(
+            error.contains("Cannot publish a recoverable vault/sidecar pair"),
+            "{error}"
+        );
+        drop(opened);
+        assert!(!journal_path(&source).exists());
+        assert_eq!(fs::read(&source).unwrap(), old_vault);
+        assert_eq!(fs::read(&sidecar).unwrap(), old_sidecar);
+        assert!(VaultV3::open(&source, password).is_ok());
+        assert!(VaultV3::open(&source, "different-password-123").is_err());
     }
 
     #[cfg(unix)]

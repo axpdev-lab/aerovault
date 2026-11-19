@@ -1261,14 +1261,9 @@ pub struct RecoveryStatus {
 /// Report the Error Correction recovery surfaces for a vault without the password.
 pub(super) fn recovery_status(path: &Path) -> Result<RecoveryStatus, String> {
     let embedded = has_error_correction(path).unwrap_or(false);
-    let physical = std::fs::canonicalize(path).ok();
-    let manifest_path = path;
-    #[cfg(windows)]
-    let manifest_path = if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
-        physical.as_deref().unwrap_or(path)
-    } else {
-        manifest_path
-    };
+    let namespace = super::vault::recovery_namespace(path).ok();
+    let manifest_path = namespace.as_deref().unwrap_or(path);
+    let physical = std::fs::canonicalize(manifest_path).ok();
     let (manifest_parity, header_parity) = sidecar_parity_flags(manifest_path);
     let header_parity = physical.as_deref().is_some_and(|p| {
         if p == manifest_path {

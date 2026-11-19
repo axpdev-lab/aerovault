@@ -2541,14 +2541,8 @@ fn retry_open_for_recovery(
     open_vault_with_guard(path.to_path_buf(), password, encrypted_only, Some(&guard))
 }
 
-fn open_vault_with_guard(
-    path: impl Into<PathBuf>,
-    password: &str,
-    encrypted_only: bool,
-    recovery_guard: Option<&WriteLock>,
-) -> Result<OpenVaultV3, String> {
-    let path =
-        crate::lock::anchored(&path.into()).map_err(|e| format!("Resolve vault parent: {e}"))?;
+pub(super) fn recovery_namespace(path: &Path) -> Result<PathBuf, String> {
+    let path = crate::lock::anchored(path).map_err(|e| format!("Resolve vault parent: {e}"))?;
     // A regular Windows leaf can be an 8.3 alias. Retain the long namespace
     // spelling for recovery reads and later default-sidecar writes. A symbolic
     // leaf remains symbolic so a later replacing write still refuses it.
@@ -2558,6 +2552,16 @@ fn open_vault_with_guard(
     } else {
         path
     };
+    Ok(path)
+}
+
+fn open_vault_with_guard(
+    path: impl Into<PathBuf>,
+    password: &str,
+    encrypted_only: bool,
+    recovery_guard: Option<&WriteLock>,
+) -> Result<OpenVaultV3, String> {
+    let path = recovery_namespace(&path.into())?;
     if let Some(guard) = recovery_guard {
         super::strip_transaction::recover_under_guard(guard)?;
     } else {
@@ -5799,8 +5803,14 @@ mod tests {
         // Keep the long parent so this regression must exercise an aliased
         // vault leaf, independently of any short name on a parent directory.
         let short = long.with_file_name(short_leaf);
+        VaultV3::export_parity(&long, PW, None).unwrap();
         let status = VaultV3::recovery_status(&short).unwrap();
-        assert!(status.detached && status.manifest_parity && status.header_parity);
+        let long_status = VaultV3::recovery_status(&long).unwrap();
+        assert!(
+            long_status.detached && long_status.manifest_parity && long_status.header_parity,
+            "{long_status:?}"
+        );
+        assert_eq!(status, long_status);
         let sidecar = super::super::ec::default_sidecar_path(&long);
         let before = std::fs::read(&sidecar).unwrap();
         let mut vault = VaultV3::open(&short, PW).unwrap();
