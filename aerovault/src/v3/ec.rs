@@ -3583,6 +3583,146 @@ mod tests {
         assert_eq!(std::fs::read(&sidecar).unwrap(), expected_sidecar);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn round7f_unix_restart_completes_pair_with_stale_security_intent() {
+        use super::super::strip_transaction as tx;
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AEROVAULT_UNIX_SECURITY_RESTART_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let journal = tx::journal_path(&path);
+            let sidecar = default_sidecar_path(&path);
+            let published = path.clone();
+            tx::AFTER_SIDECAR_SECURITY_APPLY.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    assert!(!journal.join("sidecar-security-done").exists());
+                    // Reproduce a start marker left by the previous implementation.
+                    let file = std::fs::File::create(journal.join("sidecar-security-done-started"))
+                        .unwrap();
+                    file.sync_all().unwrap();
+                    std::fs::set_permissions(&published, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    std::process::exit(77);
+                }))
+            });
+            VaultV3::strip_parity(&path, PW, false).unwrap();
+            panic!("Unix security-marker interruption seam not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unix-security-restart.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "v3::ec::tests::round7f_unix_restart_completes_pair_with_stale_security_intent",
+                "--nocapture",
+            ])
+            .env(CHILD, &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(77));
+        let journal = tx::journal_path(&path);
+        assert!(journal.join("sidecar-security-done-started").is_file());
+        assert!(!journal.join("sidecar-security-done").exists());
+        let sidecar = default_sidecar_path(&path);
+        let before_vault = std::fs::read(&path).unwrap();
+        let before_sidecar = std::fs::read(&sidecar).unwrap();
+        assert!(VaultV3::open(&path, PW).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), before_vault);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before_sidecar);
+        for file in [&path, &sidecar] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!journal.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_mixed_pair_rollback_preserves_later_vault_dacl() {
+        use super::super::{strip_transaction as tx, windows_security as acl};
+        const CHILD: &str = "AEROVAULT_MIXED_ROLLBACK_ACL_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let narrowed = path.clone();
+            let hook: Box<dyn FnOnce()> = Box::new(move || {
+                acl::apply(&narrowed, "D:P(D;;FR;;;BG)(A;;FA;;;OW)(A;;FA;;;SY)", true).unwrap();
+                std::process::exit(77);
+            });
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("apply-gap")
+            {
+                tx::AFTER_VAULT_SECURITY_APPLY.with(|h| *h.borrow_mut() = Some(hook));
+            } else {
+                tx::AFTER_STRIP_VAULT.with(|h| *h.borrow_mut() = Some(hook));
+            }
+            VaultV3::strip_parity(&path, PW, false).unwrap();
+            panic!("mixed-pair vault interruption seam not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        acl::apply(
+            dir.path(),
+            "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+            true,
+        )
+        .unwrap();
+        for phase in ["apply-gap", "completed"] {
+            let path = dir.path().join(format!("{phase}.aerovault"));
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&path, PW),
+                RecoveryPlacement::Both,
+                20,
+            )
+            .unwrap();
+            VaultV3::export_parity(&path, PW, None).unwrap();
+            let original_vault = std::fs::read(&path).unwrap();
+            let sidecar = default_sidecar_path(&path);
+            let original_sidecar = std::fs::read(&sidecar).unwrap();
+            let sidecar_descriptor = acl::capture(&sidecar).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "v3::ec::tests::round7_windows_mixed_pair_rollback_preserves_later_vault_dacl",
+                    "--nocapture",
+                ])
+                .env(CHILD, &path)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(77));
+            let journal = tx::journal_path(&path);
+            assert!(!journal.join("new-vault").exists());
+            assert!(journal.join("new-sidecar").exists());
+            assert_eq!(
+                journal.join("vault-security-done").exists(),
+                phase == "completed"
+            );
+            assert!(journal.join("vault-security-done-started").is_file());
+            let descriptor = acl::capture(&path).unwrap();
+            assert_eq!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+            assert_ne!(std::fs::read(&path).unwrap(), original_vault);
+            assert!(VaultV3::open(&path, PW).is_ok());
+            assert_eq!(std::fs::read(&path).unwrap(), original_vault);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), original_sidecar);
+            assert_eq!(acl::capture(&path).unwrap(), descriptor);
+            assert_eq!(acl::capture(&sidecar).unwrap(), sidecar_descriptor);
+            assert!(!journal.exists());
+        }
+        eprintln!("Windows mixed-pair rollback: narrowed vault DACL preserved both before and after security completion");
+    }
+
     #[cfg(windows)]
     #[test]
     fn round7_windows_security_application_without_completion_is_conflict() {

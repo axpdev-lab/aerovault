@@ -250,7 +250,7 @@ fn replace_from(
     target: &Path,
     expected: Generation,
     target_before: Generation,
-    permissions: Option<&SavedPermissions>,
+    original_permissions: Option<&SavedPermissions>,
 ) -> Result<(), String> {
     if generation(source)? != expected {
         return Err("strip rollback copy failed its generation check".to_string());
@@ -278,6 +278,18 @@ fn replace_from(
             "strip target changed while preparing rollback; newer file left untouched".to_string(),
         );
     }
+    // Rolling back content must not roll back a later operator restriction.
+    // Capture current Windows security under the destination guard and carry
+    // that context onto the restored bytes, including incomplete finalization.
+    #[cfg(windows)]
+    let current_permissions = SavedPermissions::capture(target)?;
+    #[cfg(windows)]
+    let permissions = {
+        let _ = original_permissions;
+        Some(&current_permissions)
+    };
+    #[cfg(not(windows))]
+    let permissions = original_permissions;
     if let Some(permissions) = permissions {
         permissions.apply(temp.path())?;
     }
@@ -572,8 +584,8 @@ fn restore_published_permissions(
     Ok(())
 }
 
-// Sync intent before applying security, then sync completion afterwards. An
-// interrupted application is ambiguous: recovery must retain current security
+// On Windows, sync intent before applying security and completion afterwards.
+// An interrupted application is ambiguous: recovery must retain current security
 // and recovery material rather than overwrite a later operator restriction.
 fn finish_security(
     path: &Path,
@@ -585,19 +597,30 @@ fn finish_security(
     if done.try_exists().map_err(|e| e.to_string())? {
         return Ok(());
     }
-    let started = journal.join(format!("{marker}-started"));
-    match private_options().open(&started) {
-        Ok(file) => file.sync_all().map_err(|e| e.to_string())?,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(conflict(
-                journal,
-                "security publication was interrupted; current permissions retained",
-            ));
+    // Unix publication has no security write: modes were applied while staged.
+    // A start marker left by an earlier version cannot make it ambiguous.
+    #[cfg(windows)]
+    {
+        let started = journal.join(format!("{marker}-started"));
+        match private_options().open(&started) {
+            Ok(file) => file.sync_all().map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(conflict(
+                    journal,
+                    "security publication was interrupted; current permissions retained",
+                ));
+            }
+            Err(e) => return Err(e.to_string()),
         }
-        Err(e) => return Err(e.to_string()),
+        sync_dir(journal)?;
     }
-    sync_dir(journal)?;
     publish_security(path, permissions)?;
+    #[cfg(test)]
+    if marker == "vault-security-done" {
+        if let Some(hook) = AFTER_VAULT_SECURITY_APPLY.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
     #[cfg(test)]
     if marker == "sidecar-security-done" {
         if let Some(hook) = AFTER_SIDECAR_SECURITY_APPLY.with(|h| h.borrow_mut().take()) {
@@ -799,6 +822,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static AFTER_VAULT_SECURITY_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_PENDING_JOURNAL_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_SIDECAR_SECURITY_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static FAIL_CLEANUP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -833,7 +857,7 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
-    fn round7d_incomplete_security_intent_preserves_current_permissions() {
+    fn round7f_unix_incomplete_security_marker_does_not_change_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("published");
@@ -843,28 +867,23 @@ mod tests {
         let journal = private_dir(dir.path(), ".aerostrip-test-").unwrap();
         fs::write(journal.path().join("sidecar-security-done-started"), b"").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let error = finish_security(
+        finish_security(
             &path,
             Some(&original),
             journal.path(),
             "sidecar-security-done",
         )
-        .unwrap_err();
-        assert!(
-            error.contains("security publication was interrupted"),
-            "{error}"
-        );
+        .unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert_eq!(fs::read(&path).unwrap(), b"published content");
-        assert!(!journal.path().join("sidecar-security-done").exists());
+        assert!(journal.path().join("sidecar-security-done").is_file());
         assert!(journal
             .path()
             .join("sidecar-security-done-started")
             .exists());
-        fs::write(journal.path().join("sidecar-security-done"), b"").unwrap();
         finish_security(
             &path,
             Some(&original),
