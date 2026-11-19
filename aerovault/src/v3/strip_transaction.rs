@@ -58,6 +58,8 @@ pub(super) fn journal_path(source: &Path) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 struct SavedPermissions {
     unix_mode: Option<u32>,
+    #[serde(default)]
+    unix_acl: Option<Vec<u8>>,
     readonly: bool,
     #[serde(default)]
     windows_dacl: Option<String>,
@@ -74,6 +76,10 @@ impl SavedPermissions {
         let unix_mode = None;
         Ok(Self {
             unix_mode,
+            #[cfg(unix)]
+            unix_acl: Some(super::unix_security::capture(path)?),
+            #[cfg(not(unix))]
+            unix_acl: None,
             readonly: p.readonly(),
             #[cfg(windows)]
             windows_dacl: Some(super::windows_security::capture(path)?),
@@ -113,8 +119,19 @@ impl SavedPermissions {
         #[cfg(unix)]
         if let Some(mode) = self.unix_mode {
             use std::os::unix::fs::PermissionsExt;
-            return fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
-                .map_err(|e| e.to_string());
+            let acl = self.unix_acl.as_deref().ok_or(
+                "Recovery journal lacks the original access ACL; manual recovery required",
+            )?;
+            super::unix_security::apply(path, acl)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+                .map_err(|e| e.to_string())?;
+            if super::unix_security::capture(path)? != acl {
+                return Err(
+                    "Access ACL preservation could not be verified; originals left unchanged"
+                        .into(),
+                );
+            }
+            return Ok(());
         }
         let mut permissions = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
         permissions.set_readonly(self.readonly);
@@ -231,6 +248,15 @@ fn sync_dir(path: &Path) -> Result<(), String> {
 /// Copy with fixed scratch storage, retaining the exact generation check. The
 /// prepared directory is private; targets are fresh files, never reused paths.
 pub(super) fn copy_file(source: &Path, target: &Path) -> Result<Generation, String> {
+    copy_file_capped(source, target, u64::MAX)
+}
+
+pub(super) fn copy_file_capped(
+    source: &Path,
+    target: &Path,
+    limit: u64,
+) -> Result<Generation, String> {
+    let mut copied = 0u64;
     let mut input = crate::source::open_regular_no_follow(source).map_err(|e| e.to_string())?;
     let mut output = private_options().open(target).map_err(|e| e.to_string())?;
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
@@ -238,6 +264,12 @@ pub(super) fn copy_file(source: &Path, target: &Path) -> Result<Generation, Stri
         let n = input.read(&mut *buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
+        }
+        copied = copied
+            .checked_add(n as u64)
+            .ok_or("Recovery copy length overflow")?;
+        if copied > limit {
+            return Err("Recovery input grew beyond its validated copy bound".into());
         }
         output.write_all(&buf[..n]).map_err(|e| e.to_string())?;
     }
@@ -449,6 +481,15 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     let sidecar_now = generation_if_present(&sidecar)
         .map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
     let original_pair = vault_now == journal.old_vault && sidecar_now == journal.old_sidecar;
+    if original_pair
+        && path
+            .join("rollback-intent")
+            .try_exists()
+            .map_err(|e| e.to_string())?
+    {
+        cleanup(path)?;
+        return Ok(RecoveryOutcome::Original);
+    }
     if original_pair && path.join("new-vault").exists() && path.join("new-sidecar").exists() {
         cleanup(path)?;
         return Ok(RecoveryOutcome::Original);
@@ -476,6 +517,14 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     {
         return Err("strip rollback generation check failed; files left untouched".to_string());
     }
+    let rollback = path.join("rollback-intent");
+    if !rollback.try_exists().map_err(|e| e.to_string())? {
+        let file = private_options()
+            .open(rollback)
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        sync_dir(path)?;
+    }
     if vault_now != journal.old_vault {
         restore_original(
             &path.join("old-vault"),
@@ -493,6 +542,10 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
             sidecar_now,
             journal.old_sidecar_permissions.as_ref(),
         )?;
+    }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_ROLLBACK_RESTORE.with(|h| h.borrow_mut().take()) {
+        hook();
     }
     cleanup(path)?;
     Ok(RecoveryOutcome::Original)
@@ -822,6 +875,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static AFTER_ROLLBACK_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_VAULT_SECURITY_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static BEFORE_PENDING_JOURNAL_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_SIDECAR_SECURITY_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -927,5 +981,114 @@ mod tests {
             0
         );
         assert_eq!(fs::read(backup).unwrap(), b"private plaintext");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round8_access_acl_survives_inherited_grants_publication_and_rollback() {
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+        fn set(path: &Path, default: bool, uid: u32, rights: u16) {
+            let mut bytes = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in [
+                (1u16, 7u16, u32::MAX),
+                (2, rights, uid),
+                (4, 4, u32::MAX),
+                (16, 4, u32::MAX),
+                (32, 0, u32::MAX),
+            ] {
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&perm.to_le_bytes());
+                bytes.extend_from_slice(&id.to_le_bytes());
+            }
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let attr = if default {
+                c"system.posix_acl_default"
+            } else {
+                c"system.posix_acl_access"
+            };
+            assert_eq!(
+                unsafe {
+                    libc::setxattr(
+                        path.as_ptr(),
+                        attr.as_ptr(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        0,
+                    )
+                },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+        }
+        fn named_read(path: &Path, uid: u32) -> u16 {
+            let acl = super::super::unix_security::capture(path).unwrap();
+            if acl == [0] {
+                return 0;
+            }
+            let mut mask = 7;
+            let mut named = 0;
+            for x in acl[5..].chunks_exact(8) {
+                let tag = u16::from_le_bytes(x[..2].try_into().unwrap());
+                let perm = u16::from_le_bytes(x[2..4].try_into().unwrap());
+                let id = u32::from_le_bytes(x[4..8].try_into().unwrap());
+                if tag == 16 {
+                    mask = perm;
+                }
+                if tag == 2 && id == uid {
+                    named = perm;
+                }
+            }
+            named & mask & 4
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o711)).unwrap();
+        // Use a mapped identity even in the isolated user namespace. Native CI
+        // also runs the same named-entry and mask checks without that boundary.
+        let uid = unsafe { libc::getuid() };
+        let source = dir.path().join("original");
+        fs::write(&source, b"original plaintext").unwrap();
+        set(&source, false, uid, 0);
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        let saved = SavedPermissions::capture(&source).unwrap();
+        assert_eq!(named_read(&source, uid), 0);
+        set(dir.path(), true, uid, 4);
+        let stage = private_dir(dir.path(), ".aerostrip-acl-").unwrap();
+        let replacement = stage.path().join("replacement");
+        fs::write(&replacement, b"replacement plaintext").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(
+            named_read(&replacement, uid),
+            4,
+            "fixture inherited grant must be enabled by mode restoration alone"
+        );
+        saved.apply(&replacement).unwrap();
+        assert_eq!(named_read(&replacement, uid), 0);
+        assert_eq!(
+            super::super::unix_security::capture(&replacement).unwrap(),
+            saved.unix_acl.clone().unwrap()
+        );
+        fs::rename(&replacement, &source).unwrap();
+        assert_eq!(named_read(&source, uid), 0);
+        let backup = stage.path().join("old");
+        fs::write(&backup, b"original plaintext").unwrap();
+        replace_from(
+            &backup,
+            &source,
+            generation(&backup).unwrap(),
+            generation(&source).unwrap(),
+            Some(&saved),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"original plaintext");
+        assert_eq!(named_read(&source, uid), 0);
+        let ordinary = dir.path().join("mode-only");
+        fs::write(&ordinary, b"ordinary").unwrap();
+        super::super::unix_security::apply(&ordinary, &[0]).unwrap();
+        fs::set_permissions(&ordinary, fs::Permissions::from_mode(0o640)).unwrap();
+        let mode_only = SavedPermissions::capture(&ordinary).unwrap();
+        let next = stage.path().join("mode-stage");
+        fs::write(&next, b"ordinary").unwrap();
+        mode_only.apply(&next).unwrap();
+        assert_eq!(super::super::unix_security::capture(&next).unwrap(), [0]);
     }
 }

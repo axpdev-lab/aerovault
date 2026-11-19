@@ -542,8 +542,10 @@ fn name_too_long(error: &io::Error) -> bool {
 /// the leaf: replacing a leaf symlink must not accidentally write its target.
 pub(crate) fn anchored(path: &Path) -> io::Result<PathBuf> {
     #[cfg(windows)]
-    if matches!(path.components().next(), Some(std::path::Component::Prefix(p))
-        if matches!(p.kind(), std::path::Prefix::Verbatim(_) | std::path::Prefix::VerbatimDisk(_) | std::path::Prefix::VerbatimUNC(_, _)))
+    let verbatim = matches!(path.components().next(), Some(std::path::Component::Prefix(p))
+        if matches!(p.kind(), std::path::Prefix::Verbatim(_) | std::path::Prefix::VerbatimDisk(_) | std::path::Prefix::VerbatimUNC(_, _)));
+    #[cfg(windows)]
+    if verbatim
         && path
             .file_name()
             .is_some_and(|n| n.to_string_lossy().ends_with(['.', ' ']))
@@ -566,7 +568,38 @@ pub(crate) fn anchored(path: &Path) -> io::Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other("file path has no basename"))?;
-    Ok(std::fs::canonicalize(parent_or_dot(path))?.join(name))
+    #[cfg(windows)]
+    let name = {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<u16> = name.encode_wide().collect();
+        if !verbatim {
+            while matches!(units.last(), Some(0x20 | 0x2e)) {
+                units.pop();
+            }
+        }
+        if units.is_empty() {
+            return Err(io::Error::other(
+                "Windows file basename is empty after normalization",
+            ));
+        }
+        std::ffi::OsString::from_wide(&units)
+    };
+    #[cfg(windows)]
+    let name = name.as_os_str();
+    let pinned = std::fs::canonicalize(parent_or_dot(path))?.join(name);
+    #[cfg(windows)]
+    if !verbatim && name != path.file_name().unwrap() {
+        match std::fs::symlink_metadata(&pinned) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::other(
+                    "new Windows path ends in a dot or space; use its normalized basename",
+                ))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(pinned)
 }
 
 impl WriteLock {
@@ -1290,5 +1323,68 @@ mod tests {
             assert_eq!(std::fs::read(&literal).unwrap(), b"keep literal");
         }
         eprintln!("Windows verbatim create: both literal and trimmed-neighbor bytes preserved");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_round8_ordinary_dotted_aliases_open_and_links_refuse_create() {
+        const PW: &str = "test-password-123";
+        let dir = tempfile::tempdir().unwrap();
+        let normal = PathBuf::from(
+            dir.path()
+                .to_str()
+                .unwrap()
+                .strip_prefix(r"\\?\")
+                .unwrap_or(dir.path().to_str().unwrap()),
+        );
+        for legacy in [false, true] {
+            let path = normal.join(if legacy {
+                "legacy.aerovault"
+            } else {
+                "v3.aerovault"
+            });
+            if legacy {
+                crate::Vault::create(crate::CreateOptions::new(&path, PW)).unwrap();
+            } else {
+                crate::v3::VaultV3::create(&crate::v3::CreateOptionsV3::new(&path, PW)).unwrap();
+            }
+            let dotted =
+                path.with_file_name(format!("{}.", path.file_name().unwrap().to_string_lossy()));
+            if legacy {
+                assert!(crate::Vault::open(&dotted, PW).is_ok());
+            } else {
+                assert!(crate::v3::VaultV3::open(&dotted, PW).is_ok());
+            }
+            let link = normal.join(if legacy {
+                "legacy-link.aerovault"
+            } else {
+                "v3-link.aerovault"
+            });
+            if let Err(e) = std::os::windows::fs::symlink_file(&path, &link) {
+                if e.raw_os_error() == Some(1314) {
+                    eprintln!("Windows symbolic-link privilege unavailable; dotted symlink subcase unavailable");
+                    continue;
+                }
+                panic!("cannot create symbolic fixture: {e}");
+            }
+            let alias =
+                link.with_file_name(format!("{}.", link.file_name().unwrap().to_string_lossy()));
+            let before = std::fs::read(&path).unwrap();
+            let error = if legacy {
+                crate::Vault::create(crate::CreateOptions::new(&alias, PW))
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string()
+            } else {
+                crate::v3::VaultV3::create(&crate::v3::CreateOptionsV3::new(&alias, PW))
+                    .map(|_| ())
+                    .unwrap_err()
+            };
+            assert!(error.contains("symbolic link"), "{error}");
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
     }
 }

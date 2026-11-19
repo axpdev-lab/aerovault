@@ -758,6 +758,7 @@ pub fn correct_generate_with_progress(
         crate::lock::refuse_destination(Path::new(out), path).map_err(|e| e.to_string())?;
     }
     let locked = std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
+    crate::lock::refuse_lock_file_name(&locked).map_err(|e| e.to_string())?;
     let rel = rel_name(file);
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
     // it even for tiny files (the gate is a sync-pipeline opt-in, not a CLI-of-one concern).

@@ -483,16 +483,27 @@ pub(super) fn export_parity(
         hook();
     }
     // Only a symbolic leaf keeps an alias namespace on open. Windows regular
-    // 8.3/case aliases open under their canonical long leaf instead.
-    if out_path.is_some()
-        || !std::fs::symlink_metadata(vault_path).is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return export_parity_locked(lock.source_path(), password, out_path, &lock);
-    }
-    let out = default_sidecar_path(vault_path);
+    // 8.3/case aliases open under their canonical long leaf instead. Keep the
+    // caller's source separately so a destination wait cannot hide retargeting.
+    let symbolic_leaf =
+        std::fs::symlink_metadata(vault_path).is_ok_and(|m| m.file_type().is_symlink());
+    let out = out_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        default_sidecar_path(if symbolic_leaf {
+            vault_path
+        } else {
+            lock.source_path()
+        })
+    });
     crate::lock::refuse_destination(&out, vault_path).map_err(|e| e.to_string())?;
     crate::lock::refuse_destination(&out, &real).map_err(|e| e.to_string())?;
-    export_parity_locked_impl(lock.source_path(), password, &out, true, &lock)
+    export_parity_locked(
+        lock.source_path(),
+        vault_path,
+        password,
+        &out,
+        out_path.is_none(),
+        &lock,
+    )
 }
 
 /// [`export_parity`] under the caller's write lock, held from the read of the
@@ -505,18 +516,7 @@ pub(super) fn export_parity(
 /// is not.
 pub(super) fn export_parity_locked(
     vault_path: &Path,
-    password: &str,
-    out_path: Option<&Path>,
-    _lock: &crate::lock::WriteLock,
-) -> Result<ExportParityResult, String> {
-    let out = out_path
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_sidecar_path(vault_path));
-    export_parity_locked_impl(vault_path, password, &out, out_path.is_none(), _lock)
-}
-
-fn export_parity_locked_impl(
-    vault_path: &Path,
+    supplied_source: &Path,
     password: &str,
     out: &Path,
     automatic: bool,
@@ -526,6 +526,11 @@ fn export_parity_locked_impl(
     let out = crate::lock::anchored(out).map_err(|e| e.to_string())?;
     let out_lock = crate::lock::acquire_destination(&out, vault_path, source_lock)
         .map_err(|e| e.to_string())?;
+    let current_source = std::fs::canonicalize(supplied_source)
+        .map_err(|e| format!("Resolve export source after destination wait: {e}"))?;
+    if current_source != source_lock.source_path() {
+        return Err("Export source changed target while waiting for destination; retry".into());
+    }
     if automatic {
         validate_automatic_sidecar_destination(&out)?;
     }
@@ -603,6 +608,7 @@ pub(super) fn export_parity_under_locks(
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static AFTER_STRIP_SIDECAR_VALIDATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_EXPORT_SOURCE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_EXPORT_GENERATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -650,11 +656,34 @@ pub(super) fn strip_parity(
                 .to_string(),
         );
     }
+    let prepared = if !force {
+        let prepared = super::strip_transaction::private_dir(
+            super::vault::output_parent_dir(vault_path),
+            ".aerostrip-prepare-",
+        )?;
+        let sidecar_limit = crate::source::open_regular_no_follow(&sidecar)
+            .and_then(|f| f.metadata())
+            .map_err(|e| e.to_string())?
+            .len();
+        // Apply the existing geometry/file bounds before copying any payload.
+        drop(open_vault_sidecar(vault_path, &sidecar)?);
+        super::strip_transaction::copy_file_capped(
+            &sidecar,
+            &prepared.path().join("old-sidecar"),
+            sidecar_limit,
+        )?;
+        Some(prepared)
+    } else {
+        None
+    };
     if !force {
         if !scrub_vault(&vault).is_empty() {
             return Err("Vault has damaged blocks: run repair before stripping parity".to_string());
         }
-        let mut detached = open_vault_sidecar(vault_path, &sidecar)?;
+        let mut detached = open_vault_sidecar(
+            vault_path,
+            &prepared.as_ref().unwrap().path().join("old-sidecar"),
+        )?;
         detached
             .verify_binding(&container_sha256_file(vault_path)?.0)
             .map_err(|e| format!("{e}; run export-parity before stripping, or pass --force"))?;
@@ -684,12 +713,12 @@ pub(super) fn strip_parity(
     if force {
         super::vault::save_locked(&mut vault, &lock)?;
     } else {
-        let prepared = super::strip_transaction::private_dir(
-            super::vault::output_parent_dir(vault_path),
-            ".aerostrip-prepare-",
-        )?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_STRIP_SIDECAR_VALIDATION.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        let prepared = prepared.expect("non-forced strip prepared its validated sidecar");
         super::strip_transaction::copy_file(vault_path, &prepared.path().join("old-vault"))?;
-        super::strip_transaction::copy_file(&sidecar, &prepared.path().join("old-sidecar"))?;
         let staged = prepared.path().join("new-vault");
         super::vault::save_locked_to(&mut vault, &lock, &staged)?;
         // The staged seal is complete; release the original data before opening
@@ -3879,5 +3908,135 @@ mod tests {
         eprintln!(
             "Windows journal-only recovery: unchanged files retain narrowed and non-writable DACLs"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round8_export_alias_retarget_during_destination_wait_is_refused() {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.aerovault");
+            let b = dir.path().join("b.aerovault");
+            for p in [&a, &b] {
+                VaultV3::create(&CreateOptionsV3::new(p, PW)).unwrap();
+            }
+            let alias = dir.path().join("alias.aerovault");
+            std::os::unix::fs::symlink(&a, &alias).unwrap();
+            let explicit_out = explicit.then(|| dir.path().join("chosen.aerocorrect"));
+            VaultV3::export_parity(&alias, PW, explicit_out.as_deref()).unwrap();
+            let out = explicit_out
+                .clone()
+                .unwrap_or_else(|| default_sidecar_path(&alias));
+            let before = std::fs::read(&out).unwrap();
+            let held = crate::lock::acquire(&out).unwrap();
+            std::thread::scope(|scope| {
+                let reader = alias.clone();
+                let chosen_out = explicit_out.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let worker = scope.spawn(move || {
+                    crate::lock::ON_LOCK_CONTENTION
+                        .with(|h| *h.borrow_mut() = Some(Box::new(move || tx.send(()).unwrap())));
+                    VaultV3::export_parity(&reader, PW, chosen_out.as_deref())
+                });
+                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                std::fs::remove_file(&alias).unwrap();
+                std::os::unix::fs::symlink(&b, &alias).unwrap();
+                drop(held);
+                assert!(worker
+                    .join()
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("changed target"));
+            });
+            assert_eq!(std::fs::read(&out).unwrap(), before);
+            VaultV3::export_parity(&alias, PW, explicit_out.as_deref()).unwrap();
+        }
+    }
+
+    #[test]
+    fn round8_strip_preserves_sidecar_changed_after_validation() {
+        for changed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.aerovault");
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&path, PW),
+                RecoveryPlacement::Both,
+                20,
+            )
+            .unwrap();
+            VaultV3::export_parity(&path, PW, None).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let sidecar = default_sidecar_path(&path);
+            if changed {
+                let target = sidecar.clone();
+                AFTER_STRIP_SIDECAR_VALIDATION.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        std::fs::write(target, b"later sidecar").unwrap()
+                    }))
+                });
+            }
+            let result = VaultV3::strip_parity(&path, PW, false);
+            if changed {
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert_eq!(std::fs::read(&sidecar).unwrap(), b"later sidecar");
+            } else {
+                assert!(result.is_ok());
+                assert!(VaultV3::open(&path, PW).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn round8_rollback_restart_after_original_restore_retires_journal() {
+        use super::super::strip_transaction as tx;
+        const CHILD: &str = "AEROVAULT_ROUND8_ROLLBACK_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            if std::env::var_os("AEROVAULT_ROUND8_RECOVER").is_some() {
+                tx::AFTER_ROLLBACK_RESTORE
+                    .with(|h| *h.borrow_mut() = Some(Box::new(|| std::process::exit(78))));
+                VaultV3::open(&path, PW).unwrap();
+            } else {
+                tx::AFTER_STRIP_VAULT
+                    .with(|h| *h.borrow_mut() = Some(Box::new(|| std::process::exit(77))));
+                VaultV3::strip_parity(&path, PW, false).unwrap();
+            }
+            panic!("rollback seam not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let sidecar = default_sidecar_path(&path);
+        let before_sidecar = std::fs::read(&sidecar).unwrap();
+        for recover in [false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "v3::ec::tests::round8_rollback_restart_after_original_restore_retires_journal",
+                    "--nocapture",
+                ])
+                .env(CHILD, &path);
+            if recover {
+                child.env("AEROVAULT_ROUND8_RECOVER", "1");
+            }
+            assert_eq!(
+                child.status().unwrap().code(),
+                Some(if recover { 78 } else { 77 })
+            );
+        }
+        let journal = tx::journal_path(&path);
+        assert!(journal.join("rollback-intent").exists());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(VaultV3::open(&path, PW).is_ok());
+        assert!(!journal.exists());
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before_sidecar);
     }
 }

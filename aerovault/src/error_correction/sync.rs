@@ -445,6 +445,7 @@ type Hook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static AFTER_REPAIR_INITIAL_HASH: Hook = const { std::cell::RefCell::new(None) };
     /// Test seam: runs before [`write_if_unchanged`] takes the lock.
     pub(crate) static BEFORE_WRITE_LOCK: Hook = const { std::cell::RefCell::new(None) };
     /// Test seam: runs between the unchanged check and the write, lock held.
@@ -474,9 +475,12 @@ pub fn verify_repair_sync_file(
     let sidecar = validated_sidecar_for(rel_path, expected_sha256, file_size, sidecar_bytes)?;
 
     // Fast path: stream the file once and hash it. Bounded memory (one read chunk).
-    if hash_file_streaming(path)? == *expected_sha256 {
+    let initial_sha256 = hash_file_streaming(path)?;
+    if initial_sha256 == *expected_sha256 {
         return Ok(SyncEcRepairResult::Verified);
     }
+    #[cfg(test)]
+    run_hook(&AFTER_REPAIR_INITIAL_HASH);
 
     // Repair path: stream window by window into a temp file in the same directory,
     // repairing each window from its own parity, then atomically replace the original
@@ -520,6 +524,9 @@ pub fn verify_repair_sync_file(
         // tmp is dropped (removed) here; the original file is byte-for-byte untouched.
         return Err("AeroSync EC repair failed post-repair SHA-256 verification".to_string());
     }
+    if finalize_sha256(read_hasher) != initial_sha256 {
+        return Err("Repair target changed between initial hash and staging read; retry".into());
+    }
     // Release the read handle on the target before persisting. On Windows, renaming the
     // repaired temp onto a file that still has a live read handle fails with
     // ERROR_ACCESS_DENIED (os error 5) (audit M1). The repair loop above is the only
@@ -531,27 +538,34 @@ pub fn verify_repair_sync_file(
     // On a persist failure (or a refusal) the temp file is removed, so a
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
-    write_if_unchanged(path, &finalize_sha256(read_hasher), |locked_path| {
+    write_if_unchanged(path, &initial_sha256, |locked_path| {
         // The private stage stays private throughout any wait. Permission-only
         // changes do not affect the content hash, so sample them under guard.
         let permissions = std::fs::metadata(locked_path)
             .map_err(|e| e.to_string())?
             .permissions();
+        #[cfg(unix)]
+        let access_acl = crate::v3::unix_security::capture(locked_path)?;
+        #[cfg(unix)]
+        crate::v3::unix_security::apply(tmp.path(), &access_acl)?;
         std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if crate::v3::unix_security::capture(tmp.path())? != access_acl {
+            return Err("Repair access ACL preservation could not be verified".into());
+        }
         #[cfg(windows)]
         let descriptor = crate::v3::windows_security::capture(locked_path)?;
         #[cfg(windows)]
         crate::v3::windows_security::apply(tmp.path(), &descriptor, true)?;
         tmp.as_file().sync_all().map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        crate::v3::windows_security::persist_repair(tmp, locked_path)?;
+        #[cfg(not(windows))]
         crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
                 path.display()
             )
-        })?;
-        #[cfg(windows)]
-        crate::v3::windows_security::apply(locked_path, &descriptor, false).map_err(|e| {
-            format!("Repaired file committed, but restoring destination DACL failed: {e}")
         })?;
         Ok(())
     })?;
@@ -629,9 +643,12 @@ fn repair_streamed(
     .map_err(|e| format!("AeroSync EC sidecar for {rel_path}: {e}"))?;
 
     // Fast path: stream the file once and hash it. Bounded memory.
-    if hash_file_streaming(path)? == *expected_sha256 {
+    let initial_sha256 = hash_file_streaming(path)?;
+    if initial_sha256 == *expected_sha256 {
         return Ok(SyncEcRepairResult::Verified);
     }
+    #[cfg(test)]
+    run_hook(&AFTER_REPAIR_INITIAL_HASH);
 
     // Repair path: stream window by window into a temp file in the same directory,
     // reading each window's parity from the sidecar on demand, then atomically replace
@@ -684,6 +701,9 @@ fn repair_streamed(
         // tmp is dropped (removed) here; the original file is byte-for-byte untouched.
         return Err("AeroSync EC repair failed post-repair SHA-256 verification".to_string());
     }
+    if finalize_sha256(read_hasher) != initial_sha256 {
+        return Err("Repair target changed between initial hash and staging read; retry".into());
+    }
     // Release the read handle on the target before persisting. On Windows, renaming the
     // repaired temp onto a file that still has a live read handle fails with
     // ERROR_ACCESS_DENIED (os error 5) (audit M1). The repair loop above is the only
@@ -695,27 +715,34 @@ fn repair_streamed(
     // On a persist failure (or a refusal) the temp file is removed, so a
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
-    write_if_unchanged(path, &finalize_sha256(read_hasher), |locked_path| {
+    write_if_unchanged(path, &initial_sha256, |locked_path| {
         // The private stage stays private throughout any wait. Permission-only
         // changes do not affect the content hash, so sample them under guard.
         let permissions = std::fs::metadata(locked_path)
             .map_err(|e| e.to_string())?
             .permissions();
+        #[cfg(unix)]
+        let access_acl = crate::v3::unix_security::capture(locked_path)?;
+        #[cfg(unix)]
+        crate::v3::unix_security::apply(tmp.path(), &access_acl)?;
         std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if crate::v3::unix_security::capture(tmp.path())? != access_acl {
+            return Err("Repair access ACL preservation could not be verified".into());
+        }
         #[cfg(windows)]
         let descriptor = crate::v3::windows_security::capture(locked_path)?;
         #[cfg(windows)]
         crate::v3::windows_security::apply(tmp.path(), &descriptor, true)?;
         tmp.as_file().sync_all().map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        crate::v3::windows_security::persist_repair(tmp, locked_path)?;
+        #[cfg(not(windows))]
         crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
                 path.display()
             )
-        })?;
-        #[cfg(windows)]
-        crate::v3::windows_security::apply(locked_path, &descriptor, false).map_err(|e| {
-            format!("Repaired file committed, but restoring destination DACL failed: {e}")
         })?;
         Ok(())
     })?;
@@ -1727,5 +1754,139 @@ mod tests {
             assert_eq!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
         }
         eprintln!("Windows repair: second-principal read denied during contention and after both repair publications");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round8_generation_rejects_resolved_lock_before_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("private.aerolock");
+        std::fs::write(&lock, sample_data(4096)).unwrap();
+        let link = dir.path().join("ordinary");
+        std::os::unix::fs::symlink(&lock, &link).unwrap();
+        let mut progress = 0;
+        assert!(super::super::correct_generate_with_progress(
+            link.to_str().unwrap(),
+            20,
+            None,
+            &mut |_, _| progress += 1
+        )
+        .is_err());
+        assert_eq!(progress, 0);
+        std::fs::remove_file(&link).unwrap();
+        let source = dir.path().join("data");
+        std::fs::write(&source, sample_data(4096)).unwrap();
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(super::super::correct_generate_with_progress(
+            link.to_str().unwrap(),
+            20,
+            None,
+            &mut |_, _| progress += 1
+        )
+        .is_ok());
+        assert!(progress > 0);
+    }
+
+    #[test]
+    fn round8_repair_keeps_initial_generation_before_staging() {
+        for streamed in [false, true] {
+            for truncated in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("target");
+                let data = sample_data(4096);
+                let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+                let sidecar = dir.path().join("parity");
+                std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+                let mut damaged = data.clone();
+                damaged[12] ^= 1;
+                std::fs::write(&path, &damaged).unwrap();
+                let replacement = if truncated {
+                    b"AEROVAULT3truncated".to_vec()
+                } else {
+                    let mut d = data.clone();
+                    d[15] ^= 2;
+                    d[..10].copy_from_slice(b"AEROVAULT3");
+                    d
+                };
+                let later = replacement.clone();
+                let target = path.clone();
+                AFTER_REPAIR_INITIAL_HASH.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || std::fs::write(target, later).unwrap()))
+                });
+                let result = if streamed {
+                    verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+                } else {
+                    verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+                };
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), replacement);
+                std::fs::write(&path, &damaged).unwrap();
+                let result = if streamed {
+                    verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+                } else {
+                    verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+                };
+                assert!(matches!(
+                    result.unwrap(),
+                    SyncEcRepairResult::Repaired { .. }
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), data);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_round8_repair_merge_failure_keeps_inheritance_retryable() {
+        use crate::v3::windows_security as acl;
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            acl::apply(
+                dir.path(),
+                "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+                true,
+            )
+            .unwrap();
+            let path = dir.path().join("inherit.bin");
+            let data = sample_data(4096);
+            let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let sidecar = dir.path().join("recovery");
+            std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[15] ^= 1;
+            std::fs::write(&path, &damaged).unwrap();
+            let before = acl::capture(&path).unwrap();
+            assert!(!before.split("D:").nth(1).unwrap().starts_with('P'));
+            acl::FAIL_REPAIR_REPLACE.with(|f| f.set(true));
+            let repair = || {
+                if streamed {
+                    verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+                } else {
+                    verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+                }
+            };
+            assert!(repair().unwrap_err().contains("merge failure"));
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert_eq!(acl::capture(&path).unwrap(), before);
+            assert!(matches!(
+                repair().unwrap(),
+                SyncEcRepairResult::Repaired { .. }
+            ));
+            assert!(matches!(repair().unwrap(), SyncEcRepairResult::Verified));
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+            assert!(!acl::capture(&path)
+                .unwrap()
+                .split("D:")
+                .nth(1)
+                .unwrap()
+                .starts_with('P'));
+            assert_ne!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+            acl::apply(dir.path(), "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)", true).unwrap();
+            assert_eq!(
+                acl::guest_effective_rights(&path).unwrap() & 1,
+                0,
+                "repair must retain live inheritance"
+            );
+        }
     }
 }

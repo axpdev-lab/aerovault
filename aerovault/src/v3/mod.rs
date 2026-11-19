@@ -27,6 +27,8 @@ pub mod manifest;
 pub mod packing;
 pub(crate) mod strip_transaction;
 pub mod telemetry;
+#[cfg(unix)]
+pub(crate) mod unix_security;
 pub mod vault;
 #[cfg(windows)]
 pub(crate) mod windows_security;

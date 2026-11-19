@@ -459,3 +459,47 @@ mod tests {
         assert!(protected_aces("D:AI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)").is_err());
     }
 }
+
+/// Replace repaired content while Windows carries destination ACL/inheritance
+/// in the same operation. No fallible ACL-finalization step follows commit.
+pub(crate) fn persist_repair(tmp: tempfile::NamedTempFile, target: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_REPAIR_REPLACE.with(|f| f.replace(false)) {
+        return Err("Injected repair ACL merge failure before replacement".into());
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            target: *const u16,
+            replacement: *const u16,
+            backup: *const u16,
+            flags: u32,
+            exclude: *mut c_void,
+            reserved: *mut c_void,
+        ) -> i32;
+    }
+    let target = wide(target);
+    let (file, replacement) = tmp.keep().map_err(|e| e.to_string())?;
+    drop(file);
+    let replacement_wide = wide(&replacement);
+    let result = unsafe {
+        ReplaceFileW(
+            target.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = std::fs::remove_file(replacement);
+        return Err(format!(
+            "Repair replacement including destination ACL merge failed: {error}"
+        ));
+    }
+    Ok(())
+}
+#[cfg(test)]
+thread_local! { pub(crate) static FAIL_REPAIR_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
