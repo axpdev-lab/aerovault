@@ -11,15 +11,20 @@ fn name(path: &Path) -> Result<std::ffi::CString, String> {
 #[cfg(target_os = "linux")]
 pub(crate) fn capture(path: &Path) -> Result<Vec<u8>, String> {
     let path = name(path)?;
-    let mut data = vec![0u8; 4097];
-    let n = unsafe {
+    capture_linux(|data, len| unsafe {
         libc::getxattr(
             path.as_ptr(),
             c"system.posix_acl_access".as_ptr(),
-            data.as_mut_ptr().cast(),
-            4096,
+            data,
+            len,
         )
-    };
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn capture_linux(read: impl FnOnce(*mut libc::c_void, usize) -> isize) -> Result<Vec<u8>, String> {
+    let mut data = vec![0u8; 4097];
+    let n = read(data.as_mut_ptr().cast(), 4096);
     if n < 0 {
         let error = std::io::Error::last_os_error();
         if matches!(error.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP)) {
@@ -30,6 +35,40 @@ pub(crate) fn capture(path: &Path) -> Result<Vec<u8>, String> {
     data.truncate(n as usize);
     data.insert(0, 1);
     Ok(data)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn copy_extraction_acl(
+    source: &std::fs::File,
+    target: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::{io, os::fd::AsRawFd};
+    let name = c"system.posix_acl_access";
+    let data = capture_linux(|data, len| unsafe {
+        libc::fgetxattr(source.as_raw_fd(), name.as_ptr(), data, len)
+    })
+    .map_err(io::Error::other)?;
+    let fd = target.as_raw_fd();
+    if data == [0] {
+        if unsafe { libc::fremovexattr(fd, name.as_ptr()) } != 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP)) {
+                return Err(error);
+            }
+        }
+    } else if unsafe {
+        libc::fsetxattr(
+            fd,
+            name.as_ptr(),
+            data[1..].as_ptr().cast(),
+            data.len() - 1,
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -130,6 +169,10 @@ mod darwin {
         if unsafe { statx_np(path.as_ptr(), metadata.as_mut_ptr(), filesec.0) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        read_acl(&filesec)
+    }
+
+    fn read_acl(filesec: &FileSec) -> io::Result<Option<Owned>> {
         let mut acl: *mut c_void = std::ptr::null_mut();
         let value = std::ptr::from_mut(&mut acl).cast();
         if unsafe { filesec_get_property(filesec.0, FILESEC_ACL, value) } != 0 {
@@ -190,12 +233,50 @@ mod darwin {
         }
         Ok(())
     }
+
+    pub(super) fn copy_file_acl(source: c_int, target: c_int) -> io::Result<()> {
+        let filesec = FileSec::new()?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { fstatx_np(source, metadata.as_mut_ptr(), filesec.0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let Some(acl) = read_acl(&filesec)? else {
+            return clear_file_acl(target);
+        };
+        let destination = FileSec::new()?;
+        if unsafe {
+            filesec_set_property(
+                destination.0,
+                FILESEC_ACL,
+                std::ptr::from_ref(&acl.0).cast(),
+            )
+        } != 0
+            || unsafe { fchmodx_np(target, destination.0) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn clear_extraction_acl(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     darwin::clear_file_acl(file.as_raw_fd())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn copy_extraction_acl(
+    source: &std::fs::File,
+    target: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    darwin::copy_file_acl(source.as_raw_fd(), target.as_raw_fd())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+pub(super) fn copy_extraction_acl(_: &std::fs::File, _: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(target_os = "macos")]

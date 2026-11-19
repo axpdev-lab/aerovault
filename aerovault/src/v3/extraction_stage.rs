@@ -7,11 +7,12 @@ use std::{fs::File, io, path::Path};
 mod platform {
     use super::*;
     use rand::RngCore;
+    use std::io::Read;
     use std::{
         ffi::{CStr, CString, OsStr},
         os::unix::{
             ffi::OsStrExt,
-            fs::OpenOptionsExt,
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
             io::{AsRawFd, FromRawFd},
         },
     };
@@ -37,7 +38,7 @@ mod platform {
 
     enum Replacement {
         Exchange,
-        Link(CString),
+        Backup(CString, Identity),
     }
 
     type Identity = (libc::dev_t, libc::ino_t);
@@ -105,6 +106,69 @@ mod platform {
             Ok(())
         }
 
+        fn backup_original(
+            &self,
+            target: &CStr,
+            original: Identity,
+        ) -> io::Result<(CString, Identity)> {
+            let directory = self.directory.as_raw_fd();
+            let backup = CString::new([self.name.to_bytes(), b".previous"].concat())
+                .map_err(io::Error::other)?;
+            match link(directory, target, &backup) {
+                Ok(()) => Ok((backup, original)),
+                Err(error)
+                    if unsupported_rename(&error)
+                        || matches!(error.raw_os_error(), Some(libc::EPERM | libc::EMLINK)) =>
+                {
+                    self.copy_original(target, original)
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        fn copy_original(
+            &self,
+            target: &CStr,
+            original: Identity,
+        ) -> io::Result<(CString, Identity)> {
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    target.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let source = unsafe { File::from_raw_fd(fd) };
+            let opened = stat(|metadata| unsafe { libc::fstat(fd, metadata) })?;
+            if opened.st_mode & libc::S_IFMT != libc::S_IFREG || identity(&opened) != original {
+                return Err(io::Error::other("Original extraction destination changed"));
+            }
+            let before = source.metadata()?;
+            let mut backup = Self::new(&self.directory, Path::new(""))?;
+            let copied = io::copy(&mut (&source).take(before.len()), &mut &backup.file)?;
+            copy_permissions(&source, &backup.file, &before)?;
+            backup.file.sync_all()?;
+            let after = source.metadata()?;
+            if copied != before.len()
+                || before.len() != after.len()
+                || before.modified()? != after.modified()?
+                || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
+                || identity_at(self.directory.as_raw_fd(), target)? != original
+            {
+                return Err(io::Error::other(
+                    "Original extraction destination changed while copied",
+                ));
+            }
+            let backup_identity = identity_at(self.directory.as_raw_fd(), &backup.name)?;
+            // Transfer responsibility for retaining or removing the backup
+            // name to the publication path.
+            backup.published = true;
+            Ok((std::mem::take(&mut backup.name), backup_identity))
+        }
+
         pub(crate) fn publish(
             &mut self,
             target: &Path,
@@ -131,7 +195,7 @@ mod platform {
                 return Ok(());
             }
 
-            // Retain the original inode until the post-rename containment
+            // Retain the original output until the post-rename containment
             // check. A parent move can occur inside either rename syscall.
             let original = stat_at(directory, &target)?;
             if original.st_mode & libc::S_IFMT != libc::S_IFREG {
@@ -143,25 +207,33 @@ mod platform {
             let replacement = match rename_exchange(directory, &self.name, &target) {
                 Ok(()) => Replacement::Exchange,
                 Err(error) if unsupported_rename(&error) => {
-                    let backup = CString::new([self.name.to_bytes(), b".previous"].concat())
-                        .map_err(io::Error::other)?;
-                    link(directory, &target, &backup)?;
-                    if let Err(error) =
-                        check_parent().and_then(|()| rename(directory, &self.name, &target))
-                    {
-                        let _ = unlink(directory, &backup);
+                    let (backup, backup_identity) = self.backup_original(&target, original)?;
+                    let replace = check_parent().and_then(|()| {
+                        if identity_at(directory, &target)? != original
+                            || identity_at(directory, &backup)? != backup_identity
+                        {
+                            return Err(io::Error::other(
+                                "Original extraction destination changed",
+                            ));
+                        }
+                        rename(directory, &self.name, &target)
+                    });
+                    if let Err(error) = replace {
+                        if identity_at(directory, &backup).is_ok_and(|id| id == backup_identity) {
+                            let _ = unlink(directory, &backup);
+                        }
                         return Err(error);
                     }
-                    Replacement::Link(backup)
+                    Replacement::Backup(backup, backup_identity)
                 }
                 Err(error) => return Err(error),
             };
-            let backup = match &replacement {
-                Replacement::Exchange => &self.name,
-                Replacement::Link(backup) => backup,
+            let (backup, backup_identity) = match &replacement {
+                Replacement::Exchange => (&self.name, original),
+                Replacement::Backup(backup, identity) => (backup, *identity),
             };
             let verify_original = || {
-                if identity_at(directory, backup)? != original {
+                if identity_at(directory, backup)? != backup_identity {
                     return Err(io::Error::other("Original extraction destination changed"));
                 }
                 Ok(())
@@ -172,7 +244,7 @@ mod platform {
                     .and_then(|()| verify_original())
                     .and_then(|()| match &replacement {
                         Replacement::Exchange => rename_exchange(directory, backup, &target),
-                        Replacement::Link(_) => rename(directory, backup, &target),
+                        Replacement::Backup(..) => rename(directory, backup, &target),
                     });
                 return Err(match restored {
                     Ok(()) => error,
@@ -200,10 +272,37 @@ mod platform {
             if !self.published {
                 let _ = self.file.set_len(0);
             }
-            if self.verify().is_ok() {
+            if !self.name.as_bytes().is_empty() && self.verify().is_ok() {
                 let _ = unlink(self.directory.as_raw_fd(), &self.name);
             }
         }
+    }
+
+    fn copy_permissions(
+        source: &File,
+        backup: &File,
+        original: &std::fs::Metadata,
+    ) -> io::Result<()> {
+        let staged = backup.metadata()?;
+        if (staged.uid(), staged.gid()) != (original.uid(), original.gid()) {
+            unix_result(unsafe {
+                libc::fchown(backup.as_raw_fd(), original.uid(), original.gid())
+            })?;
+        }
+        let mode = original.permissions().mode() & 0o7777;
+        if backup.metadata()?.permissions().mode() & 0o7777 != mode {
+            backup.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        crate::v3::unix_security::copy_extraction_acl(source, backup)?;
+        let applied = backup.metadata()?;
+        if (applied.uid(), applied.gid(), applied.mode() & 0o7777)
+            != (original.uid(), original.gid(), mode)
+        {
+            return Err(io::Error::other(
+                "Cannot preserve original extraction permissions",
+            ));
+        }
+        Ok(())
     }
 
     fn stat(read: impl FnOnce(*mut libc::stat) -> libc::c_int) -> io::Result<libc::stat> {
@@ -244,6 +343,10 @@ mod platform {
     }
 
     fn link(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        #[cfg(test)]
+        if FORBID_LINK_AND_EXCHANGE.get() {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
         unix_result(unsafe {
             libc::linkat(directory, source.as_ptr(), directory, dest.as_ptr(), 0)
         })
@@ -261,8 +364,16 @@ mod platform {
             )
     }
 
-    #[cfg(target_os = "linux")]
     fn rename_exchange(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        #[cfg(test)]
+        if FORBID_LINK_AND_EXCHANGE.get() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        exchange(directory, source, dest)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exchange(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
         unix_result(unsafe {
             libc::syscall(
                 libc::SYS_renameat2,
@@ -276,7 +387,7 @@ mod platform {
     }
 
     #[cfg(target_os = "macos")]
-    fn rename_exchange(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+    fn exchange(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
         unix_result(unsafe {
             libc::renameatx_np(
                 directory,
@@ -289,7 +400,7 @@ mod platform {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn rename_exchange(_: libc::c_int, _: &CStr, _: &CStr) -> io::Result<()> {
+    fn exchange(_: libc::c_int, _: &CStr, _: &CStr) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
@@ -328,6 +439,64 @@ mod platform {
         // Filesystems without an atomic no-replace rename can atomically
         // create a hard link. The stage's normal cleanup removes the old name.
         link(directory, source, dest)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static FORBID_LINK_AND_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn extraction_replaces_and_restores_without_exchange_or_hard_links() {
+        use std::io::Write;
+
+        for moved in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let parent = fixture.path().join("destination");
+            let moved_parent = fixture.path().join("moved");
+            std::fs::create_dir(&parent).unwrap();
+            let target = parent.join("file");
+            let original = b"original USB drive output";
+            let payload = b"new extracted bytes";
+            std::fs::write(&target, original).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let pinned = pin(&parent).unwrap();
+            let mut stage = Stage::new(&pinned[0], &parent).unwrap();
+            stage.file().write_all(payload).unwrap();
+            FORBID_LINK_AND_EXCHANGE.set(true);
+            let checks = std::cell::Cell::new(0);
+            let result = stage.publish(&target, true, || {
+                checks.set(checks.get() + 1);
+                if moved && checks.get() == 2 {
+                    // Move after the fallback's last pre-rename check.
+                    std::fs::rename(&parent, &moved_parent).unwrap();
+                    return Ok(());
+                }
+                if parent.is_dir() {
+                    return Ok(());
+                }
+                Err(io::Error::other("validated output directory changed"))
+            });
+            FORBID_LINK_AND_EXCHANGE.set(false);
+            drop(stage);
+            let parent = if moved {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("directory changed"));
+                let restored = moved_parent.join("file");
+                let metadata = restored.metadata().unwrap();
+                assert_eq!(metadata.mode() & 0o777, 0o640);
+                assert_eq!(std::fs::read(restored).unwrap(), original);
+                moved_parent
+            } else {
+                result.unwrap();
+                assert_eq!(std::fs::read(target).unwrap(), payload);
+                parent
+            };
+            assert_eq!(std::fs::read_dir(parent).unwrap().count(), 1);
+        }
     }
 
     #[cfg(all(test, target_os = "macos"))]
