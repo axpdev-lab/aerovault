@@ -107,6 +107,8 @@ pub(crate) mod fifo_test {
 /// parent test harness and every timeout kills and reaps the child.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod memory_test {
+    const COMPLETION: &str = "AEROVAULT_MEMORY_TEST_COMPLETION";
+
     pub(crate) fn limit() {
         let bound = 1536 * 1024 * 1024;
         let r = libc::rlimit {
@@ -123,10 +125,13 @@ pub(crate) mod memory_test {
                 let _ = self.0.wait();
             }
         }
+        let dir = tempfile::tempdir().unwrap();
+        let completion = dir.path().join("complete");
         let mut child = Child(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", test, "--nocapture"])
                 .env(key, path)
+                .env(COMPLETION, &completion)
                 .spawn()
                 .unwrap(),
         );
@@ -139,5 +144,30 @@ pub(crate) mod memory_test {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert!(status.success(), "memory-limited child failed: {status}");
+        assert!(
+            completion.is_file(),
+            "memory-limited child did not complete {test}"
+        );
+    }
+
+    pub(crate) fn complete() {
+        std::fs::write(std::env::var_os(COMPLETION).unwrap(), []).unwrap();
+    }
+
+    #[test]
+    fn round9_memory_harness_requires_worker_completion() {
+        const KEY: &str = "AEROVAULT_MEMORY_HARNESS_TEST";
+        if std::env::var_os(KEY).is_some() {
+            limit();
+            complete();
+            return;
+        }
+        let path = std::path::Path::new(".");
+        assert!(std::panic::catch_unwind(|| run("no_such_test", KEY, path)).is_err());
+        run(
+            "source::memory_test::round9_memory_harness_requires_worker_completion",
+            KEY,
+            path,
+        );
     }
 }

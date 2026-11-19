@@ -2551,6 +2551,7 @@ mod tests {
             assert!(again.list().unwrap().is_empty());
             assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
             assert!(Vault::open(&path, "initial-password-123").is_err());
+            crate::source::memory_test::complete();
             return;
         }
         let dir = tempfile::tempdir().unwrap();

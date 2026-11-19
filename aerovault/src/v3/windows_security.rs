@@ -462,7 +462,11 @@ mod tests {
 
 /// Replace repaired content while Windows carries destination ACL/inheritance
 /// in the same operation. No fallible ACL-finalization step follows commit.
-pub(crate) fn persist_repair(tmp: tempfile::NamedTempFile, target: &Path) -> Result<(), String> {
+pub(crate) fn persist_repair(
+    tmp: tempfile::NamedTempFile,
+    target: &Path,
+    private: &mut super::strip_transaction::PrivateDir,
+) -> Result<(), String> {
     #[cfg(test)]
     if FAIL_REPAIR_REPLACE.with(|f| f.replace(false)) {
         return Err("Injected repair ACL merge failure before replacement".into());
@@ -478,15 +482,41 @@ pub(crate) fn persist_repair(tmp: tempfile::NamedTempFile, target: &Path) -> Res
             reserved: *mut c_void,
         ) -> i32;
     }
-    let target = wide(target);
-    let (file, replacement) = tmp.keep().map_err(|e| e.to_string())?;
+    // Place the sealed, protected replacement in the actual destination
+    // directory so Windows merges inheritance in the final parent context.
+    let parent = super::vault::output_parent_dir(target);
+    let sibling = tempfile::Builder::new()
+        .prefix(".aerorepair-publish-")
+        .tempfile_in(parent)
+        .map_err(|e| e.to_string())?
+        .into_temp_path();
+    let file = tmp.persist(&sibling).map_err(|e| e.to_string())?;
     drop(file);
+    let replacement = sibling.keep().map_err(|e| e.to_string())?;
+    let backup = private.path().join("original");
+    let target_wide = wide(target);
     let replacement_wide = wide(&replacement);
+    let backup_wide = wide(&backup);
+    #[cfg(test)]
+    if FAIL_REPAIR_AFTER_BACKUP.with(|f| f.replace(false)) {
+        std::fs::rename(target, &backup)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&replacement);
+            })
+            .map_err(|e| e.to_string())?;
+        return Err(recover_repair_failure(
+            target,
+            &replacement,
+            &backup,
+            private,
+            &std::io::Error::from_raw_os_error(1177),
+        ));
+    }
     let result = unsafe {
         ReplaceFileW(
-            target.as_ptr(),
+            target_wide.as_ptr(),
             replacement_wide.as_ptr(),
-            std::ptr::null(),
+            backup_wide.as_ptr(),
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -494,12 +524,50 @@ pub(crate) fn persist_repair(tmp: tempfile::NamedTempFile, target: &Path) -> Res
     };
     if result == 0 {
         let error = std::io::Error::last_os_error();
-        let _ = std::fs::remove_file(replacement);
-        return Err(format!(
-            "Repair replacement including destination ACL merge failed: {error}"
+        return Err(recover_repair_failure(
+            target,
+            &replacement,
+            &backup,
+            private,
+            &error,
         ));
     }
     Ok(())
 }
+
+fn recover_repair_failure(
+    target: &Path,
+    replacement: &Path,
+    backup: &Path,
+    private: &mut super::strip_transaction::PrivateDir,
+    error: &std::io::Error,
+) -> String {
+    // A partial failure can move the old file aside. Restore it without
+    // clobbering a newer path. If restoration is impossible, keep both copies.
+    match (target.try_exists(), backup.try_exists()) {
+        (Ok(false), Ok(true)) if std::fs::hard_link(backup, target).is_ok() => {}
+        (Ok(true), Ok(false)) if !matches!(error.raw_os_error(), Some(1176 | 1177)) => {}
+        _ => {
+            let recovery_dir = private.keep();
+            let retained = recovery_dir.join("replacement");
+            let retained = if std::fs::rename(replacement, &retained).is_ok() {
+                &retained
+            } else {
+                replacement
+            };
+            return format!(
+                "Repair replacement failed: {error}. Preserve the recovery directory {} and replacement {}",
+                recovery_dir.display(),
+                retained.display()
+            );
+        }
+    }
+    let _ = std::fs::remove_file(replacement);
+    format!("Repair replacement including destination ACL merge failed: {error}")
+}
+
 #[cfg(test)]
-thread_local! { pub(crate) static FAIL_REPAIR_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! {
+    pub(crate) static FAIL_REPAIR_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_REPAIR_AFTER_BACKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}

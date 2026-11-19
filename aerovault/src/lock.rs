@@ -593,7 +593,7 @@ pub(crate) fn anchored(path: &Path) -> io::Result<PathBuf> {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(io::Error::other(
-                    "new Windows path ends in a dot or space; use its normalized basename",
+                    "new Windows path ends in a dot or a space; use its normalized basename",
                 ))
             }
             Err(e) => return Err(e),

@@ -475,22 +475,12 @@ pub(crate) fn reconstruct_from_error_correction(
         ));
     }
 
-    let mut d = Vec::with_capacity(l);
+    let mut d = zeroize::Zeroizing::new(Vec::with_capacity(l));
     for b in blocks.iter() {
         d.extend_from_slice(b);
     }
 
     let (num_data_shards, num_groups) = error_correction_geometry(&payload.header);
-
-    let shard_at = |d: &[u8], idx: usize| -> Vec<u8> {
-        let start = idx * s;
-        let end = (start + s).min(l);
-        let mut v = vec![0u8; s];
-        if start < end {
-            v[..end - start].copy_from_slice(&d[start..end]);
-        }
-        v
-    };
 
     let rs = ReedSolomon::<reed_solomon_erasure::galois_8::Field>::new(k, p)
         .map_err(|e| format!("RS create for reconstruct: {:?}", e))?;
@@ -499,20 +489,22 @@ pub(crate) fn reconstruct_from_error_correction(
     let mut changed = false;
 
     for g in 0..num_groups {
-        let mut opt: Vec<Option<Vec<u8>>> = vec![None; k + p];
+        let mut opt = vec![(zeroize::Zeroizing::new(vec![0u8; s]), false); k + p];
         let mut erased_data = 0usize;
 
-        for (local, slot) in opt.iter_mut().take(k).enumerate() {
+        for (local, (shard, present)) in opt.iter_mut().take(k).enumerate() {
             let gi = g * k + local;
             if gi < num_data_shards {
-                let sh = shard_at(&d, gi);
-                if error_correction_shard_checksum(&sh) == payload.data_checksums[gi] {
-                    *slot = Some(sh); // shard intact
+                let start = gi * s;
+                let end = (start + s).min(l);
+                shard[..end - start].copy_from_slice(&d[start..end]);
+                if error_correction_shard_checksum(shard) == payload.data_checksums[gi] {
+                    *present = true;
                 } else {
                     erased_data += 1; // damaged -> RS erasure
                 }
             } else {
-                *slot = Some(vec![0u8; s]); // virtual zero-pad slot
+                *present = true; // virtual zero-pad slot
             }
         }
 
@@ -520,9 +512,10 @@ pub(crate) fn reconstruct_from_error_correction(
             let pidx = g * p + pp;
             let start = pidx * s;
             if start + s <= payload.parity_data.len() {
-                let par = payload.parity_data[start..start + s].to_vec();
-                if error_correction_shard_checksum(&par) == payload.parity_checksums[pidx] {
-                    opt[k + pp] = Some(par); // parity intact
+                let par = &payload.parity_data[start..start + s];
+                if error_correction_shard_checksum(par) == payload.parity_checksums[pidx] {
+                    opt[k + pp].0.copy_from_slice(par);
+                    opt[k + pp].1 = true;
                 }
                 // else: rotted parity -> leave None so RS routes around it
             }
@@ -535,18 +528,16 @@ pub(crate) fn reconstruct_from_error_correction(
             continue; // more erasures than parity can cover; leave group untouched
         }
 
-        for (local, slot) in opt.iter().take(k).enumerate() {
+        for (local, (shard, _)) in opt.iter().take(k).enumerate() {
             let gi = g * k + local;
             if gi >= num_data_shards {
                 continue;
             }
-            if let Some(sh) = slot {
-                let start = gi * s;
-                let end = (start + s).min(l);
-                if d[start..end] != sh[..end - start] {
-                    d[start..end].copy_from_slice(&sh[..end - start]);
-                    changed = true;
-                }
+            let start = gi * s;
+            let end = (start + s).min(l);
+            if d[start..end] != shard[..end - start] {
+                d[start..end].copy_from_slice(&shard[..end - start]);
+                changed = true;
             }
         }
         recovered += erased_data;
@@ -810,7 +801,7 @@ pub fn correct_generate_with_progress(
         let _out_lock = crate::lock::acquire_destination(&destination, &locked, &source_guard)
             .map_err(|e| e.to_string())?;
         if out.is_none() {
-            crate::v3::ec::validate_automatic_sidecar_destination(&destination)?;
+            crate::v3::ec::validate_standalone_sidecar_destination(&destination)?;
         }
         if path != locked {
             let current =

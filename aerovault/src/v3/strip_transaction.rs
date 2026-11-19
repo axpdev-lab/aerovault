@@ -9,7 +9,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::vault::{output_parent_dir, persist_over};
+use super::vault::output_parent_dir;
+#[cfg(not(windows))]
+use super::vault::persist_over;
 use crate::lock::WriteLock;
 use serde::{Deserialize, Serialize};
 
@@ -169,6 +171,10 @@ struct Journal {
     new_vault_permissions: Option<SavedPermissions>,
     #[serde(default)]
     new_sidecar_permissions: Option<SavedPermissions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged_vault_dacl: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    staged_sidecar_dacl: Option<[u8; 32]>,
 }
 
 pub(crate) struct PrivateDir {
@@ -177,6 +183,11 @@ pub(crate) struct PrivateDir {
 impl PrivateDir {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn keep(&mut self) -> PathBuf {
+        std::mem::take(&mut self.path)
     }
 }
 impl Drop for PrivateDir {
@@ -221,7 +232,29 @@ pub(crate) fn private_dir(parent: &Path, prefix: &str) -> Result<PrivateDir, Str
             .map_err(|e| e.to_string())?
             .keep()
     };
-    Ok(PrivateDir { path })
+    let dir = PrivateDir { path };
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // A 0700 directory can still inherit an ACL grant. Clear it while the
+        // directory is empty, before it is allowed to hold any vault bytes.
+        super::unix_security::apply(dir.path(), &[])?;
+        let mode = fs::metadata(dir.path())
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 || !super::unix_security::capture(dir.path())?.is_empty() {
+            return Err("Private transaction directory is accessible to other principals".into());
+        }
+        if fs::read_dir(dir.path())
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some()
+        {
+            return Err("Private transaction directory changed during creation".into());
+        }
+    }
+    Ok(dir)
 }
 
 fn private_options() -> fs::OpenOptions {
@@ -282,13 +315,14 @@ fn replace_from(
     target: &Path,
     expected: Generation,
     target_before: Generation,
-    original_permissions: Option<&SavedPermissions>,
 ) -> Result<(), String> {
     if generation(source)? != expected {
         return Err("strip rollback copy failed its generation check".to_string());
     }
     let mut input = crate::source::open_regular_no_follow(source).map_err(|e| e.to_string())?;
     let private = private_dir(output_parent_dir(target), ".aerostrip-restore-")?;
+    #[cfg(windows)]
+    let mut private = private;
     let mut temp = tempfile::Builder::new()
         .prefix("replacement-")
         .tempfile_in(private.path())
@@ -311,26 +345,16 @@ fn replace_from(
         );
     }
     // Rolling back content must not roll back a later operator restriction.
-    // Capture current Windows security under the destination guard and carry
+    // Capture current security under the destination guard and carry
     // that context onto the restored bytes, including incomplete finalization.
-    #[cfg(windows)]
-    let current_permissions = SavedPermissions::capture(target)?;
-    #[cfg(windows)]
-    let permissions = {
-        let _ = original_permissions;
-        Some(&current_permissions)
-    };
-    #[cfg(not(windows))]
-    let permissions = original_permissions;
-    if let Some(permissions) = permissions {
-        permissions.apply(temp.path())?;
-    }
+    let permissions = SavedPermissions::capture(target)?;
+    permissions.apply(temp.path())?;
     // Backups remain private: permissions are restored only on the replacement.
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    super::windows_security::persist_repair(temp, target, &mut private)?;
+    #[cfg(not(windows))]
     persist_over(temp, target).map_err(|e| e.to_string())?;
-    if let Some(permissions) = permissions {
-        permissions.published(target)?;
-    }
     sync_dir(output_parent_dir(target))
 }
 
@@ -442,7 +466,7 @@ fn read_journal(path: &Path) -> Result<Journal, String> {
         .map_err(|e| e.to_string())?;
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid strip journal: {e}"))?;
-    if !matches!(journal.version, 1..=3) {
+    if !matches!(journal.version, 1..=4) {
         return Err("unsupported strip journal version".into());
     }
     Ok(journal)
@@ -531,7 +555,6 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
             source,
             journal.old_vault,
             vault_now,
-            journal.old_vault_permissions.as_ref(),
         )?;
     }
     if sidecar_now != journal.old_sidecar {
@@ -540,7 +563,6 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
             &sidecar,
             journal.old_sidecar,
             sidecar_now,
-            journal.old_sidecar_permissions.as_ref(),
         )?;
     }
     #[cfg(test)]
@@ -556,7 +578,6 @@ fn restore_original(
     target: &Path,
     original: Option<Generation>,
     current: Option<Generation>,
-    permissions: Option<&SavedPermissions>,
 ) -> Result<(), String> {
     if let Some(original) = original {
         return replace_from(
@@ -564,7 +585,6 @@ fn restore_original(
             target,
             original,
             current.ok_or("rollback target unexpectedly absent")?,
-            permissions,
         );
     }
     // Absence is an original state too. Remove only the exact recorded new
@@ -617,6 +637,7 @@ fn restore_published_permissions(
                 .or(journal.old_vault_permissions.as_ref()),
             marker,
             "vault-security-done",
+            journal.staged_vault_dacl,
         )?;
     }
     if !marker
@@ -632,6 +653,7 @@ fn restore_published_permissions(
                 .or(journal.old_sidecar_permissions.as_ref()),
             marker,
             "sidecar-security-done",
+            journal.staged_sidecar_dacl,
         )?;
     }
     Ok(())
@@ -645,6 +667,7 @@ fn finish_security(
     permissions: Option<&SavedPermissions>,
     journal: &Path,
     marker: &str,
+    staged_dacl: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let done = journal.join(marker);
     if done.try_exists().map_err(|e| e.to_string())? {
@@ -655,6 +678,18 @@ fn finish_security(
     #[cfg(windows)]
     {
         let started = journal.join(format!("{marker}-started"));
+        if started.try_exists().map_err(|e| e.to_string())? {
+            return Err(conflict(
+                journal,
+                "security publication was interrupted; current permissions retained",
+            ));
+        }
+        if staged_dacl != Some(dacl_digest(path)?) {
+            return Err(conflict(
+                journal,
+                "published Windows DACL differs from the recorded stage or the journal lacks its descriptor",
+            ));
+        }
         match private_options().open(&started) {
             Ok(file) => file.sync_all().map_err(|e| e.to_string())?,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -667,6 +702,8 @@ fn finish_security(
         }
         sync_dir(journal)?;
     }
+    #[cfg(not(windows))]
+    let _ = staged_dacl;
     publish_security(path, permissions)?;
     #[cfg(test)]
     if marker == "vault-security-done" {
@@ -696,6 +733,12 @@ fn publish_security(path: &Path, permissions: Option<&SavedPermissions>) -> Resu
         permissions.published(path)?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn dacl_digest(path: &Path) -> Result<[u8; 32], String> {
+    let descriptor = super::windows_security::capture(path)?;
+    Ok(*blake3::hash(descriptor.as_bytes()).as_bytes())
 }
 
 /// Readers stay lock-free unless a pending strip needs recovery. Writers use
@@ -762,8 +805,10 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
 pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> Result<(), String> {
     let sidecar = super::ec::default_sidecar_path(source);
     let journal = Journal {
-        version: 3,
+        version: 4,
         source_name: native_name(source),
+        staged_vault_dacl: None,
+        staged_sidecar_dacl: None,
         new_vault_permissions: SavedPermissions::new_destination(source)?,
         new_sidecar_permissions: SavedPermissions::new_destination(&sidecar)?,
         old_vault: generation_if_present(&prepared.path().join("old-vault"))?,
@@ -797,6 +842,12 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
     if let Some(p) = &journal.old_sidecar_permissions {
         p.apply(&prepared.path().join("new-sidecar"))?;
     }
+    #[cfg(windows)]
+    let journal = Journal {
+        staged_vault_dacl: Some(dacl_digest(&prepared.path().join("new-vault"))?),
+        staged_sidecar_dacl: Some(dacl_digest(&prepared.path().join("new-sidecar"))?),
+        ..journal
+    };
     let encoded = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
     if encoded.len() > 4096 {
         return Err("strip journal exceeds size limit; originals left unchanged".to_string());
@@ -832,6 +883,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
                 .or(journal.old_vault_permissions.as_ref()),
             &path,
             "vault-security-done",
+            journal.staged_vault_dacl,
         )?;
         sync_dir(output_parent_dir(source))?;
         #[cfg(test)]
@@ -851,6 +903,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
                 .or(journal.old_sidecar_permissions.as_ref()),
             &path,
             "sidecar-security-done",
+            journal.staged_sidecar_dacl,
         )?;
         #[cfg(test)]
         if FAIL_FINAL_SYNC.with(|fail| fail.replace(false)) {
@@ -891,6 +944,38 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn round9_macos_private_directory_clears_inherited_acl_before_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "everyone allow readsecurity,file_inherit,directory_inherit,only_inherit"
+            ])
+            .arg(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let ordinary = tempfile::tempdir_in(dir.path()).unwrap();
+        assert!(!super::super::unix_security::capture(ordinary.path())
+            .unwrap()
+            .is_empty());
+        let original = dir.path().join("plaintext");
+        fs::write(&original, b"plaintext before strip").unwrap();
+        super::super::unix_security::apply(&original, &[]).unwrap();
+        let prepared = private_dir(dir.path(), ".aerostrip-prepare-").unwrap();
+        let backup = prepared.path().join("old-vault");
+        assert!(super::super::unix_security::capture(prepared.path())
+            .unwrap()
+            .is_empty());
+        copy_file(&original, &backup).unwrap();
+        assert!(super::super::unix_security::capture(&backup)
+            .unwrap()
+            .is_empty());
+        assert_eq!(fs::read(backup).unwrap(), b"plaintext before strip");
+    }
     #[test]
     fn journal_source_names_are_native_and_cannot_escape_the_parent() {
         let dir = tempfile::tempdir().unwrap();
@@ -926,6 +1011,7 @@ mod tests {
             Some(&original),
             journal.path(),
             "sidecar-security-done",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -943,6 +1029,7 @@ mod tests {
             Some(&original),
             journal.path(),
             "sidecar-security-done",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1027,7 +1114,7 @@ mod tests {
             }
             let mut mask = 7;
             let mut named = 0;
-            for x in acl[5..].chunks_exact(8) {
+            for x in acl[5..].as_chunks::<8>().0 {
                 let tag = u16::from_le_bytes(x[..2].try_into().unwrap());
                 let perm = u16::from_le_bytes(x[2..4].try_into().unwrap());
                 let id = u32::from_le_bytes(x[4..8].try_into().unwrap());
@@ -1076,7 +1163,6 @@ mod tests {
             &source,
             generation(&backup).unwrap(),
             generation(&source).unwrap(),
-            Some(&saved),
         )
         .unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"original plaintext");

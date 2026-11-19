@@ -63,9 +63,25 @@ pub(crate) fn apply(path: &Path, data: &[u8]) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod darwin {
     use std::ffi::{c_char, c_int, c_void};
+    use std::io;
+
+    // Darwin's <sys/fcntl.h> filesec property and removal sentinel.
+    const FILESEC_ACL: c_int = 5;
+    const FILESEC_REMOVE_ACL: *const c_void = std::ptr::without_provenance(1);
     pub(super) const EXTENDED: c_int = 0x100;
     unsafe extern "C" {
-        pub(super) fn acl_get_file(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn filesec_init() -> *mut c_void;
+        fn filesec_free(filesec: *mut c_void);
+        #[cfg_attr(target_arch = "x86_64", link_name = "statx_np$INODE64")]
+        fn statx_np(path: *const c_char, metadata: *mut libc::stat, filesec: *mut c_void) -> c_int;
+        fn filesec_get_property(filesec: *mut c_void, property: c_int, value: *mut c_void)
+            -> c_int;
+        fn filesec_set_property(
+            filesec: *mut c_void,
+            property: c_int,
+            value: *const c_void,
+        ) -> c_int;
+        fn chmodx_np(path: *const c_char, filesec: *mut c_void) -> c_int;
         pub(super) fn acl_to_text(acl: *mut c_void, len: *mut isize) -> *mut c_char;
         pub(super) fn acl_from_text(text: *const c_char) -> *mut c_void;
         pub(super) fn acl_set_file(path: *const c_char, kind: c_int, acl: *mut c_void) -> c_int;
@@ -79,19 +95,73 @@ mod darwin {
             }
         }
     }
+
+    struct FileSec(*mut c_void);
+
+    impl FileSec {
+        fn new() -> io::Result<Self> {
+            let filesec = unsafe { filesec_init() };
+            if filesec.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(filesec))
+        }
+    }
+
+    impl Drop for FileSec {
+        fn drop(&mut self) {
+            unsafe { filesec_free(self.0) };
+        }
+    }
+
+    pub(super) fn capture(path: &std::ffi::CStr) -> io::Result<Option<Owned>> {
+        let filesec = FileSec::new()?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // statx_np resolves the path and fetches security in the same call.
+        // Only ENOENT from the subsequent property lookup means no ACL.
+        if unsafe { statx_np(path.as_ptr(), metadata.as_mut_ptr(), filesec.0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut acl: *mut c_void = std::ptr::null_mut();
+        let value = std::ptr::from_mut(&mut acl).cast();
+        if unsafe { filesec_get_property(filesec.0, FILESEC_ACL, value) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        if std::ptr::eq(acl.cast_const(), FILESEC_REMOVE_ACL) {
+            return Ok(None);
+        }
+        Ok(Some(Owned(acl)))
+    }
+
+    pub(super) fn clear(path: &std::ffi::CStr) -> io::Result<()> {
+        if capture(path)?.is_none() {
+            return Ok(());
+        }
+        let filesec = FileSec::new()?;
+        // acl_delete_file_np is unsupported in Darwin libc. chmodx_np with
+        // the filesec removal sentinel removes inherited entries as well.
+        if unsafe { filesec_set_property(filesec.0, FILESEC_ACL, FILESEC_REMOVE_ACL) } != 0
+            || unsafe { chmodx_np(path.as_ptr(), filesec.0) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn capture(path: &Path) -> Result<Vec<u8>, String> {
     let path = name(path)?;
-    let acl = unsafe { darwin::acl_get_file(path.as_ptr(), darwin::EXTENDED) };
-    if acl.is_null() {
-        return Err(format!(
-            "Cannot capture access ACL: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let acl = darwin::Owned(acl);
+    let Some(acl) =
+        darwin::capture(&path).map_err(|e| format!("Cannot capture access ACL: {e}"))?
+    else {
+        return Ok(Vec::new());
+    };
     let mut len = 0;
     let text = unsafe { darwin::acl_to_text(acl.0, &mut len) };
     if text.is_null() {
@@ -117,6 +187,9 @@ pub(crate) fn apply(path: &Path, data: &[u8]) -> Result<(), String> {
         return Err("Access ACL exceeds recovery bound".into());
     }
     let path = name(path)?;
+    if data.is_empty() {
+        return darwin::clear(&path).map_err(|e| format!("Cannot clear access ACL: {e}"));
+    }
     let text = std::ffi::CString::new(data).map_err(|e| e.to_string())?;
     let acl = unsafe { darwin::acl_from_text(text.as_ptr()) };
     if acl.is_null() {
@@ -130,6 +203,38 @@ pub(crate) fn apply(path: &Path, data: &[u8]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{apply, capture};
+
+    #[test]
+    fn round9_macos_access_acl_round_trips_absence_and_inherited_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        assert!(capture(&plain).is_err());
+        assert!(apply(&plain, &[]).is_err());
+        std::fs::write(&plain, b"plain").unwrap();
+        let no_acl = capture(&plain).unwrap();
+        assert!(no_acl.is_empty());
+
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow list,file_inherit,only_inherit"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let child = dir.path().join("child");
+        std::fs::write(&child, b"child").unwrap();
+        let inherited = capture(&child).unwrap();
+        assert!(!inherited.is_empty());
+
+        apply(&plain, &inherited).unwrap();
+        assert_eq!(capture(&plain).unwrap(), inherited);
+        apply(&child, &no_acl).unwrap();
+        assert_eq!(capture(&child).unwrap(), no_acl);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
