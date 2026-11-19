@@ -6,7 +6,7 @@
 //! on the next open/write; a completed pair only needs journal cleanup. Recovery
 //! never replaces a generation outside the recorded old/new pair.
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::vault::output_parent_dir;
@@ -22,13 +22,19 @@ pub(super) struct Generation {
 }
 
 pub(super) fn generation(path: &Path) -> Result<Generation, String> {
-    let mut file = crate::source::open_regular_no_follow(path)
+    let file = crate::source::open_regular_no_follow(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let expected = file.metadata().map_err(|e| e.to_string())?.len();
+    hash_generation(file, expected)
+}
+
+fn hash_generation(mut file: fs::File, expected: u64) -> Result<Generation, String> {
+    let mut reader = Read::by_ref(&mut file).take(expected);
     let mut hash = blake3::Hasher::new();
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
     let mut len = 0u64;
     loop {
-        let n = file.read(&mut *buf).map_err(|e| e.to_string())?;
+        let n = reader.read(&mut *buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
@@ -36,6 +42,9 @@ pub(super) fn generation(path: &Path) -> Result<Generation, String> {
         len = len
             .checked_add(n as u64)
             .ok_or("generation length overflow")?;
+    }
+    if len != expected || file.read(&mut buf[..1]).map_err(|e| e.to_string())? != 0 {
+        return Err("generation changed length while hashing".into());
     }
     Ok(Generation {
         len,
@@ -49,6 +58,29 @@ fn generation_if_present(path: &Path) -> Result<Option<Generation>, String> {
         Err(e) => Err(e.to_string()),
         Ok(_) => generation(path).map(Some),
     }
+}
+
+fn recorded_generation(
+    path: &Path,
+    candidates: &[Option<Generation>],
+) -> Result<Option<Generation>, String> {
+    let file = match crate::source::open_regular_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    if !candidates
+        .iter()
+        .flatten()
+        .any(|candidate| candidate.len == len)
+    {
+        return Err(format!(
+            "unexpected recovery length {len} for {}",
+            path.display()
+        ));
+    }
+    hash_generation(file, len).map(Some)
 }
 
 pub(super) fn journal_path(source: &Path) -> PathBuf {
@@ -351,15 +383,11 @@ pub(super) fn copy_file_capped(
 }
 
 fn replace_from(
-    source: &Path,
+    mut input: fs::File,
     target: &Path,
     expected: Generation,
     target_before: Generation,
 ) -> Result<(), String> {
-    if generation(source)? != expected {
-        return Err("strip rollback copy failed its generation check".to_string());
-    }
-    let mut input = crate::source::open_regular_no_follow(source).map_err(|e| e.to_string())?;
     let private = private_dir(output_parent_dir(target), ".aerostrip-restore-")?;
     #[cfg(windows)]
     let mut private = private;
@@ -368,12 +396,15 @@ fn replace_from(
         .tempfile_in(private.path())
         .map_err(|e| e.to_string())?;
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
-    loop {
-        let n = input.read(&mut *buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
+    let mut remaining = expected.len;
+    while remaining > 0 {
+        let n = remaining.min(buf.len() as u64) as usize;
+        input.read_exact(&mut buf[..n]).map_err(|e| e.to_string())?;
         temp.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        remaining -= n as u64;
+    }
+    if input.read(&mut buf[..1]).map_err(|e| e.to_string())? != 0 {
+        return Err("strip rollback copy grew while being read".into());
     }
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
     #[cfg(all(test, target_os = "macos"))]
@@ -383,7 +414,7 @@ fn replace_from(
     if generation(temp.path())? != expected {
         return Err("strip rollback copy changed while being read".to_string());
     }
-    if generation(target)? != target_before {
+    if recorded_generation(target, &[Some(target_before)])? != Some(target_before) {
         return Err(
             "strip target changed while preparing rollback; newer file left untouched".to_string(),
         );
@@ -499,16 +530,201 @@ fn conflict(path: &Path, reason: &str) -> String {
     format!("pending strip transaction conflicts ({reason}); files left untouched; preserve the vault, sidecar and rollback directory {}, then follow the pending-strip conflict procedure in AEROVAULT-V3-SPEC.md before reopening", path.display())
 }
 
-fn read_journal(path: &Path) -> Result<Journal, String> {
-    if !fs::symlink_metadata(path)
-        .map_err(|e| e.to_string())?
-        .file_type()
-        .is_dir()
-    {
-        return Err("strip transaction path is not a regular directory".to_string());
+struct TrustedJournal<'a> {
+    path: &'a Path,
+    directory: same_file::Handle,
+    #[cfg(windows)]
+    pins: Vec<fs::File>,
+    #[cfg(unix)]
+    opened: fs::File,
+}
+
+impl<'a> TrustedJournal<'a> {
+    fn open(path: &'a Path) -> Result<Self, String> {
+        let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !metadata.is_dir() {
+            return Err("strip transaction path is not a regular directory".into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err("strip transaction directory is a reparse point".into());
+            }
+        }
+        let mut pins = super::extraction_stage::pin(path).map_err(|e| e.to_string())?;
+        let opened = pins.remove(0);
+        let directory =
+            same_file::Handle::from_file(opened.try_clone().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        validate_private_journal_directory(path, &opened)?;
+        #[cfg(windows)]
+        super::windows_security::verify_private_journal_directory(path)?;
+        #[cfg(windows)]
+        pins.push(opened);
+        let journal = Self {
+            path,
+            directory,
+            #[cfg(windows)]
+            pins,
+            #[cfg(unix)]
+            opened,
+        };
+        journal.recheck()?;
+        Ok(journal)
     }
-    let p = path.join("journal.json");
-    let mut file = crate::source::open_regular_no_follow(&p).map_err(|e| e.to_string())?;
+
+    fn recheck(&self) -> Result<(), String> {
+        let current = super::extraction_stage::directory_identity(self.path)
+            .map_err(|e| format!("strip journal directory unavailable: {e}"))?;
+        if current != self.directory {
+            return Err("strip journal directory changed".into());
+        }
+        Ok(())
+    }
+
+    fn open_input(&self, name: &str) -> Result<fs::File, String> {
+        #[cfg(unix)]
+        let file = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let leaf = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
+            let fd = unsafe {
+                libc::openat(
+                    self.opened.as_raw_fd(),
+                    leaf.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o022 != 0
+                || metadata.nlink() != 1
+            {
+                return Err(
+                    "strip journal input does not have trusted ownership and access".into(),
+                );
+            }
+            file
+        };
+        #[cfg(windows)]
+        let file = {
+            let path = self.path.join(name);
+            let file = crate::source::open_regular_no_follow(&path).map_err(|e| e.to_string())?;
+            super::windows_security::verify_journal_input(&file)?;
+            file
+        };
+        #[cfg(not(any(windows, unix)))]
+        let file = crate::source::open_regular_no_follow(&self.path.join(name))
+            .map_err(|e| e.to_string())?;
+        self.recheck()?;
+        Ok(file)
+    }
+
+    fn backup(&self, name: &str, expected: Option<Generation>) -> Result<Option<fs::File>, String> {
+        let Some(expected) = expected else {
+            if self.path.join(name).exists() {
+                return Err("unexpected strip rollback material; files left untouched".into());
+            }
+            return Ok(None);
+        };
+        let mut file = self.open_input(name)?;
+        if file.metadata().map_err(|e| e.to_string())?.len() != expected.len
+            || hash_generation(file.try_clone().map_err(|e| e.to_string())?, expected.len)?
+                != expected
+        {
+            return Err("strip rollback generation check failed; files left untouched".into());
+        }
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        Ok(Some(file))
+    }
+
+    fn retire(self) -> Result<(), String> {
+        self.recheck()?;
+        let path = self.path;
+        #[cfg(windows)]
+        let (journal_handle, ancestors) = {
+            let mut pins = self.pins;
+            (pins.pop(), pins)
+        };
+        #[cfg(windows)]
+        {
+            drop(self.directory);
+            drop(journal_handle);
+            let result = cleanup(path);
+            drop(ancestors);
+            result
+        }
+        #[cfg(not(windows))]
+        cleanup(path)
+    }
+}
+
+#[cfg(unix)]
+fn validate_private_journal_directory(path: &Path, opened: &fs::File) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let user = unsafe { libc::geteuid() };
+    let metadata = opened.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_dir() || metadata.uid() != user || metadata.mode() & 0o077 != 0 {
+        return Err(
+            "strip journal directory does not have trusted ownership and private access".into(),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if !super::unix_security::capture(path)?.is_empty() {
+        return Err("strip journal directory has an extended access ACL".into());
+    }
+    // An untrusted parent must not be able to replace the checked journal entry.
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
+        if !metadata.is_dir()
+            || (metadata.uid() != user && metadata.uid() != 0)
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err("strip journal ancestry permits replacement by another principal".into());
+        }
+        #[cfg(target_os = "macos")]
+        if super::unix_security::capture(ancestor)?
+            .split(|&b| b == b'\n')
+            .any(mac_acl_may_mutate)
+        {
+            return Err("strip journal ancestry grants additional access through an ACL".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn mac_acl_may_mutate(ace: &[u8]) -> bool {
+    let mut fields = ace.rsplit(|&b| b == b':');
+    let permissions = fields.next().unwrap_or_default();
+    let flags = fields.next().unwrap_or_default();
+    let mut flags = flags.split(|&b| b == b',');
+    flags.next() == Some(b"allow".as_slice())
+        && !flags.any(|flag| flag == b"only_inherit")
+        && permissions.split(|&b| b == b',').any(|p| {
+            !matches!(
+                p,
+                b"" | b"list"
+                    | b"search"
+                    | b"read"
+                    | b"execute"
+                    | b"readattr"
+                    | b"readextattr"
+                    | b"readsecurity"
+                    | b"synchronize"
+            )
+        })
+}
+
+fn read_journal(trusted: &TrustedJournal<'_>) -> Result<Journal, String> {
+    let mut file = trusted.open_input("journal.json")?;
     if file.metadata().map_err(|e| e.to_string())?.len() > 4096 {
         return Err("strip journal exceeds size limit".to_string());
     }
@@ -517,6 +733,9 @@ fn read_journal(path: &Path) -> Result<Journal, String> {
         .take(4097)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
+    if bytes.len() > 4096 {
+        return Err("strip journal exceeds size limit".into());
+    }
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid strip journal: {e}"))?;
     if !matches!(journal.version, 1..=4) {
@@ -525,8 +744,8 @@ fn read_journal(path: &Path) -> Result<Journal, String> {
     Ok(journal)
 }
 
-fn load(path: &Path, source: &Path) -> Result<(Journal, PathBuf), String> {
-    let journal = read_journal(path)?;
+fn load(trusted: &TrustedJournal<'_>, source: &Path) -> Result<(Journal, PathBuf), String> {
+    let journal = read_journal(trusted)?;
     let recorded = recorded_source(output_parent_dir(source), &journal.source_name)?;
     if native_name(source) != journal.source_name && !same_existing_file(source, &recorded) {
         return Err(
@@ -547,16 +766,18 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     if !lock.covers_namespace(source) {
         return Err("strip source lock namespace changed".to_string());
     }
-    let (journal, recorded) = load(path, source)?;
+    let trusted = TrustedJournal::open(path).map_err(|e| conflict(path, &e))?;
+    let (journal, recorded) = load(&trusted, source).map_err(|e| conflict(path, &e))?;
     let source = recorded.as_path();
     if !lock.covers_namespace(source) {
         return Err("strip recorded source lock namespace changed".to_string());
     }
     let sidecar = super::ec::default_sidecar_path(source);
-    let vault_now = generation_if_present(source)
+    let vault_now = recorded_generation(source, &[journal.old_vault, Some(journal.new_vault)])
         .map_err(|e| conflict(path, &format!("vault unavailable: {e}")))?;
-    let sidecar_now = generation_if_present(&sidecar)
-        .map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
+    let sidecar_now =
+        recorded_generation(&sidecar, &[journal.old_sidecar, Some(journal.new_sidecar)])
+            .map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
     let original_pair = vault_now == journal.old_vault && sidecar_now == journal.old_sidecar;
     if original_pair
         && path
@@ -564,17 +785,18 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
             .try_exists()
             .map_err(|e| e.to_string())?
     {
-        cleanup(path)?;
+        trusted.retire()?;
         return Ok(RecoveryOutcome::Original);
     }
     if original_pair && path.join("new-vault").exists() && path.join("new-sidecar").exists() {
-        cleanup(path)?;
+        trusted.retire()?;
         return Ok(RecoveryOutcome::Original);
     }
     if vault_now == Some(journal.new_vault) && sidecar_now == Some(journal.new_sidecar) {
         // A crash can occur just after rename and before inheritance restoration.
+        trusted.recheck()?;
         restore_published_permissions(source, &sidecar, &journal, path)?;
-        cleanup(path)?;
+        trusted.retire()?;
         return Ok(RecoveryOutcome::Stripped);
     }
     if original_pair {
@@ -589,11 +811,9 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         return Err(conflict(path, "newer or damaged vault or sidecar"));
     }
     // Verify both copies before replacing either original.
-    if generation_if_present(&path.join("old-vault"))? != journal.old_vault
-        || generation_if_present(&path.join("old-sidecar"))? != journal.old_sidecar
-    {
-        return Err("strip rollback generation check failed; files left untouched".to_string());
-    }
+    let old_vault = trusted.backup("old-vault", journal.old_vault)?;
+    let old_sidecar = trusted.backup("old-sidecar", journal.old_sidecar)?;
+    trusted.recheck()?;
     let rollback = path.join("rollback-intent");
     if !rollback.try_exists().map_err(|e| e.to_string())? {
         let file = private_options()
@@ -603,38 +823,28 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         sync_dir(path)?;
     }
     if vault_now != journal.old_vault {
-        restore_original(
-            &path.join("old-vault"),
-            source,
-            journal.old_vault,
-            vault_now,
-        )?;
+        restore_original(old_vault, source, journal.old_vault, vault_now)?;
     }
     if sidecar_now != journal.old_sidecar {
-        restore_original(
-            &path.join("old-sidecar"),
-            &sidecar,
-            journal.old_sidecar,
-            sidecar_now,
-        )?;
+        restore_original(old_sidecar, &sidecar, journal.old_sidecar, sidecar_now)?;
     }
     #[cfg(test)]
     if let Some(hook) = AFTER_ROLLBACK_RESTORE.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    cleanup(path)?;
+    trusted.retire()?;
     Ok(RecoveryOutcome::Original)
 }
 
 fn restore_original(
-    backup: &Path,
+    backup: Option<fs::File>,
     target: &Path,
     original: Option<Generation>,
     current: Option<Generation>,
 ) -> Result<(), String> {
     if let Some(original) = original {
         return replace_from(
-            backup,
+            backup.ok_or("rollback backup unexpectedly absent")?,
             target,
             original,
             current.ok_or("rollback target unexpectedly absent")?,
@@ -642,7 +852,7 @@ fn restore_original(
     }
     // Absence is an original state too. Remove only the exact recorded new
     // generation; preserve any later file as a recovery conflict.
-    if generation_if_present(target)? != current {
+    if recorded_generation(target, &[current])? != current {
         return Err("strip target changed before restoring absence".into());
     }
     if current.is_some() {
@@ -817,7 +1027,7 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
     if let Some(hook) = BEFORE_PENDING_JOURNAL_READ.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let journal = match read_journal(&path) {
+    let journal = match TrustedJournal::open(&path).and_then(|trusted| read_journal(&trusted)) {
         Ok(journal) => journal,
         Err(_) => {
             // Publication may have retired the directory after our optimistic
@@ -922,6 +1132,9 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
         if SavedPermissions::capture_if_present(source)? != journal.old_vault_permissions {
             return Err("Original vault security changed before publication".into());
         }
+        if recorded_generation(source, &[journal.old_vault])? != journal.old_vault {
+            return Err("Original vault content changed before publication".into());
+        }
         fs::rename(path.join("new-vault"), source).map_err(|e| e.to_string())?;
         finish_security(
             source,
@@ -940,6 +1153,9 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
         }
         if SavedPermissions::capture_if_present(&sidecar)? != journal.old_sidecar_permissions {
             return Err("Original sidecar security changed before publication".into());
+        }
+        if recorded_generation(&sidecar, &[journal.old_sidecar])? != journal.old_sidecar {
+            return Err("Original sidecar content changed before publication".into());
         }
         fs::rename(path.join("new-sidecar"), &sidecar).map_err(|e| e.to_string())?;
         #[cfg(test)]
@@ -1039,7 +1255,7 @@ mod tests {
             }));
         });
         replace_from(
-            &backup,
+            crate::source::open_regular_no_follow(&backup).unwrap(),
             &original,
             generation(&backup).unwrap(),
             generation(&original).unwrap(),
@@ -1048,6 +1264,117 @@ mod tests {
         assert!(inspected.get());
         assert_eq!(fs::read(original).unwrap(), b"plaintext before strip");
     }
+    #[cfg(unix)]
+    #[test]
+    fn recovery_rejects_unrecorded_sparse_length_before_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar");
+        fs::write(&path, b"recorded sidecar").unwrap();
+        let original = generation(&path).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64 * 1024 * 1024 * 1024)
+            .unwrap();
+        let error = recorded_generation(&path, &[Some(original)]).unwrap_err();
+        assert!(error.contains("unexpected recovery length"), "{error}");
+    }
+
+    #[test]
+    fn strip_publication_keeps_byte_only_edits_at_both_rename_boundaries() {
+        for edit_before_vault in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.aerozip");
+            let sidecar = super::super::ec::default_sidecar_path(&source);
+            fs::write(&source, b"vault old").unwrap();
+            fs::write(&sidecar, b"sidecar old").unwrap();
+            let prepared = private_dir(dir.path(), ".prepared-").unwrap();
+            copy_file(&source, &prepared.path().join("old-vault")).unwrap();
+            copy_file(&sidecar, &prepared.path().join("old-sidecar")).unwrap();
+            fs::write(prepared.path().join("new-vault"), b"vault new").unwrap();
+            fs::write(prepared.path().join("new-sidecar"), b"sidecar new").unwrap();
+            let target = if edit_before_vault { &source } else { &sidecar };
+            let edited = if edit_before_vault {
+                &b"vault ext"[..]
+            } else {
+                &b"sidecar ext"[..]
+            };
+            let path = target.clone();
+            let slot = if edit_before_vault {
+                &AFTER_STRIP_JOURNAL
+            } else {
+                &AFTER_STRIP_VAULT
+            };
+            slot.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || fs::write(path, edited).unwrap()))
+            });
+            let lock = crate::lock::acquire_without_recovery(&source).unwrap();
+            let error = publish(&source, prepared, &lock).unwrap_err();
+            assert!(
+                error.contains("content changed before publication"),
+                "{error}"
+            );
+            assert!(journal_path(&source).is_dir());
+            assert_eq!(fs::read(target).unwrap(), edited);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_recovery_rejects_untrusted_shared_journal_without_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        let source = shared.join("source.aerozip");
+        let sidecar = super::super::ec::default_sidecar_path(&source);
+        fs::write(&source, b"source unchanged").unwrap();
+        fs::write(&sidecar, b"sidecar unchanged").unwrap();
+        let journal = journal_path(&source);
+        fs::create_dir(&journal).unwrap();
+        fs::write(journal.join("journal.json"), b"untrusted origin").unwrap();
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o777)).unwrap();
+        let error = recover_if_pending(&source).unwrap_err();
+        assert!(
+            error.contains("trusted ownership and private access"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"source unchanged");
+        assert_eq!(fs::read(&sidecar).unwrap(), b"sidecar unchanged");
+        assert!(journal.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn automatic_recovery_rejects_foreign_owner_fixture() {
+        use std::os::unix::fs::MetadataExt;
+        let Some(shared) = std::env::var_os("AEROVAULT_TEST_FOREIGN_JOURNAL_ROOT") else {
+            return;
+        };
+        let shared = PathBuf::from(shared);
+        let incoming = shared.join("incoming");
+        assert_ne!(incoming.metadata().unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
+        let source = shared.join("source.aerozip");
+        let sidecar = super::super::ec::default_sidecar_path(&source);
+        fs::write(&source, b"trusted vault bytes").unwrap();
+        fs::write(&sidecar, b"trusted sidecar bytes").unwrap();
+        let journal = journal_path(&source);
+        fs::rename(incoming, &journal).unwrap();
+        let error = recover_if_pending(&source).unwrap_err();
+        assert!(
+            error.contains("trusted ownership and private access"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"trusted vault bytes");
+        assert_eq!(fs::read(&sidecar).unwrap(), b"trusted sidecar bytes");
+        assert!(journal.is_dir());
+        eprintln!("Foreign journal owner refused with both destination generations unchanged");
+    }
+
     #[test]
     fn journal_source_names_are_native_and_cannot_escape_the_parent() {
         let dir = tempfile::tempdir().unwrap();
@@ -1231,7 +1558,7 @@ mod tests {
         let backup = stage.path().join("old");
         fs::write(&backup, b"original plaintext").unwrap();
         replace_from(
-            &backup,
+            crate::source::open_regular_no_follow(&backup).unwrap(),
             &source,
             generation(&backup).unwrap(),
             generation(&source).unwrap(),

@@ -1138,7 +1138,7 @@ pub(super) fn reconstruct_manifest_from_sidecar(
 fn sidecar_parity_flags(vault_path: &Path) -> (bool, bool) {
     let sidecar_path = recovery_sidecar_path(vault_path);
     match open_vault_sidecar(vault_path, &sidecar_path) {
-        Ok(reader) => (
+        Ok(reader) if !reader.has_standalone_tiling() => (
             reader
                 .segments()
                 .get(VAULT_SIDECAR_SEG_MANIFEST)
@@ -1148,7 +1148,7 @@ fn sidecar_parity_flags(vault_path: &Path) -> (bool, bool) {
                 .get(VAULT_SIDECAR_SEG_HEADER)
                 .is_some_and(|s| s.avec_len != 0),
         ),
-        Err(_) => (false, false),
+        _ => (false, false),
     }
 }
 
@@ -1261,11 +1261,23 @@ pub struct RecoveryStatus {
 /// Report the Error Correction recovery surfaces for a vault without the password.
 pub(super) fn recovery_status(path: &Path) -> Result<RecoveryStatus, String> {
     let embedded = has_error_correction(path).unwrap_or(false);
-    let (manifest_parity, _) = sidecar_parity_flags(path);
-    let header_parity = std::fs::canonicalize(path)
-        .ok()
-        .is_some_and(|p| sidecar_parity_flags(&p).1);
-    let detached = recovery_sidecar_path(path).exists() || header_parity;
+    let physical = std::fs::canonicalize(path).ok();
+    let manifest_path = path;
+    #[cfg(windows)]
+    let manifest_path = if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        physical.as_deref().unwrap_or(path)
+    } else {
+        manifest_path
+    };
+    let (manifest_parity, header_parity) = sidecar_parity_flags(manifest_path);
+    let header_parity = physical.as_deref().is_some_and(|p| {
+        if p == manifest_path {
+            header_parity
+        } else {
+            sidecar_parity_flags(p).1
+        }
+    });
+    let detached = recovery_sidecar_path(manifest_path).exists() || header_parity;
     Ok(RecoveryStatus {
         embedded,
         detached,
@@ -2245,6 +2257,21 @@ mod tests {
         crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn recovery_status_distinguishes_standalone_from_vault_metadata_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        crate::error_correction::correct_generate(path.to_str().unwrap(), 20, None).unwrap();
+        let status = recovery_status(&path).unwrap();
+        assert!(status.detached);
+        assert!(!status.manifest_parity && !status.header_parity);
+        std::fs::remove_file(default_sidecar_path(&path)).unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let status = recovery_status(&path).unwrap();
+        assert!(status.detached && status.manifest_parity && status.header_parity);
     }
 
     #[test]

@@ -438,17 +438,38 @@ impl Vault {
                 continue;
             }
 
-            let mut source_reader = source;
-            let mut chunk_count = 0u32;
-            let chunk_total = if metadata.len() == 0 {
-                0
+            let mut source = source;
+            let mut measured = Zeroizing::new(Vec::new());
+            if metadata.len() == 0 {
+                // Some regular pseudo-files have no stat size. Bound the
+                // measurement before deriving the authenticated chunk count.
+                let cap = u64::from(MAX_CHUNK_SIZE);
+                crate::secret::read_to_end(
+                    &mut Read::by_ref(&mut source).take(cap + 1),
+                    &mut measured,
+                )?;
+                if measured.len() as u64 > cap {
+                    return Err(crate::Error::Manifest(
+                        "size-unknown source exceeds the bounded add buffer".into(),
+                    ));
+                }
+                if source.metadata()?.len() != 0 {
+                    return Err(crate::Error::Manifest(
+                        "source changed size during add; aborting".into(),
+                    ));
+                }
+            }
+            let mut measured_reader = measured.as_slice();
+            let (source_reader, source_len): (&mut dyn Read, u64) = if measured.is_empty() {
+                (&mut source, metadata.len())
             } else {
-                metadata
-                    .len()
-                    .div_ceil(chunk_size as u64)
-                    .try_into()
-                    .map_err(|_| crate::Error::Manifest("chunk count overflow".into()))?
+                (&mut measured_reader, measured.len() as u64)
             };
+            let mut chunk_count = 0u32;
+            let chunk_total = source_len
+                .div_ceil(chunk_size as u64)
+                .try_into()
+                .map_err(|_| crate::Error::Manifest("chunk count overflow".into()))?;
             let file_id = if bind_chunks {
                 let mut id = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut id);
@@ -458,7 +479,7 @@ impl Vault {
             };
             let entry_offset = data_offset;
 
-            let mut remaining = metadata.len();
+            let mut remaining = source_len;
             while remaining > 0 {
                 let bytes_read = remaining.min(chunk_size as u64) as usize;
                 let mut chunk = Zeroizing::new(vec![0u8; bytes_read]);
@@ -508,7 +529,7 @@ impl Vault {
             }
 
             // The v3+ chunk AAD binds `chunk_total`, derived from the pre-stream
-            // `metadata.len()`. Extraction rebuilds the AAD from the manifest's
+            // source length. Extraction rebuilds the AAD from the manifest's
             // stored `chunk_count` (the actual number of chunks streamed). If the
             // source changed size between the stat and the read, the two diverge
             // and every chunk would fail AAD verification on extract: a silently
@@ -531,7 +552,7 @@ impl Vault {
             manifest.entries.push(ManifestEntry {
                 encrypted_name,
                 name: String::new(),
-                size: metadata.len(),
+                size: source_len,
                 offset: entry_offset,
                 chunk_count,
                 file_id,
@@ -1826,6 +1847,30 @@ mod tests {
                     vec![7; 4097]
                 );
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_add_supports_size_unknown_sources_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.aerovault");
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, []).unwrap();
+        let source = Path::new("/proc/version");
+        assert_eq!(source.metadata().unwrap().len(), 0);
+        let expected = std::fs::read(source).unwrap();
+        assert!(!expected.is_empty());
+        for version in [VERSION, LEGACY_VERSION] {
+            let vault =
+                Vault::create(CreateOptions::new(&path, "test-password-123").with_version(version))
+                    .unwrap();
+            assert_eq!(vault.add_files(&[source, empty.as_path()]).unwrap(), 2);
+            let out = dir.path().join(format!("out-{version}"));
+            vault.extract_all(&out).unwrap();
+            assert_eq!(std::fs::read(out.join("version")).unwrap(), expected);
+            assert!(std::fs::read(out.join("empty")).unwrap().is_empty());
+            std::fs::remove_file(&path).unwrap();
         }
     }
 

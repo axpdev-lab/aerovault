@@ -18,6 +18,25 @@ unsafe extern "system" {
         size: u32,
         needed: *mut u32,
     ) -> i32;
+    fn GetSecurityInfo(
+        handle: *mut c_void,
+        object_type: u32,
+        info: u32,
+        owner: *mut *mut c_void,
+        group: *mut *mut c_void,
+        dacl: *mut *mut c_void,
+        sacl: *mut *mut c_void,
+        descriptor: *mut *mut c_void,
+    ) -> u32;
+    fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    fn GetTokenInformation(
+        token: *mut c_void,
+        class: u32,
+        value: *mut c_void,
+        size: u32,
+        needed: *mut u32,
+    ) -> i32;
+    fn EqualSid(left: *const c_void, right: *const c_void) -> i32;
     fn GetSecurityDescriptorDacl(
         descriptor: *const c_void,
         present: *mut i32,
@@ -68,6 +87,7 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
     fn CreateDirectoryW(path: *const u16, attributes: *const SecurityAttributes) -> i32;
+    fn GetCurrentProcess() -> *mut c_void;
 }
 
 #[repr(C)]
@@ -87,6 +107,10 @@ struct AclSize {
 /// Compare all ACE bytes and DACL protection, independently of SDDL formatting
 /// and Windows' informational auto-inheritance control flags.
 fn protected_aces(sddl: &str) -> Result<Vec<Vec<u8>>, String> {
+    access_aces(sddl, true)
+}
+
+fn access_aces(sddl: &str, protected: bool) -> Result<Vec<Vec<u8>>, String> {
     if sddl.len() > 65536 || sddl.contains('\0') {
         return Err("Invalid bounded DACL text".into());
     }
@@ -107,7 +131,7 @@ fn protected_aces(sddl: &str) -> Result<Vec<Vec<u8>>, String> {
     let mut control = 0u16;
     let mut revision = 0;
     if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0
-        || control & 0x1000 == 0
+        || (protected && control & 0x1000 == 0)
     {
         return Err("Private directory DACL is not protected".into());
     }
@@ -164,16 +188,14 @@ fn wide(path: &Path) -> Vec<u16> {
 
 pub(crate) fn capture(path: &Path) -> Result<String, String> {
     let path = wide(path);
+    capture_security(|descriptor, size, needed| unsafe {
+        GetFileSecurityW(path.as_ptr(), OWNER | DACL, descriptor, size, needed)
+    })
+}
+
+fn capture_security(read: impl Fn(*mut c_void, u32, *mut u32) -> i32) -> Result<String, String> {
     let mut needed = 0;
-    unsafe {
-        GetFileSecurityW(
-            path.as_ptr(),
-            OWNER | DACL,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        );
-    }
+    read(std::ptr::null_mut(), 0, &mut needed);
     if needed == 0 || needed > 65536 {
         return Err(format!(
             "Cannot capture bounded file DACL: {}",
@@ -182,26 +204,21 @@ pub(crate) fn capture(path: &Path) -> Result<String, String> {
     }
     // DWORD-aligned storage for the self-relative descriptor returned by Windows.
     let mut descriptor = vec![0u32; (needed as usize).div_ceil(4)];
-    if unsafe {
-        GetFileSecurityW(
-            path.as_ptr(),
-            OWNER | DACL,
-            descriptor.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    } == 0
-    {
+    if read(descriptor.as_mut_ptr().cast(), needed, &mut needed) == 0 {
         return Err(format!(
             "Read file DACL: {}",
             std::io::Error::last_os_error()
         ));
     }
+    encode_security(descriptor.as_ptr().cast())
+}
+
+fn encode_security(descriptor: *const c_void) -> Result<String, String> {
     let mut text = std::ptr::null_mut();
     let mut len = 0;
     if unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor.as_ptr().cast(),
+            descriptor,
             1,
             OWNER | DACL,
             &mut text,
@@ -221,6 +238,113 @@ pub(crate) fn capture(path: &Path) -> Result<String, String> {
     // Windows returns the buffer capacity in WCHARs, not the string length.
     // Only the prefix through the first NUL is initialized string content.
     unsafe { decode_sddl_buffer(owned.0.cast::<u16>(), len as usize) }
+}
+
+fn verify_current_owner(sddl: &str) -> Result<(), String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    const QUERY: u32 = 8;
+    const TOKEN_OWNER: u32 = 4;
+    let mut raw_token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), QUERY, &mut raw_token) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+    let mut needed = 0;
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TOKEN_OWNER,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed < std::mem::size_of::<*mut c_void>() as u32 || needed > 65536 {
+        return Err("Cannot determine the current Windows token owner".into());
+    }
+    let mut owner = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TOKEN_OWNER,
+            owner.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let expected = unsafe { owner.as_ptr().cast::<*mut c_void>().read() };
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let descriptor = Local(descriptor);
+    let mut actual = std::ptr::null_mut();
+    let mut defaulted = 0;
+    if unsafe { GetSecurityDescriptorOwner(descriptor.0, &mut actual, &mut defaulted) } == 0
+        || actual.is_null()
+        || expected.is_null()
+        || unsafe { EqualSid(actual, expected) } == 0
+    {
+        return Err("strip journal object belongs to a different Windows owner".into());
+    }
+    Ok(())
+}
+
+const PRIVATE_DIRECTORY_DACL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
+
+pub(super) fn verify_private_journal_directory(path: &Path) -> Result<(), String> {
+    let actual = capture(path)?;
+    verify_current_owner(&actual)?;
+    if protected_aces(&actual)? != protected_aces(PRIVATE_DIRECTORY_DACL)? {
+        return Err("strip journal directory has an unexpected DACL".into());
+    }
+    Ok(())
+}
+
+pub(super) fn verify_journal_input(file: &std::fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            1,
+            OWNER | DACL,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() {
+        return Err(format!(
+            "Read strip journal input security: {}",
+            std::io::Error::from_raw_os_error(status as i32)
+        ));
+    }
+    let descriptor = Local(descriptor);
+    let actual = encode_security(descriptor.0)?;
+    verify_current_owner(&actual)?;
+    let mut aces = access_aces(&actual, false)?;
+    for ace in &mut aces {
+        ace[1] &= !0x10; // INHERITED_ACE
+    }
+    if aces != access_aces("D:(A;;FA;;;OW)(A;;FA;;;SY)", false)? {
+        return Err("strip journal input has an unexpected DACL".into());
+    }
+    Ok(())
 }
 
 /// Read a Windows-allocated, NUL-terminated SDDL string within its buffer bound.
@@ -312,7 +436,7 @@ pub(crate) fn apply(path: &Path, sddl: &str, staging: bool) -> Result<(), String
 /// Create with the restrictive DACL atomically, before another principal can
 /// open the directory under an inherited permissive ACL.
 pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    let text: Vec<u16> = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
+    let text: Vec<u16> = PRIVATE_DIRECTORY_DACL
         .encode_utf16()
         .chain(Some(0))
         .collect();
@@ -341,7 +465,7 @@ pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
     // directory is still empty; no vault or rollback bytes have been written.
     let verified = capture(path).and_then(|actual| {
         let actual = protected_aces(&actual)?;
-        let expected = protected_aces("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)")?;
+        let expected = protected_aces(PRIVATE_DIRECTORY_DACL)?;
         if actual == expected {
             Ok(())
         } else {

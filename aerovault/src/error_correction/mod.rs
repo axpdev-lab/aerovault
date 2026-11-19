@@ -439,7 +439,17 @@ pub(crate) fn compute_metadata_parity(region: &[u8], k: usize, p: usize) -> Vec<
 
 // Reconstruction allocates these buffers at their final sizes. Reed-Solomon
 // can write recovered shards into them without allocating unowned copies.
-struct ReconstructionBuffer(Vec<u8>);
+struct ReconstructionBuffer(Vec<u8>, #[cfg(test)] bool);
+
+impl ReconstructionBuffer {
+    fn new(bytes: Vec<u8>, _is_stream: bool) -> Self {
+        Self(
+            bytes,
+            #[cfg(test)]
+            _is_stream,
+        )
+    }
+}
 
 impl AsRef<[u8]> for ReconstructionBuffer {
     fn as_ref(&self) -> &[u8] {
@@ -462,14 +472,16 @@ impl Drop for ReconstructionBuffer {
         #[cfg(test)]
         RECONSTRUCTION_WIPES.with(|count| {
             assert!(self.0.iter().all(|&b| b == 0));
-            count.set(count.get() + usize::from(had_data));
+            let mut wipes = count.get();
+            wipes[usize::from(self.1)] += usize::from(had_data);
+            count.set(wipes);
         });
     }
 }
 
 #[cfg(test)]
 thread_local! {
-    static RECONSTRUCTION_WIPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECONSTRUCTION_WIPES: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
 /// Reconstruct damaged bytes in the protected block stream using the v2 Error
@@ -510,7 +522,7 @@ pub(crate) fn reconstruct_from_error_correction(
         ));
     }
 
-    let mut stream = ReconstructionBuffer(Vec::with_capacity(l));
+    let mut stream = ReconstructionBuffer::new(Vec::with_capacity(l), true);
     for b in blocks.iter() {
         stream.0.extend_from_slice(b);
     }
@@ -526,7 +538,7 @@ pub(crate) fn reconstruct_from_error_correction(
 
     for g in 0..num_groups {
         let mut opt: Vec<_> = (0..k + p)
-            .map(|_| (ReconstructionBuffer(vec![0u8; s]), false))
+            .map(|_| (ReconstructionBuffer::new(vec![0u8; s], false), false))
             .collect();
         let mut erased_data = 0usize;
 
@@ -1088,13 +1100,15 @@ mod tests {
         let mut damaged = original.clone();
         damaged[37] ^= 1;
         let mut blocks = [damaged];
-        RECONSTRUCTION_WIPES.with(|count| count.set(0));
+        RECONSTRUCTION_WIPES.with(|count| count.set([0; 2]));
         assert_eq!(
             reconstruct_from_error_correction(&mut blocks, &parity).unwrap(),
             1
         );
         assert_eq!(blocks[0], original);
-        assert!(RECONSTRUCTION_WIPES.with(|count| count.get()) > 1);
+        let [shards, stream] = RECONSTRUCTION_WIPES.with(|count| count.get());
+        assert!(shards > 0);
+        assert_eq!(stream, 1);
     }
 
     #[test]

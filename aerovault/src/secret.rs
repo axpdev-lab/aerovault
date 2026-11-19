@@ -31,6 +31,13 @@ pub(crate) fn reserve(bytes: &mut Zeroizing<Vec<u8>>, additional: usize) -> io::
     Ok(())
 }
 
+pub(crate) fn reserve_vec(bytes: &mut Vec<u8>, additional: usize) -> io::Result<()> {
+    let mut protected = Zeroizing::new(std::mem::take(bytes));
+    let result = reserve(&mut protected, additional);
+    *bytes = std::mem::take(&mut *protected);
+    result
+}
+
 pub(crate) fn read_to_end(
     reader: &mut impl Read,
     bytes: &mut Zeroizing<Vec<u8>>,

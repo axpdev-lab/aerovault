@@ -18,11 +18,24 @@ mod platform {
     };
 
     pub(crate) fn pin(path: &Path) -> io::Result<Vec<File>> {
-        let file = std::fs::OpenOptions::new()
+        Ok(vec![open_directory(path)?])
+    }
+
+    pub(crate) fn directory_identity(path: &Path) -> io::Result<same_file::Handle> {
+        same_file::Handle::from_file(open_directory(path)?)
+    }
+
+    fn open_directory(path: &Path) -> io::Result<File> {
+        #[cfg(target_os = "linux")]
+        let access = libc::O_PATH;
+        #[cfg(target_os = "macos")]
+        let access = libc::O_SEARCH;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let access = 0;
+        std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(path)?;
-        Ok(vec![file])
+            .custom_flags(access | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
     }
 
     fn name(leaf: &OsStr) -> io::Result<CString> {
@@ -150,11 +163,20 @@ mod platform {
             let mut backup = Self::new(&self.directory, Path::new(""))?;
             let copied = io::copy(&mut (&source).take(before.len()), &mut &backup.file)?;
             copy_permissions(&source, &backup.file, &before)?;
+            let modified = before.modified()?;
+            backup
+                .file
+                .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+            if backup.file.metadata()?.modified()? != modified {
+                return Err(io::Error::other(
+                    "Cannot preserve original extraction modification time",
+                ));
+            }
             backup.file.sync_all()?;
             let after = source.metadata()?;
             if copied != before.len()
                 || before.len() != after.len()
-                || before.modified()? != after.modified()?
+                || modified != after.modified()?
                 || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
                 || identity_at(self.directory.as_raw_fd(), target)? != original
             {
@@ -405,6 +427,30 @@ mod platform {
     }
 
     fn rename_noclobber(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        match no_replace(directory, source, dest) {
+            Ok(()) => return Ok(()),
+            Err(error) if unsupported_rename(&error) => {}
+            Err(error) => return Err(error),
+        }
+        // Filesystems without an atomic no-replace rename can atomically
+        // create a hard link. The stage's normal cleanup removes the old name.
+        link(directory, source, dest).map_err(|error| {
+            if unsupported_rename(&error) || error.raw_os_error() == Some(libc::EPERM) {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "The output filesystem supports neither atomic no-replace rename nor hard-link publication",
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    fn no_replace(directory: libc::c_int, source: &CStr, dest: &CStr) -> io::Result<()> {
+        #[cfg(test)]
+        if FORBID_LINK_AND_EXCHANGE.get() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
         #[cfg(target_os = "linux")]
         let renamed = unsafe {
             libc::syscall(
@@ -414,7 +460,7 @@ mod platform {
                 directory,
                 dest.as_ptr(),
                 libc::RENAME_NOREPLACE,
-            )
+            ) as libc::c_int
         };
         #[cfg(target_os = "macos")]
         let renamed = unsafe {
@@ -426,24 +472,37 @@ mod platform {
                 libc::RENAME_EXCL,
             )
         };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (directory, source, dest);
+            Err(io::ErrorKind::Unsupported.into())
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            if renamed == 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if !unsupported_rename(&error) {
-                return Err(error);
-            }
+            unix_result(renamed)
         }
-        // Filesystems without an atomic no-replace rename can atomically
-        // create a hard link. The stage's normal cleanup removes the old name.
-        link(directory, source, dest)
     }
 
     #[cfg(test)]
     thread_local! {
         static FORBID_LINK_AND_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn extraction_rejects_unsupported_fresh_publication_without_leaving_output() {
+        let fixture = tempfile::tempdir().unwrap();
+        let parent = fixture.path();
+        let pinned = pin(parent).unwrap();
+        let mut stage = Stage::new(&pinned[0], parent).unwrap();
+        FORBID_LINK_AND_EXCHANGE.set(true);
+        let output = parent.join("output");
+        let error = stage.publish(&output, false, || Ok(())).unwrap_err();
+        FORBID_LINK_AND_EXCHANGE.set(false);
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("atomic no-replace rename"));
+        drop(stage);
+        assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
     }
 
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -461,6 +520,13 @@ mod platform {
             let payload = b"new extracted bytes";
             std::fs::write(&target, original).unwrap();
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_002);
+            File::options()
+                .write(true)
+                .open(&target)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
             let pinned = pin(&parent).unwrap();
             let mut stage = Stage::new(&pinned[0], &parent).unwrap();
             stage.file().write_all(payload).unwrap();
@@ -488,6 +554,7 @@ mod platform {
                 let restored = moved_parent.join("file");
                 let metadata = restored.metadata().unwrap();
                 assert_eq!(metadata.mode() & 0o777, 0o640);
+                assert_eq!(metadata.modified().unwrap(), modified);
                 assert_eq!(std::fs::read(restored).unwrap(), original);
                 moved_parent
             } else {
@@ -529,6 +596,10 @@ mod platform {
 mod platform {
     use super::*;
 
+    pub(crate) fn directory_identity(path: &Path) -> io::Result<same_file::Handle> {
+        same_file::Handle::from_path(path)
+    }
+
     pub(crate) fn pin(path: &Path) -> io::Result<Vec<File>> {
         #[cfg(windows)]
         {
@@ -558,10 +629,17 @@ mod platform {
     pub(crate) struct Stage {
         temp: Option<tempfile::NamedTempFile>,
         identity: same_file::Handle,
+        #[cfg(windows)]
+        _private: crate::v3::strip_transaction::PrivateDir,
     }
 
     impl Stage {
         pub(crate) fn new(_: &File, path: &Path) -> io::Result<Self> {
+            #[cfg(windows)]
+            let private = crate::v3::strip_transaction::private_dir(path, ".aerovault-v3-")
+                .map_err(io::Error::other)?;
+            #[cfg(windows)]
+            let path = private.path();
             let temp = tempfile::Builder::new()
                 .prefix(".aerovault-v3-")
                 .tempfile_in(path)?;
@@ -569,6 +647,8 @@ mod platform {
             Ok(Self {
                 temp: Some(temp),
                 identity,
+                #[cfg(windows)]
+                _private: private,
             })
         }
 
@@ -594,6 +674,18 @@ mod platform {
         ) -> io::Result<()> {
             self.verify()?;
             check_parent()?;
+            // Sample destination inheritance using an empty file. The real
+            // stage remains private through publication.
+            #[cfg(windows)]
+            let security = {
+                let parent = target
+                    .parent()
+                    .ok_or_else(|| io::Error::other("Missing output parent"))?;
+                let probe = tempfile::Builder::new()
+                    .prefix(".aerovault-security-")
+                    .tempfile_in(parent)?;
+                crate::v3::windows_security::capture(probe.path()).map_err(io::Error::other)?
+            };
             let temp = self.temp.take().expect("unpublished stage");
             let result = if overwrite {
                 temp.persist(target)
@@ -601,7 +693,12 @@ mod platform {
                 temp.persist_noclobber(target)
             };
             match result {
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    #[cfg(windows)]
+                    crate::v3::windows_security::apply(target, &security, false)
+                        .map_err(|e| io::Error::other(format!("Output published with private access; applying destination security failed: {e}")))?;
+                    Ok(())
+                }
                 Err(error) => {
                     self.temp = Some(error.file);
                     Err(error.error)
@@ -609,6 +706,45 @@ mod platform {
             }
         }
     }
+
+    #[cfg(all(test, windows))]
+    #[test]
+    fn extraction_windows_stage_blocks_inherited_reads_on_failure() {
+        use crate::v3::windows_security::guest_effective_rights;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let grant = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-5-32-546:(OI)(CI)(R)"])
+            .output()
+            .unwrap();
+        assert!(grant.status.success());
+        let ordinary = dir.path().join("ordinary");
+        File::create(&ordinary).unwrap();
+        assert_ne!(guest_effective_rights(&ordinary).unwrap() & 1, 0);
+        let output = dir.path().join("output");
+        let pinned = pin(dir.path()).unwrap();
+        let mut stage = Stage::new(&pinned[0], dir.path()).unwrap();
+        let staged = stage.temp.as_ref().unwrap().path().to_path_buf();
+        assert_eq!(guest_effective_rights(&staged).unwrap() & 1, 0);
+        stage
+            .file()
+            .write_all(b"private until publication")
+            .unwrap();
+        assert_eq!(guest_effective_rights(&staged).unwrap() & 1, 0);
+        let error = stage
+            .publish(&output, false, || Err(io::Error::other("injected failure")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "injected failure");
+        drop(stage);
+        assert!(!output.exists() && !staged.exists());
+
+        let mut stage = Stage::new(&pinned[0], dir.path()).unwrap();
+        stage.file().write_all(b"share after publication").unwrap();
+        stage.publish(&output, false, || Ok(())).unwrap();
+        assert_ne!(guest_effective_rights(&output).unwrap() & 1, 0);
+    }
 }
 
-pub(super) use platform::{pin, Stage};
+pub(super) use platform::{directory_identity, pin, Stage};

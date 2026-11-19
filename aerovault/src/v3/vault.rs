@@ -1103,7 +1103,8 @@ fn ingest_chunk(
         // directly, skipping AES-256-GCM-SIV. `cipher_hash` is taken over the
         // stored bytes either way (ciphertext on the encrypted lane, the payload
         // here), so the decode-side integrity check is unchanged.
-        let encrypted = Zeroizing::new(if manifest_is_plaintext(&vault.manifest) {
+        let plaintext = manifest_is_plaintext(&vault.manifest);
+        let encrypted = Zeroizing::new(if plaintext {
             payload.to_vec()
         } else {
             encrypt_with_aad(&vault.master_key, payload, &aad)?
@@ -1128,10 +1129,16 @@ fn ingest_chunk(
             .and_then(|start| start.checked_add(enc))
             .ok_or("Vault data length overflow")?;
         ensure_write_data_budget(end)?;
-        vault
-            .data
-            .try_reserve(encrypted.len() + 8)
-            .map_err(|e| format!("Cannot reserve the next vault block: {e}"))?;
+        let additional = encrypted.len() + 8;
+        if plaintext {
+            crate::secret::reserve_vec(&mut vault.data, additional)
+                .map_err(|e| format!("Cannot reserve the next vault block: {e}"))?;
+        } else {
+            vault
+                .data
+                .try_reserve(additional)
+                .map_err(|e| format!("Cannot reserve the next vault block: {e}"))?;
+        }
         vault
             .data
             .extend_from_slice(&(encrypted.len() as u64).to_le_bytes());
@@ -1766,7 +1773,8 @@ impl ExtractionParent {
     fn recheck(&self) -> Result<(), String> {
         let unchanged = |path: &Path, identity: &same_file::Handle| {
             path.canonicalize().is_ok_and(|resolved| resolved == path)
-                && same_file::Handle::from_path(path).is_ok_and(|current| current == *identity)
+                && super::extraction_stage::directory_identity(path)
+                    .is_ok_and(|current| current == *identity)
         };
         if !unchanged(&self.root, &self.root_identity) || !unchanged(&self.path, &self.identity) {
             return Err("Refusing extraction: the validated output directory changed".into());
@@ -1818,7 +1826,8 @@ fn prepare_output_parent(root: &Path, output: &Path) -> Result<ExtractionParent,
     let canon_root = root
         .canonicalize()
         .map_err(|e| format!("Resolve destination {}: {e}", root.display()))?;
-    let root_identity = same_file::Handle::from_path(&canon_root).map_err(|e| e.to_string())?;
+    let root_identity =
+        super::extraction_stage::directory_identity(&canon_root).map_err(|e| e.to_string())?;
     create_contained_dirs(&canon_root, rel)?;
     let canon_parent = canon_root
         .join(rel)
@@ -5790,6 +5799,8 @@ mod tests {
         // Keep the long parent so this regression must exercise an aliased
         // vault leaf, independently of any short name on a parent directory.
         let short = long.with_file_name(short_leaf);
+        let status = VaultV3::recovery_status(&short).unwrap();
+        assert!(status.detached && status.manifest_parity && status.header_parity);
         let sidecar = super::super::ec::default_sidecar_path(&long);
         let before = std::fs::read(&sidecar).unwrap();
         let mut vault = VaultV3::open(&short, PW).unwrap();
@@ -6403,6 +6414,36 @@ mod tests {
         assert_eq!(std::fs::read(output).unwrap(), b"extracted bytes");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extraction_works_without_directory_listing_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("write-and-search");
+        let input = fixture.path().join("input");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(&input, b"extract without listing").unwrap();
+        let archive = fixture.path().join("archive.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&archive)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&archive).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "output".into())]).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let listing = std::fs::read_dir(&root);
+        let result = VaultV3::extract_all(&vault, &root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(
+                listing.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        result.unwrap();
+        assert_eq!(
+            std::fs::read(root.join("output")).unwrap(),
+            b"extract without listing"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn round14_extraction_refuses_a_replaced_validated_parent() {
@@ -6518,15 +6559,23 @@ mod tests {
 
     #[test]
     fn round14_failed_plaintext_add_wipes_the_rejected_range() {
+        use rand::RngCore;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("archive.aerozip");
         let original = dir.path().join("original");
         let large = dir.path().join("large");
+        let larger = dir.path().join("larger");
         std::fs::write(&original, b"keep this entry").unwrap();
-        std::fs::write(&large, vec![0xa7; PACK_SMALL_FILE_THRESHOLD + 1]).unwrap();
+        let mut random = vec![0u8; PACK_SMALL_FILE_THRESHOLD + 1];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        std::fs::write(&large, &random).unwrap();
+        random.resize(random.len() * 8, 0);
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        std::fs::write(&larger, random).unwrap();
         VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
         let mut vault = VaultV3::open_plaintext(&path).unwrap();
         VaultV3::add_files(&mut vault, &[(original, "kept".into())]).unwrap();
+        vault.data.shrink_to_fit();
         let prefix = vault.data.clone();
         let before = std::fs::read(&path).unwrap();
         let observed = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -6538,14 +6587,17 @@ mod tests {
                 done.set(true);
             }));
         });
+        crate::secret::WIPED_GROWTH.set(0);
         assert!(VaultV3::add_files(
             &mut vault,
             &[
                 (large, "discarded".into()),
+                (larger, "discarded-too".into()),
                 (dir.path().join("missing"), "missing".into()),
             ]
         )
         .is_err());
+        assert!(crate::secret::WIPED_GROWTH.get() >= 2);
         assert!(observed.get());
         assert_eq!(vault.data, prefix);
         assert_eq!(std::fs::read(path).unwrap(), before);
