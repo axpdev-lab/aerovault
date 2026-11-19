@@ -1115,6 +1115,7 @@ mod tests {
             eprintln!("Distinct assignable group unavailable for native repair fixture");
             return;
         };
+        eprintln!("Distinct Unix repair groups exercised: stage={original_gid}, original={gid}");
         for streamed in [false, true] {
             let path = dir.path().join("target");
             let data = sample_data(4096);

@@ -1759,6 +1759,7 @@ struct ExtractionParent {
     root_identity: same_file::Handle,
     path: PathBuf,
     identity: same_file::Handle,
+    pinned: Vec<std::fs::File>,
 }
 
 impl ExtractionParent {
@@ -1773,17 +1774,16 @@ impl ExtractionParent {
         Ok(())
     }
 
-    fn recheck_stage(
-        &self,
-        tmp: &tempfile::NamedTempFile,
-        staged_identity: &same_file::Handle,
-    ) -> Result<(), String> {
-        self.recheck()?;
-        if same_file::Handle::from_path(tmp.path()).map_err(|e| e.to_string())? != *staged_identity
-        {
-            return Err("Refusing extraction: the staging file changed".into());
-        }
-        Ok(())
+    fn recheck_stage(&self, stage: &super::extraction_stage::Stage) -> Result<(), String> {
+        self.recheck()
+            .and_then(|()| {
+                stage
+                    .verify()
+                    .map_err(|e| format!("Refusing extraction: {e}"))
+            })
+            .inspect_err(|_| {
+                let _ = stage.file().set_len(0);
+            })
     }
 }
 
@@ -1814,18 +1814,26 @@ fn prepare_output_parent(root: &Path, output: &Path) -> Result<ExtractionParent,
             canon_root.display()
         ));
     }
-    let identity = same_file::Handle::from_path(&canon_parent).map_err(|e| e.to_string())?;
+    let pinned = super::extraction_stage::pin(&canon_parent).map_err(|e| e.to_string())?;
+    let identity = same_file::Handle::from_file(pinned[0].try_clone().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
     Ok(ExtractionParent {
         root: canon_root,
         root_identity,
         path: canon_parent,
         identity,
+        pinned,
     })
 }
 
 #[cfg(test)]
+type ExtractionHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
 thread_local! {
-    static AFTER_EXTRACTION_PARENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_EXTRACTION_PARENT: ExtractionHook = const { std::cell::RefCell::new(None) };
+    static AFTER_EXTRACTION_STAGE: ExtractionHook = const { std::cell::RefCell::new(None) };
+    static BEFORE_EXTRACTION_PUBLISH: ExtractionHook = const { std::cell::RefCell::new(None) };
 }
 
 fn extract_file_entry(
@@ -1899,22 +1907,20 @@ fn extract_file_entry(
     // one block (bounded by `max_block_plaintext`), not the whole entry. The temp
     // is atomically promoted only after the full slice has been written, so a
     // failure mid-decode leaves no partial output and no plaintext temp artifact.
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".aerovault-v3-")
-        .tempfile_in(&parent.path)
+    let mut tmp = super::extraction_stage::Stage::new(&parent.pinned[0], &parent.path)
         .map_err(|e| format!("Create temp file: {e}"))?;
-    parent.recheck()?;
-    let staged_identity =
-        same_file::Handle::from_file(tmp.as_file().try_clone().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-    parent.recheck_stage(&tmp, &staged_identity)?;
+    parent.recheck_stage(&tmp)?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_EXTRACTION_STAGE.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
 
     // Cumulative decoded plaintext length so far == the old `out.len()`; used to
     // place each block against the requested slice and to detect a short entry.
     let mut decoded_len = 0usize;
     {
         use std::io::Write;
-        let mut writer = std::io::BufWriter::new(tmp.as_file_mut());
+        let mut writer = std::io::BufWriter::new(tmp.file());
         for chunk_id in &entry.chunks {
             if decoded_len >= end {
                 // Everything this entry slices is already written; ignore the
@@ -2014,45 +2020,42 @@ fn extract_file_entry(
             "Entry slice [{offset}..{end}] exceeds decoded data ({decoded_len})"
         ));
     }
-    tmp.as_file_mut()
+    tmp.file()
         .sync_all()
         .map_err(|e| format!("Sync temp file: {e}"))?;
-    if let Err(error) = parent.recheck_stage(&tmp, &staged_identity) {
-        let _ = tmp.as_file().set_len(0);
-        return Err(error);
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_EXTRACTION_PUBLISH.with(|h| h.borrow_mut().take()) {
+        hook();
     }
+    parent.recheck_stage(&tmp)?;
     // An entry named like a lock file is extracted only where no file is:
     // replacing an existing one could replace a vault's lock file. A lock file
     // is empty, so an empty entry over an empty file (extracting the same
     // folder again) has nothing to write and keeps the file that is there.
     if let Some(guard) = guard {
-        match tmp.persist_noclobber(guard.source_path()) {
-            Ok(_) => {}
-            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+        match tmp.publish(guard.source_path(), false) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 guard_extraction_replacement(guard.source_path())?;
-                parent.recheck_stage(&e.file, &staged_identity)?;
-                e.file
-                    .persist(guard.source_path())
-                    .map_err(|e| format!("Persist extracted file: {}", e.error))?;
+                parent.recheck_stage(&tmp)?;
+                tmp.publish(guard.source_path(), true)
+                    .map_err(|e| format!("Persist extracted file: {e}"))?;
             }
-            Err(e) => return Err(format!("Persist extracted file: {}", e.error)),
+            Err(e) => return Err(format!("Persist extracted file: {e}")),
         }
-    } else {
-        if let Err(e) = tmp.persist_noclobber(&destination) {
-            if e.error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(format!("Persist vault: {}", e.error));
-            }
-            let both_empty = e.file.as_file().metadata().is_ok_and(|m| m.len() == 0)
-                && std::fs::symlink_metadata(&destination)
-                    .is_ok_and(|m| m.is_file() && m.len() == 0);
-            if !both_empty {
-                return Err(format!(
-                    "{}: a file is there and its name is a vault lock file name, \
+    } else if let Err(e) = tmp.publish(&destination, false) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(format!("Persist vault: {e}"));
+        }
+        let both_empty = tmp.file().metadata().is_ok_and(|m| m.len() == 0)
+            && std::fs::symlink_metadata(&destination).is_ok_and(|m| m.is_file() && m.len() == 0);
+        if !both_empty {
+            return Err(format!(
+                "{}: a file is there and its name is a vault lock file name, \
                      so it is not written over ({})",
-                    output_path.display(),
-                    e.error
-                ));
-            }
+                output_path.display(),
+                e
+            ));
         }
     }
     fsync_parent_dir(&parent.path);
@@ -6376,6 +6379,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn round14_extraction_refuses_a_replaced_validated_parent() {
+        for hook in [
+            &AFTER_EXTRACTION_PARENT,
+            &AFTER_EXTRACTION_STAGE,
+            &BEFORE_EXTRACTION_PUBLISH,
+        ] {
+            assert_extraction_rejects_moved_parent(hook);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_extraction_rejects_moved_parent(
+        hook: &'static std::thread::LocalKey<ExtractionHook>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let outside = dir.path().join("outside");
@@ -6388,11 +6404,12 @@ mod tests {
         let mut vault = VaultV3::open_plaintext(&archive).unwrap();
         VaultV3::add_files(&mut vault, &[(input, "subdir/file".into())]).unwrap();
         let subdir = root.join("subdir");
-        let moved = root.join("moved");
+        let moved = outside.join("moved");
+        let moved_destination = moved.clone();
         let redirect = outside.clone();
-        AFTER_EXTRACTION_PARENT.with(|h| {
+        hook.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
-                std::fs::rename(&subdir, &moved).unwrap();
+                std::fs::rename(&subdir, moved_destination).unwrap();
                 std::os::unix::fs::symlink(redirect, subdir).unwrap();
             }));
         });
@@ -6401,7 +6418,45 @@ mod tests {
             error.contains("validated output directory changed"),
             "{error}"
         );
-        assert!(std::fs::read_dir(outside).unwrap().next().is_none());
+        let outside_entries: Vec<_> = std::fs::read_dir(outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(outside_entries, std::slice::from_ref(&moved));
+        for entry in std::fs::read_dir(moved).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(entry.file_name(), "file.aerolock");
+            assert_eq!(entry.metadata().unwrap().len(), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round14_extraction_prevents_parent_rename_while_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let subdir = root.join("subdir");
+        let moved = dir.path().join("moved");
+        std::fs::create_dir(&root).unwrap();
+        let input = dir.path().join("input");
+        let payload = b"plaintext inside the archive";
+        std::fs::write(&input, payload).unwrap();
+        let archive = dir.path().join("archive.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&archive)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&archive).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "subdir/file".into())]).unwrap();
+        let move_source = subdir.clone();
+        let move_destination = moved.clone();
+        BEFORE_EXTRACTION_PUBLISH.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let error = std::fs::rename(move_source, move_destination).unwrap_err();
+                assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+            }));
+        });
+        VaultV3::extract_all(&vault, &root).unwrap();
+        assert_eq!(std::fs::read(subdir.join("file")).unwrap(), payload);
+        assert!(!moved.exists());
+        std::fs::rename(subdir, moved).unwrap();
     }
 
     #[test]

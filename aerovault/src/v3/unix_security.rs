@@ -74,6 +74,13 @@ mod darwin {
         fn filesec_free(filesec: *mut c_void);
         #[cfg_attr(target_arch = "x86_64", link_name = "statx_np$INODE64")]
         fn statx_np(path: *const c_char, metadata: *mut libc::stat, filesec: *mut c_void) -> c_int;
+        #[cfg_attr(target_arch = "x86_64", link_name = "fstatx_np$INODE64")]
+        fn fstatx_np(fd: c_int, metadata: *mut libc::stat, filesec: *mut c_void) -> c_int;
+        fn filesec_query_property(
+            filesec: *mut c_void,
+            property: c_int,
+            valid: *mut c_int,
+        ) -> c_int;
         fn filesec_get_property(filesec: *mut c_void, property: c_int, value: *mut c_void)
             -> c_int;
         fn filesec_set_property(
@@ -82,6 +89,7 @@ mod darwin {
             value: *const c_void,
         ) -> c_int;
         fn chmodx_np(path: *const c_char, filesec: *mut c_void) -> c_int;
+        fn fchmodx_np(fd: c_int, filesec: *mut c_void) -> c_int;
         pub(super) fn acl_to_text(acl: *mut c_void, len: *mut isize) -> *mut c_char;
         pub(super) fn acl_from_text(text: *const c_char) -> *mut c_void;
         pub(super) fn acl_set_file(path: *const c_char, kind: c_int, acl: *mut c_void) -> c_int;
@@ -152,6 +160,42 @@ mod darwin {
         }
         Ok(())
     }
+
+    fn file_has_acl(fd: c_int) -> io::Result<bool> {
+        let filesec = FileSec::new()?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let mut valid = 0;
+        if unsafe { fstatx_np(fd, metadata.as_mut_ptr(), filesec.0) } != 0
+            || unsafe { filesec_query_property(filesec.0, FILESEC_ACL, &mut valid) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(valid != 0)
+    }
+
+    pub(super) fn clear_file_acl(fd: c_int) -> io::Result<()> {
+        if !file_has_acl(fd)? {
+            return Ok(());
+        }
+        let filesec = FileSec::new()?;
+        if unsafe { filesec_set_property(filesec.0, FILESEC_ACL, FILESEC_REMOVE_ACL) } != 0
+            || unsafe { fchmodx_np(fd, filesec.0) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if file_has_acl(fd)? {
+            return Err(io::Error::other(
+                "Extraction stage still has an inherited access ACL",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn clear_extraction_acl(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    darwin::clear_file_acl(file.as_raw_fd())
 }
 
 #[cfg(target_os = "macos")]

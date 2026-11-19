@@ -22,6 +22,7 @@ pub mod block;
 pub mod chunking;
 pub mod constants;
 pub mod ec;
+mod extraction_stage;
 pub mod format;
 pub mod manifest;
 pub mod packing;
