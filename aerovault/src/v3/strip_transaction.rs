@@ -398,7 +398,7 @@ fn read_journal(path: &Path) -> Result<Journal, String> {
         .map_err(|e| e.to_string())?;
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid strip journal: {e}"))?;
-    if !matches!(journal.version, 1 | 2) {
+    if !matches!(journal.version, 1..=3) {
         return Err("unsupported strip journal version".into());
     }
     Ok(journal)
@@ -520,6 +520,25 @@ fn restore_published_permissions(
     journal: &Journal,
     marker: &Path,
 ) -> Result<(), String> {
+    // Old journals did not durably record the start of security publication.
+    // Missing completion markers cannot distinguish an unapplied descriptor
+    // from a later operator restriction after application.
+    #[cfg(windows)]
+    if journal.version < 3 {
+        for (staged, done) in [
+            ("new-vault", "vault-security-done"),
+            ("new-sidecar", "sidecar-security-done"),
+        ] {
+            if !marker
+                .join(staged)
+                .try_exists()
+                .map_err(|e| e.to_string())?
+                && !marker.join(done).try_exists().map_err(|e| e.to_string())?
+            {
+                return Err(conflict(marker, "legacy security publication is ambiguous"));
+            }
+        }
+    }
     if !marker
         .join("new-vault")
         .try_exists()
@@ -553,8 +572,9 @@ fn restore_published_permissions(
     Ok(())
 }
 
-// A durable completion marker prevents a later recovery from reinstalling
-// permissions that already completed, including later operator restrictions.
+// Sync intent before applying security, then sync completion afterwards. An
+// interrupted application is ambiguous: recovery must retain current security
+// and recovery material rather than overwrite a later operator restriction.
 fn finish_security(
     path: &Path,
     permissions: Option<&SavedPermissions>,
@@ -565,7 +585,25 @@ fn finish_security(
     if done.try_exists().map_err(|e| e.to_string())? {
         return Ok(());
     }
+    let started = journal.join(format!("{marker}-started"));
+    match private_options().open(&started) {
+        Ok(file) => file.sync_all().map_err(|e| e.to_string())?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(conflict(
+                journal,
+                "security publication was interrupted; current permissions retained",
+            ));
+        }
+        Err(e) => return Err(e.to_string()),
+    }
+    sync_dir(journal)?;
     publish_security(path, permissions)?;
+    #[cfg(test)]
+    if marker == "sidecar-security-done" {
+        if let Some(hook) = AFTER_SIDECAR_SECURITY_APPLY.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
     let file = private_options().open(&done).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())?;
     sync_dir(journal)
@@ -603,7 +641,20 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
         Err(e) => return Err(e.to_string()),
         Ok(_) => {}
     }
-    let journal = read_journal(&path)?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_PENDING_JOURNAL_READ.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    let journal = match read_journal(&path) {
+        Ok(journal) => journal,
+        Err(_) => {
+            // Publication may have retired the directory after our optimistic
+            // existence check. Recheck under the source guard; persistent bad
+            // journals still fail there rather than being silently ignored.
+            let lock = crate::lock::acquire_without_recovery(&source).map_err(|e| e.to_string())?;
+            return recover_under_guard(&lock);
+        }
+    };
     let recorded = recorded_source(output_parent_dir(&source), &journal.source_name)?;
     if native_name(&source) != journal.source_name && !same_existing_file(&source, &recorded) {
         // Distinct case-sensitive files can share a folded lock/journal key.
@@ -635,7 +686,7 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
 pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> Result<(), String> {
     let sidecar = super::ec::default_sidecar_path(source);
     let journal = Journal {
-        version: 2,
+        version: 3,
         source_name: native_name(source),
         new_vault_permissions: SavedPermissions::new_destination(source)?,
         new_sidecar_permissions: SavedPermissions::new_destination(&sidecar)?,
@@ -748,6 +799,8 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static BEFORE_PENDING_JOURNAL_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static AFTER_SIDECAR_SECURITY_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static FAIL_CLEANUP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FAIL_FINAL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static BEFORE_STRIP_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -778,6 +831,53 @@ mod tests {
             assert!(recorded_source(dir.path(), &encoded).is_err(), "{name}");
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn round7d_incomplete_security_intent_preserves_current_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("published");
+        fs::write(&path, b"published content").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let original = SavedPermissions::capture(&path).unwrap();
+        let journal = private_dir(dir.path(), ".aerostrip-test-").unwrap();
+        fs::write(journal.path().join("sidecar-security-done-started"), b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = finish_security(
+            &path,
+            Some(&original),
+            journal.path(),
+            "sidecar-security-done",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("security publication was interrupted"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"published content");
+        assert!(!journal.path().join("sidecar-security-done").exists());
+        assert!(journal
+            .path()
+            .join("sidecar-security-done-started")
+            .exists());
+        fs::write(journal.path().join("sidecar-security-done"), b"").unwrap();
+        finish_security(
+            &path,
+            Some(&original),
+            journal.path(),
+            "sidecar-security-done",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn equal_normalized_names_do_not_prove_file_identity() {
         let dir = tempfile::tempdir().unwrap();

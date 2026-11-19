@@ -2494,7 +2494,11 @@ fn open_vault_with_guard(
                     && e.length > 0
             });
             let detached_metadata = super::ec::recovery_sidecar_path(&path).exists();
-            let pending_pair = super::strip_transaction::journal_path(&path).exists();
+            // Journals belong to the physical source even when recovery data
+            // selection deliberately retains a symbolic alias namespace.
+            let journal_source = std::fs::canonicalize(source)
+                .map_err(|e| format!("Resolve recovery journal source: {e}"))?;
+            let pending_pair = super::strip_transaction::journal_path(&journal_source).exists();
             if recovery_guard.is_none() && !embedded_metadata && !detached_metadata && !pending_pair
             {
                 return Err(orig);
@@ -5563,6 +5567,71 @@ mod tests {
             assert!(VaultV3::open(&path, PW).is_err());
             assert!(VaultV3::open(&path, "new-password-123").is_ok());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round7d_alias_manifest_failure_checks_late_physical_journal() {
+        use super::super::{ec, strip_transaction as tx};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("physical.aerovault");
+        let alias = dir.path().join("alias.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            ec::RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        ec::export_parity(&path, PW, None).unwrap();
+        let at = VaultV3::open(&path, PW).unwrap().header.manifest_offset as usize;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[at] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        let mut rotating = VaultV3::open(&path, PW).unwrap();
+        assert!(rotating.manifest_repaired_on_open);
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(!ec::recovery_sidecar_path(&alias).exists());
+        assert_ne!(tx::journal_path(&alias), tx::journal_path(&path));
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let reader_alias = alias.clone();
+            let reader = scope.spawn(move || {
+                crate::lock::set_short_wait_for_this_thread();
+                AFTER_OPEN_RECOVERY_CHECK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        ready_tx.send(()).unwrap();
+                        resume_rx
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                    }));
+                });
+                let result = VaultV3::open(&reader_alias, PW).map(|_| ());
+                result_tx.send(result.clone()).unwrap();
+                result
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let pending = tx::journal_path(&path);
+            tx::AFTER_STRIP_JOURNAL.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    assert!(pending.is_dir());
+                    resume_tx.send(()).unwrap();
+                    let error = result_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap()
+                        .unwrap_err();
+                    assert!(error.contains("locked by another writer"), "{error}");
+                }));
+            });
+            VaultV3::change_password(&mut rotating, "new-password-123").unwrap();
+            assert!(reader.join().unwrap().is_err());
+        });
+        assert!(VaultV3::open(&alias, PW).is_err());
+        assert!(VaultV3::open(&alias, "new-password-123").is_ok());
+        assert!(!tx::journal_path(&path).exists());
     }
 
     #[test]

@@ -3463,7 +3463,18 @@ mod tests {
                     .starts_with(".aerostrip-gc-")
             })
             .unwrap();
-        assert!(err.contains(retained.to_str().unwrap()));
+        let reported = err
+            .rsplit_once("relocated journal and rollback copies retained at ")
+            .expect("retirement diagnostic must name the retained directory")
+            .1;
+        // Windows publication pins a verbatim physical parent; read_dir can
+        // return its ordinary spelling. Verify the reported existing directory
+        // itself, not textual equality between these aliases.
+        assert_eq!(
+            std::fs::canonicalize(reported).unwrap(),
+            std::fs::canonicalize(&retained).unwrap(),
+            "reported backup path must identify the actual retained directory: {err}"
+        );
         assert_eq!(std::fs::read(retained.join("old-vault")).unwrap(), before);
         assert!(retained.join("old-sidecar").is_file());
         assert!(retained.join("journal.json").is_file());
@@ -3517,6 +3528,133 @@ mod tests {
         assert_eq!(std::fs::read(&second).unwrap(), bytes);
         assert!(VaultV3::open(&first, PW).is_ok());
         assert!(!journal.exists());
+    }
+
+    #[test]
+    fn round7d_reader_rechecks_journal_retired_before_read() {
+        use super::super::strip_transaction as tx;
+        const CHILD: &str = "AEROVAULT_RETIRED_JOURNAL_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            tx::AFTER_STRIP_SIDECAR.with(|h| {
+                *h.borrow_mut() = Some(Box::new(|| {
+                    std::process::exit(77);
+                }))
+            });
+            VaultV3::strip_parity(&path, PW, false).unwrap();
+            panic!("retirement interruption seam not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retired-before-read.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "v3::ec::tests::round7d_reader_rechecks_journal_retired_before_read",
+                "--nocapture",
+            ])
+            .env(CHILD, &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(77));
+        let journal = tx::journal_path(&path);
+        assert!(journal.is_dir());
+        let expected = std::fs::read(&path).unwrap();
+        let sidecar = default_sidecar_path(&path);
+        let expected_sidecar = std::fs::read(&sidecar).unwrap();
+        let retire_source = path.clone();
+        let retire_journal = journal.clone();
+        tx::BEFORE_PENDING_JOURNAL_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                // Another participating opener finishes publication between this
+                // reader's existence check and journal.json open.
+                assert!(VaultV3::open(&retire_source, PW).is_ok());
+                assert!(!retire_journal.exists());
+            }))
+        });
+        assert!(VaultV3::open(&path, PW).is_ok());
+        assert!(!journal.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), expected_sidecar);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_security_application_without_completion_is_conflict() {
+        use super::super::{strip_transaction as tx, windows_security as acl};
+        const CHILD: &str = "AEROVAULT_AMBIGUOUS_SECURITY_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let sidecar = default_sidecar_path(&path);
+            tx::AFTER_SIDECAR_SECURITY_APPLY.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    acl::apply(&sidecar, "D:P(D;;FR;;;BG)(A;;FA;;;OW)(A;;FA;;;SY)", true).unwrap();
+                    std::process::exit(77);
+                }))
+            });
+            VaultV3::strip_parity(&path, PW, false).unwrap();
+            panic!("security interruption seam not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        acl::apply(
+            dir.path(),
+            "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+            true,
+        )
+        .unwrap();
+        let path = dir.path().join("security-gap.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "v3::ec::tests::round7_windows_security_application_without_completion_is_conflict",
+                "--nocapture",
+            ])
+            .env(CHILD, &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(77));
+        let journal = tx::journal_path(&path);
+        assert!(journal.join("sidecar-security-done-started").is_file());
+        assert!(!journal.join("sidecar-security-done").exists());
+        let sidecar = default_sidecar_path(&path);
+        let descriptor = acl::capture(&sidecar).unwrap();
+        assert_eq!(acl::guest_effective_rights(&sidecar).unwrap() & 1, 0);
+        let before_vault = std::fs::read(&path).unwrap();
+        let before_sidecar = std::fs::read(&sidecar).unwrap();
+        let backups: Vec<_> = ["journal.json", "old-vault", "old-sidecar"]
+            .iter()
+            .map(|name| {
+                (
+                    journal.join(name),
+                    std::fs::read(journal.join(name)).unwrap(),
+                )
+            })
+            .collect();
+        let error = VaultV3::open(&path, PW).unwrap_err();
+        assert!(
+            error.contains("security publication was interrupted"),
+            "{error}"
+        );
+        assert!(error.contains("conflicts"), "{error}");
+        assert_eq!(acl::capture(&sidecar).unwrap(), descriptor);
+        assert_eq!(std::fs::read(&path).unwrap(), before_vault);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before_sidecar);
+        for (backup, bytes) in backups {
+            assert_eq!(std::fs::read(backup).unwrap(), bytes);
+        }
+        assert!(journal.is_dir());
+        eprintln!("Windows interrupted security application: narrowed sidecar DACL and recovery material preserved; reopen refuses ambiguity");
     }
 
     #[cfg(windows)]
