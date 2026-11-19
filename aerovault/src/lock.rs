@@ -347,7 +347,12 @@ pub(crate) fn acquire(vault: &Path) -> io::Result<WriteLock> {
 }
 
 pub(crate) fn acquire_without_recovery(vault: &Path) -> io::Result<WriteLock> {
-    acquire_with_policy(vault, false, false)
+    acquire_with_policy(vault, false, false, wait())
+}
+
+/// Refuse a contended namespace without retrying after the holder exits.
+pub(crate) fn try_acquire(vault: &Path) -> io::Result<WriteLock> {
+    recover_acquired(acquire_with_policy(vault, false, false, Duration::ZERO)?)
 }
 
 fn recover_acquired(lock: WriteLock) -> io::Result<WriteLock> {
@@ -360,13 +365,14 @@ fn recover_acquired(lock: WriteLock) -> io::Result<WriteLock> {
 /// A read-only export may lack a source lock on read-only media. A pending
 /// strip still requires a real guard and writable media to recover safely.
 pub(crate) fn acquire_for_export(vault: &Path) -> io::Result<WriteLock> {
-    recover_acquired(acquire_with_policy(vault, true, false)?)
+    recover_acquired(acquire_with_policy(vault, true, false, wait())?)
 }
 
 fn acquire_with_policy(
     vault: &Path,
     allow_unlocked_read: bool,
     replace_leaf_link: bool,
+    wait_budget: Duration,
 ) -> io::Result<WriteLock> {
     refuse_lock_file_name(vault)?;
     let source = anchored(vault)?;
@@ -381,7 +387,7 @@ fn acquire_with_policy(
     }
     let source = namespace_name_source(&source)?;
     let path = lock_path(&source);
-    let deadline = Instant::now() + wait();
+    let deadline = Instant::now() + wait_budget;
     let file = loop {
         match open_lock_file(&path) {
             Ok(Some(file)) => break file,
@@ -418,21 +424,23 @@ fn acquire_with_policy(
                     source,
                 });
             }
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+            Err(TryLockError::WouldBlock) => {
+                let retry = Instant::now() < deadline;
                 #[cfg(test)]
                 if let Some(hook) = ON_LOCK_CONTENTION.with(|h| h.borrow_mut().take()) {
                     hook();
                 }
-                std::thread::sleep(POLL);
-            }
-            Err(TryLockError::WouldBlock) => {
+                if retry {
+                    std::thread::sleep(POLL);
+                    continue;
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
                         "vault is locked by another writer ({}); retry when it has finished",
                         path.display()
                     ),
-                ))
+                ));
             }
             Err(TryLockError::Error(e)) => {
                 return Err(io::Error::new(
@@ -686,7 +694,7 @@ pub(crate) fn acquire_destination(
         return Ok(None);
     }
     std::fs::create_dir_all(parent_or_dot(out))?;
-    recover_acquired(acquire_with_policy(out, false, true)?).map(Some)
+    recover_acquired(acquire_with_policy(out, false, true, wait())?).map(Some)
 }
 
 /// Open (or create) the lock file without following a symbolic link (or, on

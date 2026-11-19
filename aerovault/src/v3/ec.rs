@@ -215,7 +215,12 @@ fn container_sha256(data: &[u8]) -> [u8; 32] {
 
 fn container_sha256_file(path: &Path) -> Result<([u8; 32], u64), String> {
     use sha2::{Digest, Sha256};
-    let mut file = crate::source::open_regular(path).map_err(|e| e.to_string())?;
+    let file = crate::source::open_regular(path).map_err(|e| e.to_string())?;
+    let expected_len = file.metadata().map_err(|e| e.to_string())?.len();
+    if expected_len > super::vault::MAX_GENERATION_EXTENT {
+        return Err("Vault container exceeds the 4 GiB generation scan budget".into());
+    }
+    let mut file = file.take(expected_len + 1);
     let mut hash = Sha256::new();
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
     let mut len = 0u64;
@@ -228,6 +233,9 @@ fn container_sha256_file(path: &Path) -> Result<([u8; 32], u64), String> {
         len = len
             .checked_add(n as u64)
             .ok_or("container length overflow")?;
+    }
+    if len != expected_len {
+        return Err("Vault changed while its parity binding was being read".into());
     }
     Ok((hash.finalize().into(), len))
 }
@@ -570,6 +578,7 @@ pub(super) fn export_parity_from_sealed(
     vault_path: &Path,
     out: &Path,
 ) -> Result<ExportParityResult, String> {
+    vault.writable_generation()?;
     if vault.manifest_repaired_on_open {
         return Err(
             "Vault manifest was recovered on open: run repair before exporting parity".to_string(),
@@ -657,6 +666,7 @@ pub(super) fn strip_parity(
     let lock = super::vault::write_lock(vault_path)?;
     let vault_path = lock.source_path();
     let mut vault = super::vault::open_vault_under_guard(vault_path, password, &lock)?;
+    vault.writable_generation()?;
     let had_embedded = vault
         .extensions
         .iter()

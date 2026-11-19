@@ -50,7 +50,7 @@ use crate::aerocrypt::{
 // Bound the generation scan independently of the in-memory data allocation.
 // The remainder covers the manifest, extension directory, parity and any
 // trailing bytes accepted from existing containers.
-const MAX_GENERATION_EXTENT: u64 = 4 * 1024 * 1024 * 1024;
+pub(super) const MAX_GENERATION_EXTENT: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
 
 fn data_budget() -> u64 {
@@ -179,7 +179,9 @@ pub struct OpenVaultV3 {
     /// by the last save): the generation baseline. Taken from the bytes on
     /// disk, so a header recovered from the sidecar does not count as a change.
     pub(super) opened_file_len: u64,
-    pub(super) opened_hash: [u8; 32],
+    // Oversized legacy containers can be read through their bounded sections,
+    // without establishing a whole-file baseline that authorizes mutations.
+    opened_hash: Option<[u8; 32]>,
     pub(super) master_key: [u8; KEY_SIZE],
     pub(super) mac_key: [u8; KEY_SIZE],
     pub(super) manifest: VaultManifestV3,
@@ -650,6 +652,7 @@ impl VaultV3 {
         if new_password.len() < MIN_PASSWORD_LEN {
             return Err("Password must be at least 8 characters".to_string());
         }
+        vault.writable_generation()?;
         let lock = write_lock(&vault.path)?;
         vault.path = lock.source_path().to_path_buf();
         let sidecar = super::ec::default_sidecar_path(lock.source_path());
@@ -1308,6 +1311,7 @@ fn write_op<T>(
     vault: &mut OpenVaultV3,
     op: impl FnOnce(&mut OpenVaultV3, &WriteLock, Option<&WriteLock>) -> Result<T, String>,
 ) -> Result<T, String> {
+    vault.writable_generation()?;
     let lock = write_lock(&vault.path)?;
     #[cfg(test)]
     if let Some(hook) = BEFORE_MUTATION_SIDECAR_LOCK.with(|h| h.borrow_mut().take()) {
@@ -1769,6 +1773,22 @@ fn extract_file_entry(
 ) -> Result<PathBuf, String> {
     // Create + contain the parent before decoding/writing any plaintext (audit M2).
     prepare_output_parent(dest_root, output_path)?;
+    let guard = if crate::lock::refuse_lock_file_name(output_path).is_ok() {
+        let destination = crate::lock::anchored(output_path).map_err(|e| e.to_string())?;
+        crate::lock::refuse_destination(&destination, &vault.path).map_err(|e| e.to_string())?;
+        let lock = match std::fs::symlink_metadata(&destination) {
+            // An absent recovery destination may be in use by a password
+            // rotation. Refuse contention instead of publishing once it exits.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::lock::try_acquire(&destination)
+            }
+            Err(e) => return Err(format!("Inspect extraction destination: {e}")),
+            Ok(_) => crate::lock::acquire(&destination),
+        };
+        Some(lock.map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
 
     // We only ever slice `out[offset..offset+size]`, so decoding never needs to
     // grow `out` past that bound. Tracking it lets us stop early and refuse a
@@ -1921,7 +1941,18 @@ fn extract_file_entry(
     // replacing an existing one could replace a vault's lock file. A lock file
     // is empty, so an empty entry over an empty file (extracting the same
     // folder again) has nothing to write and keeps the file that is there.
-    if crate::lock::refuse_lock_file_name(output_path).is_err() {
+    if let Some(guard) = guard {
+        match tmp.persist_noclobber(guard.source_path()) {
+            Ok(_) => {}
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                guard_extraction_replacement(guard.source_path())?;
+                e.file
+                    .persist(guard.source_path())
+                    .map_err(|e| format!("Persist extracted file: {}", e.error))?;
+            }
+            Err(e) => return Err(format!("Persist extracted file: {}", e.error)),
+        }
+    } else {
         if let Err(e) = tmp.persist_noclobber(output_path) {
             if e.error.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(format!("Persist vault: {}", e.error));
@@ -1937,20 +1968,6 @@ fn extract_file_entry(
                     e.error
                 ));
             }
-        }
-    } else {
-        let destination = crate::lock::anchored(output_path).map_err(|e| e.to_string())?;
-        crate::lock::refuse_destination(&destination, &vault.path).map_err(|e| e.to_string())?;
-        let guard = crate::lock::acquire(&destination).map_err(|e| e.to_string())?;
-        match tmp.persist_noclobber(guard.source_path()) {
-            Ok(_) => {}
-            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                guard_extraction_replacement(guard.source_path())?;
-                e.file
-                    .persist(guard.source_path())
-                    .map_err(|e| format!("Persist extracted file: {}", e.error))?;
-            }
-            Err(e) => return Err(format!("Persist extracted file: {}", e.error)),
         }
     }
     fsync_parent_dir(parent);
@@ -2498,12 +2515,9 @@ fn open_vault_with_guard(
     validate_ranges(&header, file_len)?;
 
     // Opening keeps the data section in memory. Bound and reserve it before
-    // the baseline scan, so a large sparse archive fails without scanning or
-    // allowing allocation failure to abort the process.
+    // the baseline scan, so an oversized data section fails before scanning
+    // and an allocation failure cannot abort the process.
     ensure_data_budget(header.data_len)?;
-    if file_len > MAX_GENERATION_EXTENT {
-        return Err("Vault container exceeds the 4 GiB generation scan budget".into());
-    }
     let data_size =
         usize::try_from(header.data_len).map_err(|_| "Data section exceeds address space")?;
     let mut data = Vec::new();
@@ -2523,14 +2537,20 @@ fn open_vault_with_guard(
     if let Some(hook) = BEFORE_OPEN_GENERATION.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let (opened_file_len, opened_hash) =
-        file_generation_starting_with(&mut file, &header_bytes, file_len)?;
-    if opened_file_len != file_len {
-        return Err(format!(
-            "{} changed while it was being opened; open it again",
-            path.display()
-        ));
-    }
+    let opened_hash = if file_len <= MAX_GENERATION_EXTENT {
+        let (hashed_len, hash) = file_generation_starting_with(&mut file, &header_bytes, file_len)?;
+        if hashed_len != file_len {
+            return Err(format!(
+                "{} changed while it was being opened; open it again",
+                path.display()
+            ));
+        }
+        Some(hash)
+    } else {
+        // The validated data and metadata reads below are bounded separately.
+        // An older container can contain a large, unused tail or a sparse gap.
+        None
+    };
 
     file.seek(std::io::SeekFrom::Start(header.data_offset))
         .map_err(|e| format!("Seek data section: {e}"))?;
@@ -2649,7 +2669,7 @@ fn open_vault_with_guard(
     }
     Ok(OpenVaultV3 {
         path,
-        opened_file_len,
+        opened_file_len: file_len,
         opened_hash,
         header,
         // Copied into the handle, whose Drop wipes them; the wrapped copies
@@ -2707,11 +2727,20 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
 }
 
 pub(super) fn assert_vault_generation_at(vault: &OpenVaultV3, path: &Path) -> Result<(), String> {
+    let expected = vault.writable_generation()?;
     let mut file = crate::source::open_regular(path).map_err(|e| format!("Open vault: {e}"))?;
-    if file_generation(&mut file)? != (vault.opened_file_len, vault.opened_hash) {
+    if file_generation(&mut file)? != (vault.opened_file_len, expected) {
         return Err("Vault changed while this write was in progress; retry operation".to_string());
     }
     Ok(())
+}
+
+impl OpenVaultV3 {
+    pub(super) fn writable_generation(&self) -> Result<[u8; 32], String> {
+        self.opened_hash.ok_or_else(|| {
+            "Vault is available for reading and extraction. Its extent exceeds the 4 GiB write generation budget".into()
+        })
+    }
 }
 
 /// A writer that passes bytes through and keeps their count and BLAKE3 hash,
@@ -2962,7 +2991,7 @@ pub(super) fn save_locked_to(
     // Refresh the staleness baseline so a second save in the same session does
     // not trip the generation guard against the bytes we just wrote.
     vault.opened_file_len = file_len;
-    vault.opened_hash = file_hash;
+    vault.opened_hash = Some(file_hash);
     vault.header = header;
     vault.header_repaired_on_open = false;
     vault.manifest_repaired_on_open = false;
@@ -3290,7 +3319,7 @@ mod tests {
     }
 
     #[test]
-    fn round10_extraction_waits_for_rotation_lock_on_an_absent_sidecar() {
+    fn round11_contended_fresh_extraction_cannot_publish_after_rotation_releases_lock() {
         const NEW: &str = "replacement-password-123";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotation.aerovault");
@@ -3304,16 +3333,30 @@ mod tests {
         std::fs::remove_file(&sidecar).unwrap();
         let mut vault = VaultV3::open(&path, PW).unwrap();
         let output = sidecar.clone();
+        let (start, started) = std::sync::mpsc::channel();
+        let (contention, contended) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let timeout = std::time::Duration::from_secs(5);
+        let extract = std::thread::spawn(move || {
+            started.recv_timeout(timeout).unwrap();
+            crate::lock::ON_LOCK_CONTENTION.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    contention.send(()).unwrap();
+                    released.recv_timeout(timeout).unwrap();
+                }));
+            });
+            VaultV3::extract_entry(&archived, "old-parity", &output)
+        });
         IN_SAVE_WINDOW.with(|h| {
             *h.borrow_mut() = Some(Box::new(move || {
-                assert!(!output.exists());
-                crate::lock::set_short_wait_for_this_thread();
-                let error = VaultV3::extract_entry(&archived, "old-parity", &output).unwrap_err();
-                assert!(error.contains("locked by another writer"), "{error}");
-                assert!(!output.exists());
+                start.send(()).unwrap();
+                contended.recv_timeout(timeout).unwrap();
             }));
         });
         VaultV3::change_password(&mut vault, NEW).unwrap();
+        release.send(()).unwrap();
+        let error = extract.join().unwrap().unwrap_err();
+        assert!(error.contains("locked by another writer"), "{error}");
         assert!(!sidecar.exists());
         assert!(VaultV3::open(&path, PW).is_err());
         assert!(VaultV3::open(&path, NEW).is_ok());
@@ -3938,7 +3981,7 @@ mod tests {
         let mut file = std::fs::File::open(&vp).unwrap();
         assert_eq!(
             file_generation(&mut file).unwrap(),
-            (v.opened_file_len, v.opened_hash)
+            (v.opened_file_len, v.opened_hash.unwrap())
         );
         drop(file);
         VaultV3::add_files(&mut v, &[(src.join("a.txt"), "b.txt".to_string())]).unwrap();
@@ -5287,7 +5330,7 @@ mod tests {
                 header_mac: [0u8; MAC_SIZE],
             },
             opened_file_len: 0,
-            opened_hash: [0u8; 32],
+            opened_hash: Some([0u8; 32]),
             master_key: [0u8; KEY_SIZE],
             mac_key: [0u8; KEY_SIZE],
             manifest,
@@ -6217,19 +6260,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn round9_sparse_tail_is_refused_before_generation_scan() {
+    fn round12_legacy_sparse_tail_allows_extraction_without_a_write_baseline() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"valid 0.6.8 payload").unwrap();
         VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut opened = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut opened, &[(input.clone(), "input".into())]).unwrap();
+        drop(opened);
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let original_len = file.metadata().unwrap().len();
         file.set_len(original_len + 8).unwrap();
-        assert!(VaultV3::open_plaintext(&path).is_ok());
+        assert!(VaultV3::open_plaintext(&path)
+            .unwrap()
+            .opened_hash
+            .is_some());
         file.set_len(MAX_GENERATION_EXTENT + 1).unwrap();
+        drop(file);
         crate::lock::take_trace();
-        let error = VaultV3::open_plaintext(&path).unwrap_err();
-        assert!(error.contains("generation scan budget"), "{error}");
+        let mut opened = VaultV3::open_plaintext(&path).unwrap();
+        assert!(opened.opened_hash.is_none());
         assert!(!crate::lock::take_trace().contains(&"generation"));
+        let output = dir.path().join("output");
+        VaultV3::extract_entry(&opened, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"valid 0.6.8 payload");
+        let error = VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap_err();
+        assert!(error.contains("write generation budget"), "{error}");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_GENERATION_EXTENT + 1
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -336,6 +336,10 @@ fn replace_from(
         temp.write_all(&buf[..n]).map_err(|e| e.to_string())?;
     }
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    #[cfg(all(test, target_os = "macos"))]
+    if let Some(inspect) = INSPECT_ROLLBACK_STAGE.with(|h| h.borrow_mut().take()) {
+        inspect(temp.path());
+    }
     if generation(temp.path())? != expected {
         return Err("strip rollback copy changed while being read".to_string());
     }
@@ -356,6 +360,15 @@ fn replace_from(
     #[cfg(not(windows))]
     persist_over(temp, target).map_err(|e| e.to_string())?;
     sync_dir(output_parent_dir(target))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+type InspectRollbackStage = Box<dyn FnOnce(&Path)>;
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static INSPECT_ROLLBACK_STAGE: std::cell::RefCell<Option<InspectRollbackStage>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn cleanup(path: &Path) -> Result<(), String> {
@@ -974,7 +987,28 @@ mod tests {
         assert!(super::super::unix_security::capture(&backup)
             .unwrap()
             .is_empty());
-        assert_eq!(fs::read(backup).unwrap(), b"plaintext before strip");
+        assert_eq!(fs::read(&backup).unwrap(), b"plaintext before strip");
+        fs::write(&original, b"new plaintext").unwrap();
+        let inspected = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = inspected.clone();
+        INSPECT_ROLLBACK_STAGE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |staged| {
+                let acl = super::super::unix_security::capture;
+                assert!(acl(staged.parent().unwrap()).unwrap().is_empty());
+                assert!(acl(staged).unwrap().is_empty());
+                assert_eq!(fs::read(staged).unwrap(), b"plaintext before strip");
+                observed.set(true);
+            }));
+        });
+        replace_from(
+            &backup,
+            &original,
+            generation(&backup).unwrap(),
+            generation(&original).unwrap(),
+        )
+        .unwrap();
+        assert!(inspected.get());
+        assert_eq!(fs::read(original).unwrap(), b"plaintext before strip");
     }
     #[test]
     fn journal_source_names_are_native_and_cannot_escape_the_parent() {
