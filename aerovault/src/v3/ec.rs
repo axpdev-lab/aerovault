@@ -156,10 +156,9 @@ pub(crate) fn validate_automatic_sidecar_destination(path: &Path) -> Result<(), 
 
 pub(crate) fn validate_standalone_sidecar_destination(path: &Path) -> Result<(), String> {
     if let Some(reader) = inspect_automatic_sidecar_destination(path)? {
-        crate::error_correction::sidecar::validate_window_tiling_iter(
-            reader.segments().iter().map(|s| (s.window_offset, s.window_len)),
-            reader.total_len,
-        ).map_err(|_| "Automatic sidecar destination holds recovery parity with different geometry; choose a separate explicit output path".to_string())?;
+        if !reader.has_standalone_tiling() {
+            return Err("Automatic sidecar destination holds recovery parity with different geometry; choose a separate explicit output path".into());
+        }
     }
     Ok(())
 }
@@ -179,29 +178,20 @@ fn inspect_automatic_sidecar_destination(
         Ok(_) => {}
     }
     let file = crate::source::open_regular_no_follow(path).map_err(|e| e.to_string())?;
-    let mut magic = Vec::with_capacity(9);
-    file.take(9)
-        .read_to_end(&mut magic)
-        .map_err(|e| e.to_string())?;
-    // A damaged vault can still recover its magic from its own parity. Only
-    // recognizable sidecar framing authorizes an automatic refresh. Inspect
-    // a fixed prefix, not an attacker-sized locator or parity payload.
-    if magic.len() != 9
-        || &magic[..8] != crate::error_correction::AEROCORRECT_MAGIC
-        || !matches!(magic[8], 1 | crate::error_correction::AEROCORRECT_VERSION)
-    {
-        return Err("Automatic sidecar destination contains a vault or unrecognized file; move it aside or choose an explicit output path".to_string());
+    #[cfg(test)]
+    if let Some(hook) = AFTER_SIDECAR_DEST_OPEN.with(|h| h.borrow_mut().take()) {
+        hook();
     }
-    // A recognizable prefix alone is insufficient: even those bytes of a
-    // damaged vault can be reconstructed from its own header parity. Validate
-    // the supported framing with a bounded locator and no parity allocation.
-    // Only legacy v1 needs a whole-file checksum scan; refuse oversized legacy
-    // candidates here rather than letting recognition scan an arbitrary file.
-    use crate::error_correction::sidecar::{AeroCorrectSidecarReader, SidecarReadLimits};
-    AeroCorrectSidecarReader::open_bounded(path, SidecarReadLimits {
-        segments: 1024,
-        file_len: if magic[8] == 1 { 1024 * 1024 * 1024 } else { u64::MAX },
-    }).map(Some).map_err(|e| format!("Automatic sidecar destination is an unrecognized or unbounded recovery file ({e}); choose an explicit output path to replace it"))
+    // Read the version and enforce the matching bound on the same no-follow
+    // handle. Only recognized, bounded sidecar framing authorizes a refresh.
+    crate::error_correction::sidecar::AeroCorrectSidecarReader::open_automatic_destination(file)
+        .map(Some)
+        .map_err(|e| format!("Automatic sidecar destination contains a vault or unrecognized or unbounded recovery file ({e}); choose an explicit output path"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SIDECAR_DEST_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// SHA-256 of a byte slice (the unified `.aerocorrect` format binds by content).
@@ -370,9 +360,17 @@ fn read_vault_segment(
     index: usize,
     region_len: u64,
 ) -> Result<Vec<u8>, String> {
+    read_vault_segment_bounded(open_vault_sidecar(vault_path, sidecar)?, index, region_len)
+}
+
+fn read_vault_segment_bounded(
+    mut reader: crate::error_correction::sidecar::AeroCorrectSidecarReader,
+    index: usize,
+    region_len: u64,
+) -> Result<Vec<u8>, String> {
     let max = crate::error_correction::parity_payload_bound(region_len)?;
     let max = usize::try_from(max).map_err(|_| "sidecar parity exceeds address space")?;
-    open_vault_sidecar(vault_path, sidecar)?.read_segment_avec_bounded(index, max)
+    reader.read_segment_avec_bounded(index, max)
 }
 
 /// Read the embedded `ERROR_CORRECTION_EXTENSION_ID` payload from the vault file,
@@ -419,14 +417,28 @@ pub(super) fn resolve_parity_source(
     }
     let sidecar_path = recovery_sidecar_path(&vault.path);
     if sidecar_path.exists() {
-        let parity = read_vault_segment(
-            &vault.path,
-            &sidecar_path,
-            VAULT_SIDECAR_SEG_DATA,
-            vault.header.data_len,
-        )?;
-        if !parity.is_empty() {
-            return Ok((parity, ParitySource::Detached));
+        match open_vault_sidecar(&vault.path, &sidecar_path) {
+            Ok(reader) if reader.has_standalone_tiling() => {}
+            Ok(reader) => {
+                let parity = read_vault_segment_bounded(
+                    reader,
+                    VAULT_SIDECAR_SEG_DATA,
+                    vault.header.data_len,
+                )?;
+                if !parity.is_empty() {
+                    return Ok((parity, ParitySource::Detached));
+                }
+            }
+            Err(error) => {
+                // A standalone sidecar can exceed the vault format's three
+                // segments. Only recognizable complete-file tiling permits a
+                // fallback when the vault-specific framing check rejects it.
+                if !inspect_automatic_sidecar_destination(&sidecar_path)
+                    .is_ok_and(|reader| reader.is_some_and(|r| r.has_standalone_tiling()))
+                {
+                    return Err(error);
+                }
+            }
         }
     }
     // 3. Embedded extension payload.
@@ -2233,6 +2245,109 @@ mod tests {
         crate::lock::remove_vault_and_lock(&vp);
         let _ = std::fs::remove_file(default_sidecar_path(&vp));
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn round14_standalone_sidecar_does_not_hide_embedded_vault_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embedded.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        seed_tree(&mut vault, dir.path());
+        drop(vault);
+        crate::error_correction::correct_generate(path.to_str().unwrap(), 20, None).unwrap();
+        let sidecar = default_sidecar_path(&path);
+        let before = std::fs::read(&sidecar).unwrap();
+        corrupt_data_section(&path, 64);
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        assert!(VaultV3::repair(&mut vault, false, Some(&sidecar)).is_err());
+        let (restored, source) = VaultV3::repair(&mut vault, false, None).unwrap();
+        assert!(restored > 0);
+        assert_eq!(source, ParitySource::Embedded);
+        assert!(VaultV3::scrub(&vault).is_empty());
+        assert_eq!(std::fs::read(sidecar).unwrap(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round14_automatic_sidecar_parser_uses_the_opened_descriptor_and_legacy_limit() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("data.aerocorrect");
+        let incoming = dir.path().join("oversized-v1");
+        let g =
+            crate::error_correction::sync::generate_sync_sidecar_for_bytes("rel", b"payload", 20);
+        std::fs::write(&out, g.sidecar_bytes).unwrap();
+        let mut file = std::fs::File::create(&incoming).unwrap();
+        file.write_all(crate::error_correction::AEROCORRECT_MAGIC)
+            .unwrap();
+        file.write_all(&[1]).unwrap();
+        file.set_len(1024 * 1024 * 1024 + 1).unwrap();
+        drop(file);
+        let replaced = out.clone();
+        AFTER_SIDECAR_DEST_OPEN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(incoming, replaced).unwrap()
+            }));
+        });
+        assert!(inspect_automatic_sidecar_destination(&out)
+            .unwrap()
+            .unwrap()
+            .has_standalone_tiling());
+        let error = inspect_automatic_sidecar_destination(&out).err().unwrap();
+        assert!(
+            error.contains("legacy aerocorrect sidecar exceeds"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round14_strip_preserves_security_changed_before_either_rename() {
+        use super::super::strip_transaction as tx;
+        use std::os::unix::fs::PermissionsExt;
+        for narrow_sidecar in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("plain.aerozip");
+            let sidecar = default_sidecar_path(&path);
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new_plaintext(&path),
+                RecoveryPlacement::Both,
+                20,
+            )
+            .unwrap();
+            VaultV3::export_parity(&path, "", None).unwrap();
+            let narrowed = if narrow_sidecar { &sidecar } else { &path };
+            std::fs::set_permissions(narrowed, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let dest = narrowed.clone();
+            let hook = Box::new(move || {
+                std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+            });
+            if narrow_sidecar {
+                tx::AFTER_STRIP_VAULT.with(|f| *f.borrow_mut() = Some(hook));
+            } else {
+                tx::AFTER_STRIP_JOURNAL.with(|f| *f.borrow_mut() = Some(hook));
+            }
+            let before = std::fs::read(&path).unwrap();
+            let before_sidecar = std::fs::read(&sidecar).unwrap();
+            let error = VaultV3::strip_parity(&path, "", false).unwrap_err();
+            assert!(
+                error.contains("security changed before publication"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), before_sidecar);
+            assert_eq!(
+                std::fs::metadata(narrowed).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(!tx::journal_path(&path).exists());
+        }
     }
 
     #[test]

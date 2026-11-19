@@ -57,27 +57,37 @@ pub(super) fn journal_path(source: &Path) -> PathBuf {
     source.with_file_name(format!(".{}.aerostrip", hash.to_hex()))
 }
 
-#[derive(Serialize, Deserialize)]
-struct SavedPermissions {
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedPermissions {
     unix_mode: Option<u32>,
     #[serde(default)]
     unix_acl: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unix_owner_group: Option<(u32, u32)>,
     readonly: bool,
     #[serde(default)]
     windows_dacl: Option<String>,
 }
 impl SavedPermissions {
-    fn capture(path: &Path) -> Result<Self, String> {
-        let p = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    pub(crate) fn capture(path: &Path) -> Result<Self, String> {
+        let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
+            return Err("Cannot capture security of a non-regular file".into());
+        }
+        let p = metadata.permissions();
         #[cfg(unix)]
-        let unix_mode = {
-            use std::os::unix::fs::PermissionsExt;
-            Some(p.mode() & 0o777)
+        let (unix_mode, unix_owner_group) = {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            (
+                Some(p.mode() & 0o777),
+                Some((metadata.uid(), metadata.gid())),
+            )
         };
         #[cfg(not(unix))]
-        let unix_mode = None;
+        let (unix_mode, unix_owner_group) = (None, None);
         Ok(Self {
             unix_mode,
+            unix_owner_group,
             #[cfg(unix)]
             unix_acl: Some(super::unix_security::capture(path)?),
             #[cfg(not(unix))]
@@ -88,6 +98,14 @@ impl SavedPermissions {
             #[cfg(not(windows))]
             windows_dacl: None,
         })
+    }
+
+    fn capture_if_present(path: &Path) -> Result<Option<Self>, String> {
+        if path.try_exists().map_err(|e| e.to_string())? {
+            Self::capture(path).map(Some)
+        } else {
+            Ok(None)
+        }
     }
     /// Capture how a new file would be created in its actual destination
     /// directory, using an empty probe rather than exposing staged vault bytes.
@@ -109,7 +127,7 @@ impl SavedPermissions {
         }
     }
 
-    fn apply(&self, path: &Path) -> Result<(), String> {
+    pub(crate) fn apply(&self, path: &Path) -> Result<(), String> {
         #[cfg(windows)]
         super::windows_security::apply(
             path,
@@ -120,10 +138,32 @@ impl SavedPermissions {
         )?;
         #[cfg(unix)]
         if let Some(mode) = self.unix_mode {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::{
+                fd::AsRawFd,
+                unix::fs::{MetadataExt, PermissionsExt},
+            };
             let acl = self.unix_acl.as_deref().ok_or(
                 "Recovery journal lacks the original access ACL; manual recovery required",
             )?;
+            if let Some((uid, gid)) = self.unix_owner_group {
+                let stage =
+                    crate::source::open_regular_no_follow(path).map_err(|e| e.to_string())?;
+                let metadata = stage.metadata().map_err(|e| e.to_string())?;
+                if (metadata.uid(), metadata.gid()) != (uid, gid) {
+                    if unsafe { libc::fchown(stage.as_raw_fd(), uid, gid) } != 0 {
+                        return Err(format!(
+                            "Cannot preserve file owner and group: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    let metadata = stage.metadata().map_err(|e| e.to_string())?;
+                    if (metadata.uid(), metadata.gid()) != (uid, gid) {
+                        return Err(
+                            "File owner and group preservation could not be verified".into()
+                        );
+                    }
+                }
+            }
             super::unix_security::apply(path, acl)?;
             fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
                 .map_err(|e| e.to_string())?;
@@ -828,16 +868,8 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
         new_vault: generation(&prepared.path().join("new-vault"))?,
         old_sidecar: generation_if_present(&prepared.path().join("old-sidecar"))?,
         new_sidecar: generation(&prepared.path().join("new-sidecar"))?,
-        old_vault_permissions: if source.exists() {
-            Some(SavedPermissions::capture(source)?)
-        } else {
-            None
-        },
-        old_sidecar_permissions: if sidecar.exists() {
-            Some(SavedPermissions::capture(&sidecar)?)
-        } else {
-            None
-        },
+        old_vault_permissions: SavedPermissions::capture_if_present(source)?,
+        old_sidecar_permissions: SavedPermissions::capture_if_present(&sidecar)?,
     };
     if !lock.covers_namespace(source)
         || generation_if_present(source)? != journal.old_vault
@@ -887,6 +919,9 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
         hook();
     }
     let result = (|| {
+        if SavedPermissions::capture_if_present(source)? != journal.old_vault_permissions {
+            return Err("Original vault security changed before publication".into());
+        }
         fs::rename(path.join("new-vault"), source).map_err(|e| e.to_string())?;
         finish_security(
             source,
@@ -902,6 +937,9 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
         #[cfg(test)]
         if let Some(hook) = AFTER_STRIP_VAULT.with(|h| h.borrow_mut().take()) {
             hook();
+        }
+        if SavedPermissions::capture_if_present(&sidecar)? != journal.old_sidecar_permissions {
+            return Err("Original sidecar security changed before publication".into());
         }
         fs::rename(path.join("new-sidecar"), &sidecar).map_err(|e| e.to_string())?;
         #[cfg(test)]

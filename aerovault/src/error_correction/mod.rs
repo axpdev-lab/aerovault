@@ -851,7 +851,7 @@ pub fn correct_generate_with_progress(
                 ));
             }
         }
-        sync::assert_unchanged(&locked, &generated.file_sha256)?;
+        sync::assert_unchanged(&locked, generated.file_size, &generated.file_sha256)?;
         #[cfg(test)]
         sync::run_hook(&sync::IN_WRITE_WINDOW);
         crate::v3::vault::atomic_write(&destination, &generated.sidecar_bytes)

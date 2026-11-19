@@ -755,11 +755,32 @@ impl AeroCorrectSidecarReader {
     }
 
     pub(crate) fn open_bounded(path: &Path, limits: SidecarReadLimits) -> Result<Self, String> {
-        let mut file = crate::source::open_regular(path)
+        #[cfg(test)]
+        crate::lock::trace("open correction sidecar");
+        let file = crate::source::open_regular(path)
             .map_err(|e| format!("open aerocorrect sidecar {}: {e}", path.display()))?;
+        Self::parse_file(file, limits, limits.file_len)
+    }
+
+    pub(crate) fn open_automatic_destination(file: File) -> Result<Self, String> {
+        Self::parse_file(
+            file,
+            SidecarReadLimits {
+                segments: 1024,
+                file_len: u64::MAX,
+            },
+            1024 * 1024 * 1024,
+        )
+    }
+
+    fn parse_file(
+        mut file: File,
+        limits: SidecarReadLimits,
+        legacy_max: u64,
+    ) -> Result<Self, String> {
         let file_len = file
             .metadata()
-            .map_err(|e| format!("stat aerocorrect sidecar {}: {e}", path.display()))?
+            .map_err(|e| format!("stat aerocorrect sidecar: {e}"))?
             .len();
         if file_len > limits.file_len {
             return Err("aerocorrect sidecar exceeds expected file-size bound".to_string());
@@ -775,9 +796,22 @@ impl AeroCorrectSidecarReader {
         }
         match prefix[AEROCORRECT_MAGIC.len()] {
             AEROCORRECT_VERSION => Self::open_v2(file, file_len, limits),
+            AEROCORRECT_VERSION_V1 if file_len > legacy_max => {
+                Err("legacy aerocorrect sidecar exceeds expected file-size bound".into())
+            }
             AEROCORRECT_VERSION_V1 => Self::open_v1(file, file_len, limits),
             version => Err(format!("unsupported aerocorrect sidecar version {version}")),
         }
+    }
+
+    pub(crate) fn has_standalone_tiling(&self) -> bool {
+        validate_window_tiling_iter(
+            self.segments
+                .iter()
+                .map(|s| (s.window_offset, s.window_len)),
+            self.total_len,
+        )
+        .is_ok()
     }
 
     /// Streaming open of the self-healing v2 framing: read only the prefix and the (tiny)

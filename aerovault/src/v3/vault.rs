@@ -1337,6 +1337,13 @@ fn write_op<T>(
     let result = op(vault, &lock, sidecar_lock.as_ref());
     if result.is_err() {
         vault.manifest = manifest;
+        if let Some(appended) = vault.data.get_mut(data_len..) {
+            appended.zeroize();
+            #[cfg(test)]
+            if let Some(inspect) = INSPECT_REJECTED_ADD.with(|h| h.borrow_mut().take()) {
+                inspect(appended);
+            }
+        }
         vault.data.truncate(data_len);
     }
     result
@@ -1345,7 +1352,11 @@ fn write_op<T>(
 #[cfg(test)]
 thread_local! {
     pub(super) static BEFORE_MUTATION_SIDECAR_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static INSPECT_REJECTED_ADD: std::cell::RefCell<Option<InspectRejectedAdd>> = const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(test)]
+type InspectRejectedAdd = Box<dyn FnOnce(&[u8])>;
 
 fn lock_default_sidecar(path: &Path) -> Result<Option<WriteLock>, String> {
     let sidecar = super::ec::default_sidecar_path(path);
@@ -1743,11 +1754,41 @@ fn create_contained_dirs(root: &Path, rel: &Path) -> Result<(), String> {
 /// escape (audit M2). `output` is always built as `root.join(rel)` by the extract
 /// callers, so its parent is lexically under `root`; `root` may be a friendly
 /// (non-canonical) path — the containment assertion canonicalizes both sides.
-fn prepare_output_parent(root: &Path, output: &Path) -> Result<(), String> {
-    let parent = match output.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => return Ok(()),
-    };
+struct ExtractionParent {
+    root: PathBuf,
+    root_identity: same_file::Handle,
+    path: PathBuf,
+    identity: same_file::Handle,
+}
+
+impl ExtractionParent {
+    fn recheck(&self) -> Result<(), String> {
+        let unchanged = |path: &Path, identity: &same_file::Handle| {
+            path.canonicalize().is_ok_and(|resolved| resolved == path)
+                && same_file::Handle::from_path(path).is_ok_and(|current| current == *identity)
+        };
+        if !unchanged(&self.root, &self.root_identity) || !unchanged(&self.path, &self.identity) {
+            return Err("Refusing extraction: the validated output directory changed".into());
+        }
+        Ok(())
+    }
+
+    fn recheck_stage(
+        &self,
+        tmp: &tempfile::NamedTempFile,
+        staged_identity: &same_file::Handle,
+    ) -> Result<(), String> {
+        self.recheck()?;
+        if same_file::Handle::from_path(tmp.path()).map_err(|e| e.to_string())? != *staged_identity
+        {
+            return Err("Refusing extraction: the staging file changed".into());
+        }
+        Ok(())
+    }
+}
+
+fn prepare_output_parent(root: &Path, output: &Path) -> Result<ExtractionParent, String> {
+    let parent = output_parent_dir(output);
     let rel = parent.strip_prefix(root).map_err(|_| {
         format!(
             "Refusing extraction: {} is outside destination root {}",
@@ -1755,13 +1796,15 @@ fn prepare_output_parent(root: &Path, output: &Path) -> Result<(), String> {
             root.display()
         )
     })?;
-    create_contained_dirs(root, rel)?;
     // Defense in depth: the fully-resolved parent must still live inside the
     // fully-resolved root (both canonicalize to `\\?\`-verbatim paths on Windows).
     let canon_root = root
         .canonicalize()
         .map_err(|e| format!("Resolve destination {}: {e}", root.display()))?;
-    let canon_parent = parent
+    let root_identity = same_file::Handle::from_path(&canon_root).map_err(|e| e.to_string())?;
+    create_contained_dirs(&canon_root, rel)?;
+    let canon_parent = canon_root
+        .join(rel)
         .canonicalize()
         .map_err(|e| format!("Resolve output dir {}: {e}", parent.display()))?;
     if !canon_parent.starts_with(&canon_root) {
@@ -1771,7 +1814,18 @@ fn prepare_output_parent(root: &Path, output: &Path) -> Result<(), String> {
             canon_root.display()
         ));
     }
-    Ok(())
+    let identity = same_file::Handle::from_path(&canon_parent).map_err(|e| e.to_string())?;
+    Ok(ExtractionParent {
+        root: canon_root,
+        root_identity,
+        path: canon_parent,
+        identity,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_EXTRACTION_PARENT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn extract_file_entry(
@@ -1781,9 +1835,16 @@ fn extract_file_entry(
     dest_root: &Path,
 ) -> Result<PathBuf, String> {
     // Create + contain the parent before decoding/writing any plaintext (audit M2).
-    prepare_output_parent(dest_root, output_path)?;
-    let guard = if crate::lock::refuse_lock_file_name(output_path).is_ok() {
-        let destination = crate::lock::anchored(output_path).map_err(|e| e.to_string())?;
+    let parent = prepare_output_parent(dest_root, output_path)?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_EXTRACTION_PARENT.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    parent.recheck()?;
+    let destination = parent
+        .path
+        .join(output_path.file_name().ok_or("Missing output basename")?);
+    let guard = if crate::lock::refuse_lock_file_name(&destination).is_ok() {
         crate::lock::refuse_destination(&destination, &vault.path).map_err(|e| e.to_string())?;
         let lock = match std::fs::symlink_metadata(&destination) {
             // An absent recovery destination may be in use by a password
@@ -1798,6 +1859,13 @@ fn extract_file_entry(
     } else {
         None
     };
+    parent.recheck()?;
+    if guard
+        .as_ref()
+        .is_some_and(|lock| lock.source_path().parent() != Some(parent.path.as_path()))
+    {
+        return Err("Refusing extraction: the locked output directory changed".into());
+    }
 
     // We only ever slice `out[offset..offset+size]`, so decoding never needs to
     // grow `out` past that bound. Tracking it lets us stop early and refuse a
@@ -1831,12 +1899,15 @@ fn extract_file_entry(
     // one block (bounded by `max_block_plaintext`), not the whole entry. The temp
     // is atomically promoted only after the full slice has been written, so a
     // failure mid-decode leaves no partial output and no plaintext temp artifact.
-    let parent = output_parent_dir(output_path);
-    std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".aerovault-v3-")
-        .tempfile_in(parent)
+        .tempfile_in(&parent.path)
         .map_err(|e| format!("Create temp file: {e}"))?;
+    parent.recheck()?;
+    let staged_identity =
+        same_file::Handle::from_file(tmp.as_file().try_clone().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    parent.recheck_stage(&tmp, &staged_identity)?;
 
     // Cumulative decoded plaintext length so far == the old `out.len()`; used to
     // place each block against the requested slice and to detect a short entry.
@@ -1946,6 +2017,10 @@ fn extract_file_entry(
     tmp.as_file_mut()
         .sync_all()
         .map_err(|e| format!("Sync temp file: {e}"))?;
+    if let Err(error) = parent.recheck_stage(&tmp, &staged_identity) {
+        let _ = tmp.as_file().set_len(0);
+        return Err(error);
+    }
     // An entry named like a lock file is extracted only where no file is:
     // replacing an existing one could replace a vault's lock file. A lock file
     // is empty, so an empty entry over an empty file (extracting the same
@@ -1955,6 +2030,7 @@ fn extract_file_entry(
             Ok(_) => {}
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 guard_extraction_replacement(guard.source_path())?;
+                parent.recheck_stage(&e.file, &staged_identity)?;
                 e.file
                     .persist(guard.source_path())
                     .map_err(|e| format!("Persist extracted file: {}", e.error))?;
@@ -1962,12 +2038,12 @@ fn extract_file_entry(
             Err(e) => return Err(format!("Persist extracted file: {}", e.error)),
         }
     } else {
-        if let Err(e) = tmp.persist_noclobber(output_path) {
+        if let Err(e) = tmp.persist_noclobber(&destination) {
             if e.error.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(format!("Persist vault: {}", e.error));
             }
             let both_empty = e.file.as_file().metadata().is_ok_and(|m| m.len() == 0)
-                && std::fs::symlink_metadata(output_path)
+                && std::fs::symlink_metadata(&destination)
                     .is_ok_and(|m| m.is_file() && m.len() == 0);
             if !both_empty {
                 return Err(format!(
@@ -1979,7 +2055,7 @@ fn extract_file_entry(
             }
         }
     }
-    fsync_parent_dir(parent);
+    fsync_parent_dir(&parent.path);
     Ok(output_path.to_path_buf())
 }
 
@@ -1997,8 +2073,13 @@ fn guard_extraction_replacement(path: &Path) -> Result<(), String> {
     if magic == MAGIC || magic == crate::constants::MAGIC {
         return Err("Refusing extraction over an existing vault".into());
     }
+    if magic.starts_with(crate::error_correction::AEROCORRECT_MAGIC) {
+        return Err("Refusing extraction over an existing recovery sidecar".into());
+    }
     let sidecar = super::ec::recovery_sidecar_path(path);
-    if super::ec::validate_standalone_sidecar_destination(&sidecar).is_err() {
+    if crate::lock::destination_can_exist(&sidecar).map_err(|e| e.to_string())?
+        && super::ec::validate_standalone_sidecar_destination(&sidecar).is_err()
+    {
         return Err(format!(
             "Refusing extraction over a possible vault with recovery material at {}",
             sidecar.display()
@@ -3730,10 +3811,19 @@ mod tests {
                     .create_directory("during")
                     .map(drop)
                     .map_err(|e| e.to_string()),
-                "export" | "sidecar" => VaultV3::export_parity(&path, PW, None).map(drop),
-                "hash" => {
-                    crate::error_correction::sync::write_if_unchanged(&path, &[0; 32], |_| Ok(()))
+                "export" => VaultV3::export_parity(&path, PW, None).map(drop),
+                "sidecar" => {
+                    crate::lock::take_trace();
+                    let result = VaultV3::open(&path, PW).map(drop);
+                    assert!(crate::lock::take_trace().contains(&"open correction sidecar"));
+                    result
                 }
+                "hash" => crate::error_correction::sync::write_if_unchanged(
+                    &path,
+                    0,
+                    &[0; 32],
+                    |_| Ok(()),
+                ),
                 _ => unreachable!(),
             };
             assert!(result.is_err(), "non-regular input accepted");
@@ -6242,6 +6332,114 @@ mod tests {
     }
 
     #[test]
+    fn round14_extraction_preserves_an_existing_vault_recovery_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            super::super::ec::RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let output = super::super::ec::default_sidecar_path(&path);
+        let before = std::fs::read(&output).unwrap();
+        let source = dir.path().join("input");
+        std::fs::write(&source, b"ordinary archived bytes").unwrap();
+        let archive = dir.path().join("archive.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&archive)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&archive).unwrap();
+        let name = output.file_name().unwrap().to_str().unwrap();
+        VaultV3::add_files(&mut vault, &[(source, name.to_owned())]).unwrap();
+        let error = VaultV3::extract_all(&vault, dir.path()).unwrap_err();
+        assert!(error.contains("existing recovery sidecar"), "{error}");
+        assert_eq!(std::fs::read(output).unwrap(), before);
+        assert!(VaultV3::open(&path, PW).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round14_extraction_replaces_an_ordinary_max_length_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("x".repeat(255));
+        std::fs::write(&input, b"extracted bytes").unwrap();
+        std::fs::write(&output, b"ordinary existing file").unwrap();
+        let archive = dir.path().join("archive.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&archive)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&archive).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        VaultV3::extract_entry(&vault, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"extracted bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round14_extraction_refuses_a_replaced_validated_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"plaintext inside the archive").unwrap();
+        let archive = dir.path().join("archive.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&archive)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&archive).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "subdir/file".into())]).unwrap();
+        let subdir = root.join("subdir");
+        let moved = root.join("moved");
+        let redirect = outside.clone();
+        AFTER_EXTRACTION_PARENT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&subdir, &moved).unwrap();
+                std::os::unix::fs::symlink(redirect, subdir).unwrap();
+            }));
+        });
+        let error = VaultV3::extract_all(&vault, &root).unwrap_err();
+        assert!(
+            error.contains("validated output directory changed"),
+            "{error}"
+        );
+        assert!(std::fs::read_dir(outside).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn round14_failed_plaintext_add_wipes_the_rejected_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.aerozip");
+        let original = dir.path().join("original");
+        let large = dir.path().join("large");
+        std::fs::write(&original, b"keep this entry").unwrap();
+        std::fs::write(&large, vec![0xa7; PACK_SMALL_FILE_THRESHOLD + 1]).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(original, "kept".into())]).unwrap();
+        let prefix = vault.data.clone();
+        let before = std::fs::read(&path).unwrap();
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let done = observed.clone();
+        INSPECT_REJECTED_ADD.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |appended| {
+                assert!(!appended.is_empty());
+                assert!(appended.iter().all(|&b| b == 0));
+                done.set(true);
+            }));
+        });
+        assert!(VaultV3::add_files(
+            &mut vault,
+            &[
+                (large, "discarded".into()),
+                (dir.path().join("missing"), "missing".into()),
+            ]
+        )
+        .is_err());
+        assert!(observed.get());
+        assert_eq!(vault.data, prefix);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
     fn round9_saved_header_failure_keeps_the_vault_and_handle_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.aerozip");
@@ -6447,6 +6645,7 @@ mod tests {
         const KEY: &str = "AEROVAULT_ROUND8_MEMORY";
         if let Some(path) = std::env::var_os(KEY) {
             crate::source::memory_test::limit();
+            TEST_DATA_BUDGET.with(|budget| budget.set(Some(DEFAULT_DATA_BUDGET)));
             crate::lock::take_trace();
             let err = VaultV3::open_plaintext(PathBuf::from(path)).unwrap_err();
             assert!(err.contains("in-memory open budget"), "{err}");

@@ -385,7 +385,7 @@ fn hash_file_streaming(path: &Path) -> Result<[u8; 32], String> {
     hash_open_file(&mut file, path)
 }
 
-fn hash_open_file(file: &mut std::fs::File, path: &Path) -> Result<[u8; 32], String> {
+fn hash_open_file(file: &mut impl Read, path: &Path) -> Result<[u8; 32], String> {
     #[cfg(test)]
     HASH_READS.with(|n| n.set(n.get() + 1));
 
@@ -403,6 +403,23 @@ fn hash_open_file(file: &mut std::fs::File, path: &Path) -> Result<[u8; 32], Str
     Ok(finalize_sha256(hasher))
 }
 
+fn hash_file_at_length(
+    mut file: std::fs::File,
+    path: &Path,
+    expected_len: u64,
+) -> Result<[u8; 32], String> {
+    let changed = || format!("{} changed while it was being read; retry", path.display());
+    if file.metadata().map_err(|e| e.to_string())?.len() != expected_len {
+        return Err(changed());
+    }
+    let mut bounded = Read::by_ref(&mut file).take(expected_len.saturating_add(1));
+    let hash = hash_open_file(&mut bounded, path)?;
+    if bounded.limit() != 1 {
+        return Err(changed());
+    }
+    Ok(hash)
+}
+
 /// Run `write` (which replaces `path` or writes its `.aerocorrect`) under the
 /// write lock of `path`, after checking that `path` still holds the bytes that
 /// were read, by their SHA-256 `read_sha256`. The file was read without the
@@ -412,21 +429,25 @@ fn hash_open_file(file: &mut std::fs::File, path: &Path) -> Result<[u8; 32], Str
 /// into one between the check and the write.
 pub(crate) fn write_if_unchanged(
     path: &Path,
+    read_len: u64,
     read_sha256: &[u8; 32],
     write: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    write_if_unchanged_with_lock(path, read_sha256, |lock| write(lock.source_path()))
+    write_if_unchanged_with_lock(path, read_len, read_sha256, |lock| {
+        write(lock.source_path())
+    })
 }
 
 pub(crate) fn write_if_unchanged_with_lock(
     path: &Path,
+    read_len: u64,
     read_sha256: &[u8; 32],
     write: impl FnOnce(&crate::lock::WriteLock) -> Result<(), String>,
 ) -> Result<(), String> {
     #[cfg(test)]
     run_hook(&BEFORE_WRITE_LOCK);
     let _lock = crate::lock::acquire(path).map_err(|e| e.to_string())?;
-    assert_unchanged(_lock.source_path(), read_sha256)?;
+    assert_unchanged(_lock.source_path(), read_len, read_sha256)?;
     #[cfg(test)]
     run_hook(&IN_WRITE_WINDOW);
     write(&_lock)
@@ -434,8 +455,14 @@ pub(crate) fn write_if_unchanged_with_lock(
 
 /// Recheck after acquiring any additional destination guard, without taking
 /// the already held source lock recursively.
-pub(crate) fn assert_unchanged(path: &Path, read_sha256: &[u8; 32]) -> Result<(), String> {
-    if hash_file_streaming(path)? != *read_sha256 {
+pub(crate) fn assert_unchanged(
+    path: &Path,
+    read_len: u64,
+    read_sha256: &[u8; 32],
+) -> Result<(), String> {
+    let file = crate::source::open_regular(path)
+        .map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
+    if hash_file_at_length(file, path, read_len)? != *read_sha256 {
         return Err(format!(
             "{} changed while it was being read; retry",
             path.display()
@@ -486,12 +513,11 @@ pub fn verify_repair_sync_file(
     let path = pinned.as_path();
 
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
-    let (mut initial, file_size) = initial_repair_target(path)?;
+    let (initial, file_size) = initial_repair_target(path)?;
     let sidecar = validated_sidecar_for(rel_path, expected_sha256, file_size, sidecar_bytes)?;
 
     // Fast path: stream the file once and hash it. Bounded memory (one read chunk).
-    let initial_sha256 = hash_open_file(&mut initial, path)?;
-    drop(initial);
+    let initial_sha256 = hash_file_at_length(initial, path, file_size)?;
     if initial_sha256 == *expected_sha256 {
         return Ok(SyncEcRepairResult::Verified);
     }
@@ -551,20 +577,17 @@ pub fn verify_repair_sync_file(
     // On a persist failure (or a refusal) the temp file is removed, so a
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
-    write_if_unchanged(path, &initial_sha256, |locked_path| {
+    write_if_unchanged(path, file_size, &initial_sha256, |locked_path| {
         // The private stage stays private throughout any wait. Permission-only
         // changes do not affect the content hash, so sample them under guard.
-        let permissions = std::fs::metadata(locked_path)
-            .map_err(|e| e.to_string())?
-            .permissions();
         #[cfg(unix)]
-        let access_acl = crate::v3::unix_security::capture(locked_path)?;
-        #[cfg(unix)]
-        crate::v3::unix_security::apply(tmp.path(), &access_acl)?;
-        std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        if crate::v3::unix_security::capture(tmp.path())? != access_acl {
-            return Err("Repair access ACL preservation could not be verified".into());
+        crate::v3::strip_transaction::SavedPermissions::capture(locked_path)?.apply(tmp.path())?;
+        #[cfg(not(unix))]
+        {
+            let permissions = std::fs::metadata(locked_path)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
         }
         #[cfg(windows)]
         let descriptor = crate::v3::windows_security::capture(locked_path)?;
@@ -632,7 +655,7 @@ fn repair_streamed(
     let path = pinned.as_path();
 
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
-    let (mut initial, file_size) = initial_repair_target(path)?;
+    let (initial, file_size) = initial_repair_target(path)?;
     let mut reader = AeroCorrectSidecarReader::open(sidecar_path)?;
     // Same validation as the in-memory path: content binding, declared length, tiling.
     reader.verify_binding(expected_sha256).map_err(|e| {
@@ -654,8 +677,7 @@ fn repair_streamed(
     .map_err(|e| format!("AeroSync EC sidecar for {rel_path}: {e}"))?;
 
     // Fast path: stream the file once and hash it. Bounded memory.
-    let initial_sha256 = hash_open_file(&mut initial, path)?;
-    drop(initial);
+    let initial_sha256 = hash_file_at_length(initial, path, file_size)?;
     if initial_sha256 == *expected_sha256 {
         return Ok(SyncEcRepairResult::Verified);
     }
@@ -724,20 +746,17 @@ fn repair_streamed(
     // On a persist failure (or a refusal) the temp file is removed, so a
     // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
     // plaintext-at-rest).
-    write_if_unchanged(path, &initial_sha256, |locked_path| {
+    write_if_unchanged(path, file_size, &initial_sha256, |locked_path| {
         // The private stage stays private throughout any wait. Permission-only
         // changes do not affect the content hash, so sample them under guard.
-        let permissions = std::fs::metadata(locked_path)
-            .map_err(|e| e.to_string())?
-            .permissions();
         #[cfg(unix)]
-        let access_acl = crate::v3::unix_security::capture(locked_path)?;
-        #[cfg(unix)]
-        crate::v3::unix_security::apply(tmp.path(), &access_acl)?;
-        std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        if crate::v3::unix_security::capture(tmp.path())? != access_acl {
-            return Err("Repair access ACL preservation could not be verified".into());
+        crate::v3::strip_transaction::SavedPermissions::capture(locked_path)?.apply(tmp.path())?;
+        #[cfg(not(unix))]
+        {
+            let permissions = std::fs::metadata(locked_path)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
         }
         #[cfg(windows)]
         let descriptor = crate::v3::windows_security::capture(locked_path)?;
@@ -1024,7 +1043,7 @@ mod tests {
             return;
         }
         let mut ran = false;
-        let result = write_if_unchanged(&path, &hash, |_| {
+        let result = write_if_unchanged(&path, 8, &hash, |_| {
             ran = true;
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::rename(staged.path(), &path).unwrap();
@@ -1034,6 +1053,99 @@ mod tests {
         assert!(result.is_err(), "replacement accepted without a real lock");
         assert!(!ran);
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round14_correct_generate_refuses_a_different_length_before_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        std::fs::write(&path, b"small source").unwrap();
+        let replaced = path.clone();
+        BEFORE_WRITE_LOCK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(replaced)
+                    .unwrap()
+                    .set_len(4 * 1024 * 1024 * 1024)
+                    .unwrap();
+                HASH_READS.with(|reads| reads.set(0));
+            }));
+        });
+        let err = super::super::correct_generate(path.to_str().unwrap(), 20, None).unwrap_err();
+        assert!(err.contains("changed while it was being read"), "{err}");
+        assert_eq!(HASH_READS.with(|reads| reads.get()), 0);
+        assert!(!path.with_extension("aerocorrect").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round14_repair_retains_original_group_when_stage_group_differs() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, PermissionsExt},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let original_gid = std::fs::metadata(dir.path()).unwrap().gid();
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0; count as usize];
+        assert_eq!(
+            unsafe { libc::getgroups(count, groups.as_mut_ptr()) },
+            count
+        );
+        let probe = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let uid = probe.as_file().metadata().unwrap().uid();
+        let gid = groups.into_iter().find(|&gid| {
+            if gid == original_gid {
+                return false;
+            }
+            if unsafe { libc::fchown(probe.as_file().as_raw_fd(), uid, gid) } == 0 {
+                return true;
+            }
+            let error = std::io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EPERM)),
+                "{error}"
+            );
+            false
+        });
+        let Some(gid) = gid else {
+            eprintln!("Distinct assignable group unavailable for native repair fixture");
+            return;
+        };
+        for streamed in [false, true] {
+            let path = dir.path().join("target");
+            let data = sample_data(4096);
+            let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let sidecar = dir.path().join("parity");
+            std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[1] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            let uid = file.metadata().unwrap().uid();
+            assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) }, 0);
+            file.set_permissions(std::fs::Permissions::from_mode(0o640))
+                .unwrap();
+            drop(file);
+            let result = if streamed {
+                verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+            } else {
+                verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+            };
+            assert!(matches!(
+                result.unwrap(),
+                SyncEcRepairResult::Repaired { .. }
+            ));
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+                (uid, gid, 0o640)
+            );
+            assert_eq!(std::fs::read(path).unwrap(), data);
+        }
     }
 
     #[test]
@@ -2000,6 +2112,18 @@ mod tests {
             assert!(repair().unwrap_err().contains("merge failure"));
             assert_eq!(std::fs::read(&path).unwrap(), damaged);
             assert_eq!(acl::capture(&path).unwrap(), before);
+            acl::FAIL_REPAIR_WITH_ORIGINAL_INTACT.with(|f| f.set(true));
+            let error = repair().unwrap_err();
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert_eq!(acl::capture(&path).unwrap(), before);
+            assert!(!error.contains("Preserve the recovery"));
+            assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aerorepair-")
+            }));
             acl::FAIL_REPAIR_AFTER_BACKUP.with(|f| f.set(true));
             assert!(repair().unwrap_err().contains("replacement"));
             assert_eq!(std::fs::read(&path).unwrap(), damaged);

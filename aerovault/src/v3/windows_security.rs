@@ -498,6 +498,16 @@ pub(crate) fn persist_repair(
     let replacement_wide = wide(&replacement);
     let backup_wide = wide(&backup);
     #[cfg(test)]
+    if FAIL_REPAIR_WITH_ORIGINAL_INTACT.with(|f| f.replace(false)) {
+        return Err(recover_repair_failure(
+            target,
+            &replacement,
+            &backup,
+            private,
+            &std::io::Error::from_raw_os_error(1176),
+        ));
+    }
+    #[cfg(test)]
     if FAIL_REPAIR_AFTER_BACKUP.with(|f| f.replace(false)) {
         std::fs::rename(target, &backup)
             .inspect_err(|_| {
@@ -546,7 +556,7 @@ fn recover_repair_failure(
     // clobbering a newer path. If restoration is impossible, keep both copies.
     match (target.try_exists(), backup.try_exists()) {
         (Ok(false), Ok(true)) if std::fs::hard_link(backup, target).is_ok() => {}
-        (Ok(true), Ok(false)) if !matches!(error.raw_os_error(), Some(1176 | 1177)) => {}
+        (Ok(true), Ok(false)) if error.raw_os_error() != Some(1177) => {}
         _ => {
             let recovery_dir = private.keep();
             let retained = recovery_dir.join("replacement");
@@ -570,4 +580,5 @@ fn recover_repair_failure(
 thread_local! {
     pub(crate) static FAIL_REPAIR_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static FAIL_REPAIR_AFTER_BACKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_REPAIR_WITH_ORIGINAL_INTACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
