@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -54,6 +56,10 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cargo test --release -p aerovault --lib review_windows_fresh_pair_inherits_destination_security_after_restart -- --nocapture
 
+      - name: Windows repair, verbatim path and recovery ACL regressions
+        if: matrix.os == 'windows-latest'
+        run: cargo test --release -p aerovault --lib round7_windows_ -- --nocapture
+
       - name: HFS+ filename and sidecar lock regression
         if: matrix.os == 'macos-latest'
         shell: bash
@@ -71,6 +77,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
         with:

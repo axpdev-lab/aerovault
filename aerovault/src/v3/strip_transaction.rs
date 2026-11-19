@@ -154,21 +154,23 @@ struct Journal {
     new_sidecar_permissions: Option<SavedPermissions>,
 }
 
-pub(super) struct PrivateDir {
+pub(crate) struct PrivateDir {
     path: PathBuf,
 }
 impl PrivateDir {
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
-pub(super) fn private_dir(parent: &Path, prefix: &str) -> Result<PrivateDir, String> {
+pub(crate) fn private_dir(parent: &Path, prefix: &str) -> Result<PrivateDir, String> {
     #[cfg(windows)]
     let path = {
         use rand::RngCore;
@@ -294,7 +296,20 @@ fn cleanup(path: &Path) -> Result<(), String> {
     let gc = private_dir(output_parent_dir(path), ".aerostrip-gc-")?;
     fs::remove_dir(gc.path()).map_err(|e| e.to_string())?;
     fs::rename(path, gc.path()).map_err(|e| e.to_string())?;
-    sync_dir(output_parent_dir(path))?;
+    #[cfg(test)]
+    let injected = FAIL_CLEANUP_SYNC.with(|fail| fail.replace(false));
+    #[cfg(not(test))]
+    let injected = false;
+    let synced = if injected {
+        Err("injected journal retirement sync failure".to_string())
+    } else {
+        sync_dir(output_parent_dir(path))
+    };
+    if let Err(error) = synced {
+        let mut gc = gc;
+        let retained = std::mem::take(&mut gc.path);
+        return Err(format!("journal retirement sync failed ({error}); relocated journal and rollback copies retained at {}", retained.display()));
+    }
     drop(gc);
     Ok(())
 }
@@ -363,7 +378,7 @@ fn conflict(path: &Path, reason: &str) -> String {
     format!("pending strip transaction conflicts ({reason}); files left untouched; preserve the vault, sidecar and rollback directory {}, then follow the pending-strip conflict procedure in AEROVAULT-V3-SPEC.md before reopening", path.display())
 }
 
-fn load(path: &Path, source: &Path) -> Result<(Journal, PathBuf), String> {
+fn read_journal(path: &Path) -> Result<Journal, String> {
     if !fs::symlink_metadata(path)
         .map_err(|e| e.to_string())?
         .file_type()
@@ -383,10 +398,16 @@ fn load(path: &Path, source: &Path) -> Result<(Journal, PathBuf), String> {
         .map_err(|e| e.to_string())?;
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid strip journal: {e}"))?;
+    if !matches!(journal.version, 1 | 2) {
+        return Err("unsupported strip journal version".into());
+    }
+    Ok(journal)
+}
+
+fn load(path: &Path, source: &Path) -> Result<(Journal, PathBuf), String> {
+    let journal = read_journal(path)?;
     let recorded = recorded_source(output_parent_dir(source), &journal.source_name)?;
-    if !matches!(journal.version, 1 | 2)
-        || (native_name(source) != journal.source_name && !same_existing_file(source, &recorded))
-    {
+    if native_name(source) != journal.source_name && !same_existing_file(source, &recorded) {
         return Err(
             "strip journal belongs to a different source name; reopen its original path"
                 .to_string(),
@@ -415,16 +436,22 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         .map_err(|e| conflict(path, &format!("vault unavailable: {e}")))?;
     let sidecar_now = generation_if_present(&sidecar)
         .map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
+    let original_pair = vault_now == journal.old_vault && sidecar_now == journal.old_sidecar;
+    if original_pair && path.join("new-vault").exists() && path.join("new-sidecar").exists() {
+        cleanup(path)?;
+        return Ok(RecoveryOutcome::Original);
+    }
     if vault_now == Some(journal.new_vault) && sidecar_now == Some(journal.new_sidecar) {
         // A crash can occur just after rename and before inheritance restoration.
-        restore_published_permissions(source, &sidecar, &journal, true)?;
+        restore_published_permissions(source, &sidecar, &journal, path)?;
         cleanup(path)?;
         return Ok(RecoveryOutcome::Stripped);
     }
-    if vault_now == journal.old_vault && sidecar_now == journal.old_sidecar {
-        restore_published_permissions(source, &sidecar, &journal, false)?;
-        cleanup(path)?;
-        return Ok(RecoveryOutcome::Original);
+    if original_pair {
+        return Err(conflict(
+            path,
+            "original bytes match after a replacement; security finalization is ambiguous",
+        ));
     }
     if ![journal.old_vault, Some(journal.new_vault)].contains(&vault_now)
         || ![journal.old_sidecar, Some(journal.new_sidecar)].contains(&sidecar_now)
@@ -491,32 +518,57 @@ fn restore_published_permissions(
     source: &Path,
     sidecar: &Path,
     journal: &Journal,
-    new_pair: bool,
+    marker: &Path,
 ) -> Result<(), String> {
-    if new_pair {
-        publish_security(
+    if !marker
+        .join("new-vault")
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        finish_security(
             source,
             journal
                 .new_vault_permissions
                 .as_ref()
                 .or(journal.old_vault_permissions.as_ref()),
+            marker,
+            "vault-security-done",
         )?;
-        publish_security(
+    }
+    if !marker
+        .join("new-sidecar")
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        finish_security(
             sidecar,
             journal
                 .new_sidecar_permissions
                 .as_ref()
                 .or(journal.old_sidecar_permissions.as_ref()),
+            marker,
+            "sidecar-security-done",
         )?;
-        return Ok(());
-    }
-    if let Some(permissions) = &journal.old_vault_permissions {
-        permissions.published(source)?;
-    }
-    if let Some(permissions) = &journal.old_sidecar_permissions {
-        permissions.published(sidecar)?;
     }
     Ok(())
+}
+
+// A durable completion marker prevents a later recovery from reinstalling
+// permissions that already completed, including later operator restrictions.
+fn finish_security(
+    path: &Path,
+    permissions: Option<&SavedPermissions>,
+    journal: &Path,
+    marker: &str,
+) -> Result<(), String> {
+    let done = journal.join(marker);
+    if done.try_exists().map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    publish_security(path, permissions)?;
+    let file = private_options().open(&done).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    sync_dir(journal)
 }
 
 fn publish_security(path: &Path, permissions: Option<&SavedPermissions>) -> Result<(), String> {
@@ -550,6 +602,13 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.to_string()),
         Ok(_) => {}
+    }
+    let journal = read_journal(&path)?;
+    let recorded = recorded_source(output_parent_dir(&source), &journal.source_name)?;
+    if native_name(&source) != journal.source_name && !same_existing_file(&source, &recorded) {
+        // Distinct case-sensitive files can share a folded lock/journal key.
+        // A read must not recover or wait for the other file's transaction.
+        return Ok(());
     }
     let lock = crate::lock::acquire_without_recovery(&source).map_err(|e| e.to_string())?;
     recover_under_guard(&lock)
@@ -638,12 +697,14 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
     }
     let result = (|| {
         fs::rename(path.join("new-vault"), source).map_err(|e| e.to_string())?;
-        publish_security(
+        finish_security(
             source,
             journal
                 .new_vault_permissions
                 .as_ref()
                 .or(journal.old_vault_permissions.as_ref()),
+            &path,
+            "vault-security-done",
         )?;
         sync_dir(output_parent_dir(source))?;
         #[cfg(test)]
@@ -655,12 +716,14 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
         if let Some(hook) = AFTER_STRIP_SECOND_RENAME.with(|h| h.borrow_mut().take()) {
             hook();
         }
-        publish_security(
+        finish_security(
             &sidecar,
             journal
                 .new_sidecar_permissions
                 .as_ref()
                 .or(journal.old_sidecar_permissions.as_ref()),
+            &path,
+            "sidecar-security-done",
         )?;
         #[cfg(test)]
         if FAIL_FINAL_SYNC.with(|fail| fail.replace(false)) {
@@ -677,7 +740,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
         return Err(match recover_locked(source, &path, lock) {
             Ok(RecoveryOutcome::Original) => format!("Could not publish stripped vault and sidecar ({error}); original vault restored"),
             Ok(RecoveryOutcome::Stripped) => format!("Strip publication completed, but final durability sync failed ({error}); stripped vault and refreshed sidecar remain, journal retired"),
-            Err(restore) => format!("Could not publish strip ({error}); recovery pending ({restore}); rollback copies retained in {}", path.display()),
+            Err(restore) => format!("Could not publish strip ({error}); recovery pending ({restore}); active journal, if still present: {}; preserve any relocated recovery material named above", path.display()),
         });
     }
     cleanup(&path)
@@ -685,6 +748,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static FAIL_CLEANUP_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FAIL_FINAL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static BEFORE_STRIP_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static AFTER_STRIP_JOURNAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };

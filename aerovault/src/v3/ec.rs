@@ -133,7 +133,7 @@ pub(super) fn legacy_sidecar_path(vault: &Path) -> Option<PathBuf> {
     (old != default_sidecar_path(vault)).then_some(old)
 }
 
-fn recovery_sidecar_path(vault: &Path) -> PathBuf {
+pub(super) fn recovery_sidecar_path(vault: &Path) -> PathBuf {
     let native = default_sidecar_path(vault);
     if std::fs::symlink_metadata(&native).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         if let Some(legacy) = legacy_sidecar_path(vault).filter(|p| p.exists()) {
@@ -853,24 +853,26 @@ pub(super) fn repair_vault(
             );
         }
 
-        let mut blocks: Vec<Vec<u8>> = ordered
-            .iter()
-            .map(|(_, rec)| {
-                let start = rec.data_offset as usize;
-                let full = 8 + rec.block_len as usize;
-                // Always a fixed-length (8 + block_len) buffer so the
-                // concatenated stream length matches what the parity was computed
-                // over, even when the block is truncated on disk: the missing tail
-                // is zero-padded here, flagged as damaged by its shard checksum,
-                // then reconstructed.
-                let mut buf = vec![0u8; full];
-                if start < vault.data.len() {
-                    let avail = (vault.data.len() - start).min(full);
-                    buf[..avail].copy_from_slice(&vault.data[start..start + avail]);
-                }
-                buf
-            })
-            .collect();
+        let mut blocks = zeroize::Zeroizing::new(
+            ordered
+                .iter()
+                .map(|(_, rec)| {
+                    let start = rec.data_offset as usize;
+                    let full = 8 + rec.block_len as usize;
+                    // Always a fixed-length (8 + block_len) buffer so the
+                    // concatenated stream length matches what the parity was computed
+                    // over, even when the block is truncated on disk: the missing tail
+                    // is zero-padded here, flagged as damaged by its shard checksum,
+                    // then reconstructed.
+                    let mut buf = vec![0u8; full];
+                    if start < vault.data.len() {
+                        let avail = (vault.data.len() - start).min(full);
+                        buf[..avail].copy_from_slice(&vault.data[start..start + avail]);
+                    }
+                    buf
+                })
+                .collect::<Vec<Vec<u8>>>(),
+        );
 
         let bad_indices: Vec<usize> = damaged
             .iter()
@@ -911,23 +913,30 @@ pub(super) fn repair_vault(
         if all_verified {
             repaired_count = bad_indices.len();
             if !dry_run {
-                let mut new_data = vec![];
+                let mut new_data = zeroize::Zeroizing::new(Vec::new());
                 let mut new_chunks = BTreeMap::new();
                 for (i, (id, mut rec)) in ordered.into_iter().enumerate() {
                     rec.data_offset = new_data.len() as u64;
                     if blocks[i].len() >= 8 {
                         rec.block_len = u64::from_le_bytes(blocks[i][0..8].try_into().unwrap());
                     }
+                    crate::secret::reserve(&mut new_data, blocks[i].len())
+                        .map_err(|e| e.to_string())?;
                     new_data.extend_from_slice(&blocks[i]);
                     new_chunks.insert(id, rec);
                 }
-                let old_data = std::mem::replace(&mut vault.data, new_data);
+                let mut old_data = zeroize::Zeroizing::new(std::mem::replace(
+                    &mut vault.data,
+                    std::mem::take(&mut *new_data),
+                ));
                 let old_chunks = std::mem::replace(&mut vault.manifest.chunks, new_chunks);
                 if let Err(error) = save_open_vault(vault) {
-                    vault.data = old_data;
+                    std::mem::swap(&mut vault.data, &mut *old_data);
                     vault.manifest.chunks = old_chunks;
+                    wipe_repair_discard(old_data);
                     return Err(error);
                 }
+                wipe_repair_discard(old_data);
             }
         }
         // else: reconstruction could not be verified -> leave the vault
@@ -1003,6 +1012,21 @@ pub(super) fn recover_header_from_sidecar(
     }
 }
 
+fn wipe_repair_discard(mut bytes: zeroize::Zeroizing<Vec<u8>>) {
+    use zeroize::Zeroize;
+    let len = bytes.len();
+    bytes.as_mut_slice().zeroize();
+    #[cfg(test)]
+    REPAIR_WIPES.with(|n| {
+        assert!(bytes.iter().all(|&b| b == 0));
+        n.set(n.get() + usize::from(len > 0));
+    });
+    #[cfg(not(test))]
+    let _ = len;
+}
+#[cfg(test)]
+thread_local! { static REPAIR_WIPES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// GAP-4 (detached): rebuild a corrupted encrypted manifest from the sidecar's
 /// manifest parity. Returns the rebuilt encrypted-manifest bytes; the caller
 /// proves correctness by a successful AEAD decrypt. `Ok(None)` when there is no
@@ -1038,7 +1062,7 @@ pub(super) fn reconstruct_manifest_from_sidecar(
 /// the password. Returns `(manifest_parity_present, header_parity_present)`;
 /// `(false, false)` when there is no sidecar or it cannot be parsed.
 fn sidecar_parity_flags(vault_path: &Path) -> (bool, bool) {
-    let sidecar_path = default_sidecar_path(vault_path);
+    let sidecar_path = recovery_sidecar_path(vault_path);
     match open_vault_sidecar(vault_path, &sidecar_path) {
         Ok(reader) => (
             reader
@@ -1156,15 +1180,18 @@ pub struct RecoveryStatus {
     pub any: bool,
     /// The detached sidecar carries manifest (locator) parity.
     pub manifest_parity: bool,
-    /// The detached sidecar carries header parity.
+    /// The physical, rotation-managed sidecar carries header parity.
     pub header_parity: bool,
 }
 
 /// Report the Error Correction recovery surfaces for a vault without the password.
 pub(super) fn recovery_status(path: &Path) -> Result<RecoveryStatus, String> {
     let embedded = has_error_correction(path).unwrap_or(false);
-    let detached = default_sidecar_path(path).exists();
-    let (manifest_parity, header_parity) = sidecar_parity_flags(path);
+    let (manifest_parity, _) = sidecar_parity_flags(path);
+    let header_parity = std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|p| sidecar_parity_flags(&p).1);
+    let detached = recovery_sidecar_path(path).exists() || header_parity;
     Ok(RecoveryStatus {
         embedded,
         detached,
@@ -3354,5 +3381,225 @@ mod tests {
             assert!(!tx::journal_path(&path).exists());
         }
         eprintln!("Windows fresh pair: private staging and destination inheritance after publication/restart verified");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn round7_status_header_parity_uses_physical_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("physical.aerovault");
+        let alias = dir.path().join("alias.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        VaultV3::export_parity(&alias, PW, None).unwrap();
+        let status = recovery_status(&alias).unwrap();
+        assert!(status.manifest_parity);
+        assert!(!status.header_parity);
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let status = recovery_status(&alias).unwrap();
+        assert!(status.manifest_parity && status.header_parity);
+    }
+
+    #[test]
+    fn round7_plaintext_repair_wipes_success_and_failed_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plaintext.aerozip");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&path),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        let mut v = VaultV3::open_plaintext(&path).unwrap();
+        seed_tree(&mut v, dir.path());
+        drop(v);
+        VaultV3::export_parity(&path, "", None).unwrap();
+        corrupt_data_section(&path, 32);
+        let mut v = VaultV3::open_plaintext(&path).unwrap();
+        let original = v.data.clone();
+        let chunks = v.manifest.chunks.clone();
+        let guard = crate::lock::acquire(&path).unwrap();
+        crate::lock::set_short_wait_for_this_thread();
+        REPAIR_WIPES.with(|n| n.set(0));
+        assert!(VaultV3::repair(&mut v, false, None).is_err());
+        assert_eq!(v.data, original);
+        assert_eq!(
+            serde_json::to_vec(&v.manifest.chunks).unwrap(),
+            serde_json::to_vec(&chunks).unwrap()
+        );
+        assert_eq!(REPAIR_WIPES.with(|n| n.get()), 1);
+        drop(guard);
+        REPAIR_WIPES.with(|n| n.set(0));
+        assert!(VaultV3::repair(&mut v, false, None).unwrap().0 > 0);
+        assert_eq!(REPAIR_WIPES.with(|n| n.get()), 1);
+        assert!(scrub_vault(&v).is_empty());
+    }
+
+    #[test]
+    fn round7_retirement_sync_failure_preserves_actual_backup_directory() {
+        use super::super::strip_transaction as tx;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retirement.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        tx::FAIL_CLEANUP_SYNC.with(|f| f.set(true));
+        let err = VaultV3::strip_parity(&path, PW, false).unwrap_err();
+        assert!(
+            err.contains("relocated journal and rollback copies retained at"),
+            "{err}"
+        );
+        let retained = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".aerostrip-gc-")
+            })
+            .unwrap();
+        assert!(err.contains(retained.to_str().unwrap()));
+        assert_eq!(std::fs::read(retained.join("old-vault")).unwrap(), before);
+        assert!(retained.join("old-sidecar").is_file());
+        assert!(retained.join("journal.json").is_file());
+        assert!(!tx::journal_path(&path).exists());
+        assert!(VaultV3::open(&path, PW).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round7_distinct_case_vault_read_ignores_foreign_pending_journal() {
+        const CHILD: &str = "AEROVAULT_CASE_JOURNAL_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            super::super::strip_transaction::AFTER_STRIP_JOURNAL
+                .with(|h| *h.borrow_mut() = Some(Box::new(|| std::process::exit(77))));
+            VaultV3::strip_parity(&path, PW, false).unwrap();
+            panic!("journal interruption seam not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("Vault.aerovault");
+        let second = dir.path().join("vault.aerovault");
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&first, PW),
+            RecoveryPlacement::Both,
+            20,
+        )
+        .unwrap();
+        if second.exists() {
+            return;
+        } // This case requires a case-sensitive volume.
+        VaultV3::export_parity(&first, PW, None).unwrap();
+        VaultV3::create(&CreateOptionsV3::new(&second, PW)).unwrap();
+        let bytes = std::fs::read(&second).unwrap();
+        let journal = super::super::strip_transaction::journal_path(&first);
+        assert_eq!(
+            journal,
+            super::super::strip_transaction::journal_path(&second)
+        );
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "v3::ec::tests::round7_distinct_case_vault_read_ignores_foreign_pending_journal",
+                "--nocapture",
+            ])
+            .env(CHILD, &first)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(77));
+        assert!(journal.is_dir());
+        assert!(VaultV3::open(&second, PW).is_ok());
+        assert!(journal.is_dir());
+        assert_eq!(std::fs::read(&second).unwrap(), bytes);
+        assert!(VaultV3::open(&first, PW).is_ok());
+        assert!(!journal.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_journal_only_recovery_preserves_current_acl() {
+        use super::super::{strip_transaction as tx, windows_security as acl};
+        const CHILD: &str = "AEROVAULT_ORIGINAL_ACL_CHILD";
+        if let Some(path) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let narrowed = path.clone();
+            let hook: Box<dyn FnOnce()> = Box::new(move || {
+                let dacl = if narrowed
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("deny-dac")
+                {
+                    "D:P(D;;WD;;;OW)(A;;FRSD;;;OW)(A;;FA;;;SY)"
+                } else {
+                    "D:P(D;;FR;;;BG)(A;;FA;;;OW)(A;;FA;;;SY)"
+                };
+                acl::apply(&narrowed, dacl, true).unwrap();
+                std::process::exit(77);
+            });
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("completed")
+            {
+                tx::AFTER_STRIP_SECOND_RENAME.with(|h| *h.borrow_mut() = Some(hook));
+            } else {
+                tx::AFTER_STRIP_JOURNAL.with(|h| *h.borrow_mut() = Some(hook));
+            }
+            VaultV3::strip_parity(&path, PW, false).unwrap();
+            panic!("journal interruption seam not reached");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        acl::apply(
+            dir.path(),
+            "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+            true,
+        )
+        .unwrap();
+        for name in ["deny-dac", "narrow-guest", "completed-narrow"] {
+            let path = dir.path().join(format!("{name}.aerovault"));
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&path, PW),
+                RecoveryPlacement::Both,
+                20,
+            )
+            .unwrap();
+            VaultV3::export_parity(&path, PW, None).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "v3::ec::tests::round7_windows_journal_only_recovery_preserves_current_acl",
+                    "--nocapture",
+                ])
+                .env(CHILD, &path)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(77));
+            let descriptor = acl::capture(&path).unwrap();
+            let interrupted_bytes = std::fs::read(&path).unwrap();
+            if name != "completed-narrow" {
+                assert_eq!(interrupted_bytes, before);
+            }
+            if name == "deny-dac" {
+                assert!(
+                    acl::apply(&path, &descriptor, true).is_err(),
+                    "fixture must deny WRITE_DAC"
+                );
+            } else {
+                assert_eq!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+            }
+            assert!(VaultV3::open(&path, PW).is_ok());
+            assert_eq!(std::fs::read(&path).unwrap(), interrupted_bytes);
+            assert_eq!(acl::capture(&path).unwrap(), descriptor);
+            assert!(!tx::journal_path(&path).exists());
+        }
+        eprintln!(
+            "Windows journal-only recovery: unchanged files retain narrowed and non-writable DACLs"
+        );
     }
 }

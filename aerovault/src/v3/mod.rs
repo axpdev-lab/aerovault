@@ -29,7 +29,7 @@ pub(crate) mod strip_transaction;
 pub mod telemetry;
 pub mod vault;
 #[cfg(windows)]
-mod windows_security;
+pub(crate) mod windows_security;
 
 pub use chunking::{chunk_ranges_with, gear_table, keyed_chunk_id, CdcBounds};
 pub use ec::{

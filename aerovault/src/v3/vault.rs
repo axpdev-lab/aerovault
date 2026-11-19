@@ -2211,6 +2211,7 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_IMPORT_IDENTITY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_OPEN_RECOVERY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -2488,6 +2489,16 @@ fn open_vault_with_guard(
     let (manifest, manifest_repaired_on_open) = match decode_manifest(&encrypted_manifest) {
         Ok(m) => (m, false),
         Err(orig) => {
+            let embedded_metadata = extensions.iter().any(|e| {
+                e.extension_id == super::constants::ERROR_CORRECTION_META_EXTENSION_ID
+                    && e.length > 0
+            });
+            let detached_metadata = super::ec::recovery_sidecar_path(&path).exists();
+            let pending_pair = super::strip_transaction::journal_path(&path).exists();
+            if recovery_guard.is_none() && !embedded_metadata && !detached_metadata && !pending_pair
+            {
+                return Err(orig);
+            }
             if recovery_guard.is_none() {
                 // The retry reads another complete data section. Release this
                 // attempt's payload and metadata before acquiring/reopening.
@@ -3019,6 +3030,12 @@ fn add_directory_into(
     {
         if entry.path() == source {
             continue;
+        }
+        #[cfg(test)]
+        if entry.file_type().is_file() {
+            if let Some(hook) = BEFORE_IMPORT_IDENTITY.with(|h| h.borrow_mut().take()) {
+                hook();
+            }
         }
         if entry.file_type().is_file()
             && (lock.holds_file(entry.path()).map_err(|e| e.to_string())?
@@ -5775,5 +5792,58 @@ mod tests {
                 }
             }
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn round7_import_retyped_fifo_is_rejected_on_deadline() {
+        use crate::source::fifo_test;
+        if let Some(dir) = fifo_test::child_path() {
+            let path = dir.join("vault.aerozip");
+            VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+            let mut v = VaultV3::open_plaintext(&path).unwrap();
+            let ready = dir.clone();
+            BEFORE_IMPORT_IDENTITY
+                .with(|h| *h.borrow_mut() = Some(Box::new(move || fifo_test::ready(&ready))));
+            let error = VaultV3::add_directory(&mut v, &dir.join("input"), None).unwrap_err();
+            assert!(error.contains("Not a regular file"), "{error}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        std::fs::create_dir(&input).unwrap();
+        let file = input.join("candidate");
+        std::fs::write(&file, b"before type change").unwrap();
+        let name = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+        assert!(fifo_test::run(
+            "v3::vault::tests::round7_import_retyped_fifo_is_rejected_on_deadline",
+            dir.path(),
+            "identity",
+            || {
+                std::fs::remove_file(&file).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+        ));
+    }
+
+    #[test]
+    fn round7_manifest_without_recovery_does_not_retry_under_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-recovery.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        let v = VaultV3::open(&path, PW).unwrap();
+        let at = v.header.manifest_offset as usize;
+        drop(v);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[at + 4] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let original = VaultV3::open(&path, PW).unwrap_err();
+        let guard = crate::lock::acquire(&path).unwrap();
+        crate::lock::set_short_wait_for_this_thread();
+        crate::lock::take_trace();
+        GENERATION_READS.with(|n| n.set(0));
+        assert_eq!(VaultV3::open(&path, PW).unwrap_err(), original);
+        assert_eq!(GENERATION_READS.with(|n| n.get()), 1);
+        assert!(!crate::lock::take_trace().contains(&"lock"));
+        drop(guard);
     }
 }

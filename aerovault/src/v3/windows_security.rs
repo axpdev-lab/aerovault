@@ -162,7 +162,7 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
-pub(super) fn capture(path: &Path) -> Result<String, String> {
+pub(crate) fn capture(path: &Path) -> Result<String, String> {
     let path = wide(path);
     let mut needed = 0;
     unsafe {
@@ -242,7 +242,7 @@ unsafe fn decode_sddl_buffer(text: *const u16, capacity: usize) -> Result<String
 
 /// Seal inheritance while a file is staged under a different parent. After
 /// publication restore the original inheritance setting at its original parent.
-pub(super) fn apply(path: &Path, sddl: &str, staging: bool) -> Result<(), String> {
+pub(crate) fn apply(path: &Path, sddl: &str, staging: bool) -> Result<(), String> {
     if sddl.len() > 65536 || sddl.contains('\0') {
         return Err("Invalid bounded file DACL text".to_string());
     }
@@ -358,7 +358,7 @@ pub(super) fn create_private_directory(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn guest_effective_rights(path: &Path) -> Result<u32, String> {
+pub(crate) fn guest_effective_rights(path: &Path) -> Result<u32, String> {
     #[repr(C)]
     struct Trustee {
         multiple: *mut c_void,

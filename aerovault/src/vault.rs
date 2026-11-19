@@ -2250,10 +2250,10 @@ mod tests {
 
     #[test]
     fn test_is_vault_negative() {
-        let path = std::env::temp_dir().join("not-a-vault.txt");
-        std::fs::write(&path, b"just text").ok();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-vault.txt");
+        std::fs::write(&path, b"just text").unwrap();
         assert!(!Vault::is_vault(&path));
-        crate::lock::remove_vault_and_lock(&path);
 
         assert!(!Vault::is_vault("/nonexistent/path"));
     }

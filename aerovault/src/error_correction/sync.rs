@@ -483,7 +483,13 @@ pub fn verify_repair_sync_file(
     // ONLY if the whole repaired stream hashes to the expected value. Bounded memory
     // (one window at a time); all-or-nothing (a failed verify leaves the original intact).
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+    #[cfg(windows)]
+    let private = crate::v3::strip_transaction::private_dir(parent, ".aerorepair-private-")?;
+    #[cfg(windows)]
+    let stage_parent = private.path();
+    #[cfg(not(windows))]
+    let stage_parent = parent;
+    let tmp = tempfile::NamedTempFile::new_in(stage_parent).map_err(|e| {
         format!(
             "create AeroSync EC repair temp in {}: {e}",
             parent.display()
@@ -532,13 +538,22 @@ pub fn verify_repair_sync_file(
             .map_err(|e| e.to_string())?
             .permissions();
         std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let descriptor = crate::v3::windows_security::capture(locked_path)?;
+        #[cfg(windows)]
+        crate::v3::windows_security::apply(tmp.path(), &descriptor, true)?;
         tmp.as_file().sync_all().map_err(|e| e.to_string())?;
         crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
                 path.display()
             )
-        })
+        })?;
+        #[cfg(windows)]
+        crate::v3::windows_security::apply(locked_path, &descriptor, false).map_err(|e| {
+            format!("Repaired file committed, but restoring destination DACL failed: {e}")
+        })?;
+        Ok(())
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
@@ -623,7 +638,13 @@ fn repair_streamed(
     // the original ONLY if the whole repaired stream hashes to the expected value.
     // Bounded memory (one window + its parity); all-or-nothing.
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+    #[cfg(windows)]
+    let private = crate::v3::strip_transaction::private_dir(parent, ".aerorepair-private-")?;
+    #[cfg(windows)]
+    let stage_parent = private.path();
+    #[cfg(not(windows))]
+    let stage_parent = parent;
+    let tmp = tempfile::NamedTempFile::new_in(stage_parent).map_err(|e| {
         format!(
             "create AeroSync EC repair temp in {}: {e}",
             parent.display()
@@ -681,13 +702,22 @@ fn repair_streamed(
             .map_err(|e| e.to_string())?
             .permissions();
         std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let descriptor = crate::v3::windows_security::capture(locked_path)?;
+        #[cfg(windows)]
+        crate::v3::windows_security::apply(tmp.path(), &descriptor, true)?;
         tmp.as_file().sync_all().map_err(|e| e.to_string())?;
         crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
             format!(
                 "persist repaired AeroSync EC target {}: {e}",
                 path.display()
             )
-        })
+        })?;
+        #[cfg(windows)]
+        crate::v3::windows_security::apply(locked_path, &descriptor, false).map_err(|e| {
+            format!("Repaired file committed, but restoring destination DACL failed: {e}")
+        })?;
+        Ok(())
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
@@ -1589,5 +1619,113 @@ mod tests {
                 0o600
             );
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn round7_generate_pins_alias_before_progress() {
+        for parent_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            std::fs::create_dir(&a).unwrap();
+            std::fs::create_dir(&b).unwrap();
+            std::fs::write(a.join("payload"), sample_data(40_000)).unwrap();
+            std::fs::copy(a.join("payload"), b.join("payload")).unwrap();
+            let alias = dir.path().join("alias");
+            let (first, next, input) = if parent_link {
+                (a, b, alias.join("payload"))
+            } else {
+                (a.join("payload"), b.join("payload"), alias.clone())
+            };
+            std::os::unix::fs::symlink(first, &alias).unwrap();
+            let out = dir.path().join("recovery");
+            std::fs::write(&out, b"keep prior parity").unwrap();
+            let mut changed = false;
+            let err = super::super::correct_generate_with_progress(
+                input.to_str().unwrap(),
+                20,
+                Some(out.to_str().unwrap()),
+                &mut |_, _| {
+                    if !changed {
+                        std::fs::remove_file(&alias).unwrap();
+                        std::os::unix::fs::symlink(&next, &alias).unwrap();
+                        changed = true;
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(changed);
+            assert!(err.contains("changed target"), "{err}");
+            assert_eq!(std::fs::read(out).unwrap(), b"keep prior parity");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_repair_keeps_stage_and_target_restricted() {
+        use crate::v3::windows_security as acl;
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            acl::apply(
+                dir.path(),
+                "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+                true,
+            )
+            .unwrap();
+            let path = dir.path().join("private.bin");
+            let data = sample_data(40_000);
+            let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let parity = dir.path().join("recovery");
+            std::fs::write(&parity, &g.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[5000] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            acl::apply(&path, "D:P(D;;FR;;;BG)(A;;FA;;;OW)(A;;FA;;;SY)", true).unwrap();
+            let guard = crate::lock::acquire(&path).unwrap();
+            let target = path.clone();
+            let sidecar = parity.clone();
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let worker = scope.spawn(move || {
+                    crate::lock::ON_LOCK_CONTENTION
+                        .with(|h| *h.borrow_mut() = Some(Box::new(move || tx.send(()).unwrap())));
+                    if streamed {
+                        verify_repair_sync_file_streamed("rel", &g.file_sha256, &target, &sidecar)
+                    } else {
+                        verify_repair_sync_file("rel", &g.file_sha256, &target, &g.sidecar_bytes)
+                    }
+                });
+                let waiting = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+                if waiting {
+                    let private = std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| {
+                            p.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".aerorepair-private-")
+                        })
+                        .unwrap();
+                    assert_eq!(acl::guest_effective_rights(&private).unwrap() & 1, 0);
+                    let stage = std::fs::read_dir(private)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    assert_eq!(acl::guest_effective_rights(&stage).unwrap() & 1, 0);
+                }
+                drop(guard);
+                assert!(waiting, "repair never waited for held source guard");
+                assert!(matches!(
+                    worker.join().unwrap().unwrap(),
+                    SyncEcRepairResult::Repaired { .. }
+                ));
+            });
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+            assert_eq!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+        }
+        eprintln!("Windows repair: second-principal read denied during contention and after both repair publications");
     }
 }

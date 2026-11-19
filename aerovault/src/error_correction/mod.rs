@@ -757,12 +757,13 @@ pub fn correct_generate_with_progress(
     if let Some(out) = out {
         crate::lock::refuse_destination(Path::new(out), path).map_err(|e| e.to_string())?;
     }
+    let locked = std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
     let rel = rel_name(file);
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
     // it even for tiny files (the gate is a sync-pipeline opt-in, not a CLI-of-one concern).
     let result = sync::generate_sync_sidecar_for_file_capped_with_progress(
         &rel,
-        path,
+        &locked,
         pct,
         sync::AEROSYNC_EC_MAX_FILE_SIZE,
         0,
@@ -792,7 +793,6 @@ pub fn correct_generate_with_progress(
     // `file` may be a link: the sidecar goes next to the link, as before, but
     // the lock and the check are those of the file it names, so a link to a
     // vault shares that vault's lock. Nothing is written over the link itself.
-    let locked = std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
     {
         #[cfg(test)]
         sync::run_hook(&sync::BEFORE_WRITE_LOCK);
