@@ -52,16 +52,17 @@ use crate::aerocrypt::{
 // trailing bytes accepted from existing containers.
 pub(super) const MAX_GENERATION_EXTENT: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
+const DATA_BUDGET_ENV: &str = "AEROVAULT_V3_DATA_BUDGET_BYTES";
 
 fn data_budget() -> u64 {
     #[cfg(test)]
     if let Some(limit) = TEST_DATA_BUDGET.with(|limit| limit.get()) {
         return limit;
     }
-    std::env::var("AEROVAULT_V3_DATA_BUDGET_BYTES")
+    std::env::var(DATA_BUDGET_ENV)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|&size| (DEFAULT_DATA_BUDGET..MAX_GENERATION_EXTENT).contains(&size))
+        .filter(|&size| (DEFAULT_DATA_BUDGET..=isize::MAX as u64).contains(&size))
         .unwrap_or(DEFAULT_DATA_BUDGET)
 }
 
@@ -71,6 +72,14 @@ fn ensure_data_budget(size: u64) -> Result<(), String> {
         return Err(format!(
             "Vault data section exceeds the {budget}-byte in-memory open budget"
         ));
+    }
+    Ok(())
+}
+
+fn ensure_write_data_budget(size: u64) -> Result<(), String> {
+    ensure_data_budget(size)?;
+    if size > MAX_GENERATION_EXTENT - DATA_OFFSET {
+        return Err("Vault data exceeds the 4 GiB write generation budget".into());
     }
     Ok(())
 }
@@ -1118,7 +1127,7 @@ fn ingest_chunk(
             .checked_add(8)
             .and_then(|start| start.checked_add(enc))
             .ok_or("Vault data length overflow")?;
-        ensure_data_budget(end)?;
+        ensure_write_data_budget(end)?;
         vault
             .data
             .try_reserve(encrypted.len() + 8)
@@ -2862,7 +2871,7 @@ pub(super) fn save_locked_to(
     lock: &WriteLock,
     target: &Path,
 ) -> Result<(), String> {
-    ensure_data_budget(vault.data.len() as u64)?;
+    ensure_write_data_budget(vault.data.len() as u64)?;
     if !lock.covers_namespace(&vault.path) {
         return Err("source lock namespace changed; retry operation".to_string());
     }
@@ -6290,6 +6299,76 @@ mod tests {
         assert_eq!(
             std::fs::metadata(path).unwrap().len(),
             MAX_GENERATION_EXTENT + 1
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires a 64-bit host and 5 GiB of available memory; set AEROVAULT_V3_DATA_BUDGET_BYTES=4294975488"]
+    fn round13_explicit_budget_reads_a_legacy_data_section_over_four_gib() {
+        use super::super::manifest::serialize_manifest_plaintext;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerozip");
+        let input = dir.path().join("input");
+        let payload = b"referenced block beyond 4 GiB";
+        std::fs::write(&input, payload).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input.clone(), "input".into())]).unwrap();
+
+        // Write the ordinary v3 layout accepted by 0.6.8. The data section
+        // is sparse, with a live block past 4 GiB and the manifest after it.
+        let block_offset = MAX_GENERATION_EXTENT + 4096;
+        assert_eq!(vault.manifest.chunks.len(), 1);
+        vault
+            .manifest
+            .chunks
+            .values_mut()
+            .next()
+            .unwrap()
+            .data_offset = block_offset;
+        let manifest = serialize_manifest_plaintext(&vault.manifest).unwrap();
+        let mut header = vault.header.clone();
+        header.data_len = block_offset + vault.data.len() as u64;
+        header.manifest_offset = header.data_offset + header.data_len;
+        header.manifest_len = manifest.len() as u64;
+        header.extension_dir_offset = header.manifest_offset + header.manifest_len;
+        header.extension_dir_len = 2;
+        header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
+        header.extension_payload_len = 0;
+        header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&header.to_bytes()).unwrap();
+        file.seek(std::io::SeekFrom::Start(header.data_offset + block_offset))
+            .unwrap();
+        file.write_all(&vault.data).unwrap();
+        file.write_all(&manifest).unwrap();
+        file.write_all(b"[]").unwrap();
+        drop(file);
+        drop(vault);
+
+        TEST_DATA_BUDGET.with(|limit| limit.set(Some(DEFAULT_DATA_BUDGET)));
+        let default_result = VaultV3::open_plaintext(&path);
+        TEST_DATA_BUDGET.with(|limit| limit.set(None));
+        assert!(default_result
+            .unwrap_err()
+            .contains("in-memory open budget"));
+        assert!(data_budget() >= header.data_len);
+
+        crate::lock::take_trace();
+        let mut opened = VaultV3::open_plaintext(&path).unwrap();
+        assert_eq!(opened.data.len() as u64, header.data_len);
+        assert!(!crate::lock::take_trace().contains(&"generation"));
+        let output = dir.path().join("output");
+        VaultV3::extract_entry(&opened, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), payload);
+        let error = VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap_err();
+        assert!(error.contains("write generation budget"), "{error}");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            header.extension_payload_offset
         );
     }
 
