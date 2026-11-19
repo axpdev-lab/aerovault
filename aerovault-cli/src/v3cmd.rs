@@ -105,6 +105,10 @@ pub enum VaultCommands {
         /// Specific entry to extract (omit for all).
         #[arg(short, long)]
         entry: Option<String>,
+
+        /// Explicitly open an unencrypted plaintext-lane archive; no password is read.
+        #[arg(long)]
+        plaintext: bool,
     },
 
     /// Create a directory inside a vault.
@@ -255,7 +259,8 @@ pub fn run(command: VaultCommands, json: bool) -> CliResult {
             vault,
             output,
             entry,
-        } => cmd_extract(&vault, &output, entry.as_deref(), json),
+            plaintext,
+        } => cmd_extract(&vault, &output, entry.as_deref(), plaintext, json),
         VaultCommands::Mkdir { vault, name } => cmd_mkdir(&vault, &name, json),
         VaultCommands::Remove {
             vault,
@@ -449,8 +454,21 @@ fn cmd_add_dir(vault: &Path, source: &Path, prefix: Option<&str>, json: bool) ->
     Ok(())
 }
 
-fn cmd_extract(vault: &Path, output: &Path, entry: Option<&str>, json: bool) -> CliResult {
-    let v = unlock(vault)?;
+fn cmd_extract(
+    vault: &Path,
+    output: &Path,
+    entry: Option<&str>,
+    plaintext: bool,
+    json: bool,
+) -> CliResult {
+    let v = if plaintext {
+        VaultV3::open_plaintext(vault)?
+    } else {
+        unlock(vault)?
+    };
+    // The CLI's output is a directory, including for a selected entry. Open
+    // and validate the archive before creating any destination on disk.
+    std::fs::create_dir_all(output)?;
     if let Some(name) = entry {
         let pb = spinner("Extracting...");
         let dest = VaultV3::extract_entry(&v, name, output)?;
@@ -782,5 +800,37 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    #[test]
+    fn plaintext_extract_requires_explicit_selection() {
+        for (args, expected) in [
+            (
+                vec!["aerovault", "vault", "extract", "archive.aerozip"],
+                false,
+            ),
+            (
+                vec![
+                    "aerovault",
+                    "vault",
+                    "extract",
+                    "archive.aerozip",
+                    "--plaintext",
+                ],
+                true,
+            ),
+        ] {
+            let parsed = crate::Cli::try_parse_from(args).unwrap();
+            match parsed.command {
+                crate::Commands::Vault {
+                    command: super::VaultCommands::Extract { plaintext, .. },
+                } => assert_eq!(plaintext, expected),
+                _ => panic!("wrong command"),
+            }
+        }
     }
 }

@@ -75,6 +75,8 @@ pub(crate) fn derive_key(
         .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
+    #[cfg(test)]
+    crate::lock::trace("derive");
     let mut key = vec![0u8; 32];
     argon2
         .hash_password_into(password.expose_secret().as_bytes(), salt, &mut key)

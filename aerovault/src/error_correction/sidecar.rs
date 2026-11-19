@@ -27,10 +27,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::ERROR_CORRECTION_SHARD_CKSUM_LEN;
-use super::{
-    error_correction_grid, ERROR_CORRECTION_MAX_PCT, ERROR_CORRECTION_MAX_SHARD,
-    ERROR_CORRECTION_MIN_SHARD,
-};
+use super::{error_correction_grid, ERROR_CORRECTION_MAX_SHARD, ERROR_CORRECTION_MIN_SHARD};
 
 /// Magic for a unified detached recovery file: "AEROCORR".
 pub const AEROCORRECT_MAGIC: &[u8; 8] = b"AEROCORR";
@@ -593,8 +590,8 @@ fn avec_len_for_checked(content_len: u64, pct: u32) -> Option<u64> {
 }
 
 fn validate_segment_avec_len(window_len: u64, avec_len: u64) -> Result<(), String> {
-    let max_len = avec_len_for_checked(window_len, ERROR_CORRECTION_MAX_PCT)
-        .ok_or("aerocorrect sidecar segment AVEC length geometry overflows")?;
+    let max_len = super::parity_payload_bound(window_len)
+        .map_err(|e| format!("aerocorrect sidecar segment AVEC length geometry: {e}"))?;
     if avec_len > max_len {
         return Err(format!(
             "aerocorrect sidecar segment AVEC length {avec_len} exceeds maximum {max_len} for window length {window_len}"
@@ -706,7 +703,7 @@ pub(crate) struct AeroCorrectSegmentRef {
     pub(crate) window_offset: u64,
     pub(crate) window_len: u64,
     avec_file_offset: u64,
-    avec_len: u64,
+    pub(crate) avec_len: u64,
     geom: Option<[u8; GEOM_LEN]>,
 }
 
@@ -724,14 +721,70 @@ pub(crate) struct AeroCorrectSidecarReader {
     segments: Vec<AeroCorrectSegmentRef>,
 }
 
+/// Caller geometry limits are enforced before allocating any locator or scanning
+/// a legacy checksum. The generic reader retains a fixed locator-memory cap.
+#[derive(Clone, Copy)]
+pub(crate) struct SidecarReadLimits {
+    pub(crate) segments: usize,
+    pub(crate) file_len: u64,
+}
+
+impl SidecarReadLimits {
+    pub(crate) fn vault(payload_len: u64) -> Result<Self, String> {
+        let v1 = HEADER_LEN + 3 * SEGMENT_HEADER_LEN + CHECKSUM_LEN;
+        let v2 = V2_PREFIX_LEN
+            + DIRECTORY_COPIES * (DIR_FIXED_LEN + 3 * DIR_PER_SEG_LEN + COPY_CKSUM_LEN);
+        Ok(Self {
+            segments: 3,
+            file_len: payload_len
+                .checked_add(v1.max(v2) as u64)
+                .ok_or("sidecar size overflow")?,
+        })
+    }
+}
+
 impl AeroCorrectSidecarReader {
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        let mut file = File::open(path)
+        Self::open_bounded(
+            path,
+            SidecarReadLimits {
+                segments: MAX_DIRECTORY_REGION / std::mem::size_of::<AeroCorrectSegmentRef>(),
+                file_len: u64::MAX,
+            },
+        )
+    }
+
+    pub(crate) fn open_bounded(path: &Path, limits: SidecarReadLimits) -> Result<Self, String> {
+        #[cfg(test)]
+        crate::lock::trace("open correction sidecar");
+        let file = crate::source::open_regular(path)
             .map_err(|e| format!("open aerocorrect sidecar {}: {e}", path.display()))?;
+        Self::parse_file(file, limits, limits.file_len)
+    }
+
+    pub(crate) fn open_automatic_destination(file: File) -> Result<Self, String> {
+        Self::parse_file(
+            file,
+            SidecarReadLimits {
+                segments: 1024,
+                file_len: u64::MAX,
+            },
+            1024 * 1024 * 1024,
+        )
+    }
+
+    fn parse_file(
+        mut file: File,
+        limits: SidecarReadLimits,
+        legacy_max: u64,
+    ) -> Result<Self, String> {
         let file_len = file
             .metadata()
-            .map_err(|e| format!("stat aerocorrect sidecar {}: {e}", path.display()))?
+            .map_err(|e| format!("stat aerocorrect sidecar: {e}"))?
             .len();
+        if file_len > limits.file_len {
+            return Err("aerocorrect sidecar exceeds expected file-size bound".to_string());
+        }
         if file_len < (AEROCORRECT_MAGIC.len() + 1) as u64 {
             return Err("aerocorrect sidecar too short".to_string());
         }
@@ -742,17 +795,30 @@ impl AeroCorrectSidecarReader {
             return Err("bad aerocorrect sidecar magic".to_string());
         }
         match prefix[AEROCORRECT_MAGIC.len()] {
-            AEROCORRECT_VERSION => Self::open_v2(file, file_len),
-            AEROCORRECT_VERSION_V1 => Self::open_v1(file, file_len),
+            AEROCORRECT_VERSION => Self::open_v2(file, file_len, limits),
+            AEROCORRECT_VERSION_V1 if file_len > legacy_max => {
+                Err("legacy aerocorrect sidecar exceeds expected file-size bound".into())
+            }
+            AEROCORRECT_VERSION_V1 => Self::open_v1(file, file_len, limits),
             version => Err(format!("unsupported aerocorrect sidecar version {version}")),
         }
+    }
+
+    pub(crate) fn has_standalone_tiling(&self) -> bool {
+        validate_window_tiling_iter(
+            self.segments
+                .iter()
+                .map(|s| (s.window_offset, s.window_len)),
+            self.total_len,
+        )
+        .is_ok()
     }
 
     /// Streaming open of the self-healing v2 framing: read only the prefix and the (tiny)
     /// directory-copies region into memory, recover the locator, and build segment refs
     /// pointing at the on-disk parity. The parity bytes are never loaded here, so memory
     /// stays bounded to the locator regardless of file size.
-    fn open_v2(mut file: File, file_len: u64) -> Result<Self, String> {
+    fn open_v2(mut file: File, file_len: u64, limits: SidecarReadLimits) -> Result<Self, String> {
         if file_len < V2_PREFIX_LEN as u64 {
             return Err("aerocorrect sidecar too short".to_string());
         }
@@ -765,7 +831,7 @@ impl AeroCorrectSidecarReader {
 
         let mut last_err = "aerocorrect sidecar directory unrecoverable".to_string();
         for n in candidate_counts(&counts) {
-            if n == 0 {
+            if n == 0 || n as usize > limits.segments {
                 continue;
             }
             let layout = match V2Layout::for_count(n as usize, file_len) {
@@ -821,7 +887,7 @@ impl AeroCorrectSidecarReader {
     }
 
     /// Streaming open of the legacy v1 framing (wholesale-checksum envelope, read-only).
-    fn open_v1(mut file: File, file_len: u64) -> Result<Self, String> {
+    fn open_v1(mut file: File, file_len: u64, limits: SidecarReadLimits) -> Result<Self, String> {
         if file_len < (HEADER_LEN + CHECKSUM_LEN) as u64 {
             return Err("aerocorrect sidecar too short".to_string());
         }
@@ -842,6 +908,9 @@ impl AeroCorrectSidecarReader {
         let total_len = u64::from_le_bytes(header[off..off + 8].try_into().unwrap());
         off += 8;
         let segment_count = u32::from_le_bytes(header[off..off + 4].try_into().unwrap()) as usize;
+        if segment_count > limits.segments {
+            return Err("aerocorrect sidecar exceeds expected segment-count bound".to_string());
+        }
         if segment_count == 0 {
             return Err("aerocorrect sidecar has no segments".to_string());
         }
@@ -939,6 +1008,14 @@ impl AeroCorrectSidecarReader {
     /// the in-payload geometry header is healed from the directory's protected copy before
     /// the bytes are returned, so a rotted header cannot block reconstruction.
     pub(crate) fn read_segment_avec(&mut self, index: usize) -> Result<Vec<u8>, String> {
+        self.read_segment_avec_bounded(index, usize::MAX)
+    }
+
+    pub(crate) fn read_segment_avec_bounded(
+        &mut self,
+        index: usize,
+        max: usize,
+    ) -> Result<Vec<u8>, String> {
         let seg = *self
             .segments
             .get(index)
@@ -946,6 +1023,9 @@ impl AeroCorrectSidecarReader {
         let off = seg.avec_file_offset;
         let len = usize::try_from(seg.avec_len)
             .map_err(|_| "aerocorrect segment length exceeds usize".to_string())?;
+        if len > max {
+            return Err("aerocorrect parity exceeds expected recovery geometry".to_string());
+        }
         self.file
             .seek(SeekFrom::Start(off))
             .map_err(|e| format!("seek aerocorrect segment avec: {e}"))?;
@@ -1381,8 +1461,8 @@ mod tests {
 
     #[test]
     fn rejects_segment_avec_len_above_window_max_before_reading_payload() {
-        let max_avec = avec_len_for(1, ERROR_CORRECTION_MAX_PCT);
-        // A directory claiming an AVEC longer than any legal payload for its window is
+        let max_avec = super::super::parity_payload_bound(1).unwrap();
+        // A directory claiming an AVEC beyond the monotone allocation bound is
         // rejected by `validate_segment_avec_len` before the payload is materialized.
         let oversize = AeroCorrectSidecar::new(
             sha256(&[0u8]),
@@ -1406,5 +1486,80 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.contains("exceeds maximum"), "got: {err}");
+    }
+
+    #[test]
+    fn review_vault_limits_precede_legacy_allocation_and_checksum_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse-v1.aerocorrect");
+        let sc = single_segment(&sample(128), 20);
+        let valid = v1_encode(&sc);
+        std::fs::write(&path, &valid).unwrap();
+        let limits =
+            SidecarReadLimits::vault(sc.segments.iter().map(|s| s.avec_bytes.len() as u64).sum())
+                .unwrap();
+        let mut reader = AeroCorrectSidecarReader::open_bounded(&path, limits).unwrap();
+        assert_eq!(
+            reader.read_segment_avec(0).unwrap(),
+            sc.segments[0].avec_bytes
+        );
+        let mut hostile = valid[..HEADER_LEN].to_vec();
+        hostile[HEADER_LEN - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, hostile).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(limits.file_len + 1).unwrap();
+        drop(file);
+        let error = AeroCorrectSidecarReader::open_bounded(&path, limits)
+            .err()
+            .unwrap();
+        assert!(error.contains("file-size bound"), "{error}");
+        // A loose file cap still cannot turn a hostile v1 count into allocation.
+        let error = AeroCorrectSidecarReader::open_bounded(
+            &path,
+            SidecarReadLimits {
+                segments: 3,
+                file_len: u64::MAX,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("segment-count bound"), "{error}");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_sparse_legacy_sidecar_is_rejected_without_scanning() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse.aerocorrect");
+        let sc = single_segment(&sample(128), 20);
+        std::fs::write(&path, v1_encode(&sc)).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(1u64 << 40).unwrap();
+        assert!(file.metadata().unwrap().blocks() * 512 < 1024 * 1024);
+        drop(file);
+        let limits = SidecarReadLimits::vault(1 << 20).unwrap();
+        let error = AeroCorrectSidecarReader::open_bounded(&path, limits)
+            .err()
+            .unwrap();
+        assert!(error.contains("file-size bound"), "{error}");
+    }
+    #[test]
+    fn review_partial_shards_round_trip_below_fifty_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [16_384, 16_385] {
+            for pct in [20, 50] {
+                let sc = single_segment(&sample(len), pct);
+                for bytes in [v1_encode(&sc), sc.to_bytes()] {
+                    assert_eq!(AeroCorrectSidecar::from_bytes(&bytes).unwrap(), sc);
+                    let path = dir.path().join("partial.aerocorrect");
+                    std::fs::write(&path, &bytes).unwrap();
+                    let mut reader = AeroCorrectSidecarReader::open(&path).unwrap();
+                    assert_eq!(
+                        reader.read_segment_avec(0).unwrap(),
+                        sc.segments[0].avec_bytes
+                    );
+                }
+            }
+        }
     }
 }

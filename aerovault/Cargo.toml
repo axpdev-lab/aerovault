@@ -2,6 +2,7 @@
 name = "aerovault"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -22,10 +23,13 @@ test-vectors = []
 # creates and opens thousands of vaults does not spend its time in the KDF.
 # A vault written under this feature cannot be opened by a production build
 # (the profile is a format constant, not a header field), which is the point:
-# it is refused at compile time in any non-debug build. Never ship it.
+# it is refused at compile time whenever debug assertions are off (every
+# standard release build; a profile that turns debug assertions on is not
+# covered). Never ship it.
 fast-kdf-for-tests = []
 
 [dependencies]
+same-file = { workspace = true }
 aes-gcm-siv = { workspace = true }
 aes-kw = { workspace = true }
 aes-siv = { workspace = true }
@@ -48,3 +52,5 @@ walkdir = { workspace = true }
 hkdf = { workspace = true }
 zeroize = { workspace = true }
 libc = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-casefold = { workspace = true }

@@ -9,7 +9,6 @@
 //! both route here (M7 convergence: the app no longer keeps a forked copy). Sidecar bytes
 //! are byte-identical to the app's prior output (cross-impl golden T5).
 use sha2::{Digest, Sha256};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -279,8 +278,8 @@ fn generate_sync_sidecar_for_file_capped_windowed(
             });
         }
     }
-    let mut file =
-        File::open(path).map_err(|e| format!("open AeroSync EC source {}: {e}", path.display()))?;
+    let mut file = crate::source::open_regular(path)
+        .map_err(|e| format!("open AeroSync EC source {}: {e}", path.display()))?;
     let (k, p) = error_correction_grid(pct);
     let mut hasher = Sha256::new();
     let mut segments = Vec::new();
@@ -375,11 +374,21 @@ pub fn verify_repair_sync_bytes(
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
 
+#[cfg(test)]
+thread_local! { pub(crate) static HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Stream a file and return its SHA-256 with bounded memory (one `HASH_READ_CHUNK`
 /// buffer at a time). Shared by the verify fast path and the standalone verify.
 fn hash_file_streaming(path: &Path) -> Result<[u8; 32], String> {
-    let mut file =
-        File::open(path).map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
+    let mut file = crate::source::open_regular(path)
+        .map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
+    hash_open_file(&mut file, path)
+}
+
+fn hash_open_file(file: &mut impl Read, path: &Path) -> Result<[u8; 32], String> {
+    #[cfg(test)]
+    HASH_READS.with(|n| n.set(n.get() + 1));
+
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_READ_CHUNK];
     loop {
@@ -394,36 +403,145 @@ fn hash_file_streaming(path: &Path) -> Result<[u8; 32], String> {
     Ok(finalize_sha256(hasher))
 }
 
+fn hash_file_at_length(
+    mut file: std::fs::File,
+    path: &Path,
+    expected_len: u64,
+) -> Result<[u8; 32], String> {
+    let changed = || format!("{} changed while it was being read; retry", path.display());
+    if file.metadata().map_err(|e| e.to_string())?.len() != expected_len {
+        return Err(changed());
+    }
+    let mut bounded = Read::by_ref(&mut file).take(expected_len.saturating_add(1));
+    let hash = hash_open_file(&mut bounded, path)?;
+    if bounded.limit() != 1 {
+        return Err(changed());
+    }
+    Ok(hash)
+}
+
+/// Run `write` (which replaces `path` or writes its `.aerocorrect`) under the
+/// write lock of `path`, after checking that `path` still holds the bytes that
+/// were read, by their SHA-256 `read_sha256`. The file was read without the
+/// lock, so a writer may have replaced it meanwhile (a vault created at that
+/// path, a vault save): the write is then refused instead of overwriting it.
+/// The lock is taken for any file, not only a vault, so the file cannot turn
+/// into one between the check and the write.
+pub(crate) fn write_if_unchanged(
+    path: &Path,
+    read_len: u64,
+    read_sha256: &[u8; 32],
+    write: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    write_if_unchanged_with_lock(path, read_len, read_sha256, |lock| {
+        write(lock.source_path())
+    })
+}
+
+pub(crate) fn write_if_unchanged_with_lock(
+    path: &Path,
+    read_len: u64,
+    read_sha256: &[u8; 32],
+    write: impl FnOnce(&crate::lock::WriteLock) -> Result<(), String>,
+) -> Result<(), String> {
+    #[cfg(test)]
+    run_hook(&BEFORE_WRITE_LOCK);
+    let _lock = crate::lock::acquire(path).map_err(|e| e.to_string())?;
+    assert_unchanged(_lock.source_path(), read_len, read_sha256)?;
+    #[cfg(test)]
+    run_hook(&IN_WRITE_WINDOW);
+    write(&_lock)
+}
+
+/// Recheck after acquiring any additional destination guard, without taking
+/// the already held source lock recursively.
+pub(crate) fn assert_unchanged(
+    path: &Path,
+    read_len: u64,
+    read_sha256: &[u8; 32],
+) -> Result<(), String> {
+    let file = crate::source::open_regular(path)
+        .map_err(|e| format!("open {} for hashing: {e}", path.display()))?;
+    if hash_file_at_length(file, path, read_len)? != *read_sha256 {
+        return Err(format!(
+            "{} changed while it was being read; retry",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+type Hook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_REPAIR_INITIAL_SIZE: Hook = const { std::cell::RefCell::new(None) };
+    pub(crate) static AFTER_REPAIR_INITIAL_HASH: Hook = const { std::cell::RefCell::new(None) };
+    /// Test seam: runs before [`write_if_unchanged`] takes the lock.
+    pub(crate) static BEFORE_WRITE_LOCK: Hook = const { std::cell::RefCell::new(None) };
+    /// Test seam: runs between the unchanged check and the write, lock held.
+    pub(crate) static IN_WRITE_WINDOW: Hook = const { std::cell::RefCell::new(None) };
+}
+
+fn initial_repair_target(path: &Path) -> Result<(std::fs::File, u64), String> {
+    let file = crate::source::open_regular(path).map_err(|e| e.to_string())?;
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    #[cfg(test)]
+    run_hook(&AFTER_REPAIR_INITIAL_SIZE);
+    Ok((file, len))
+}
+
+fn repair_stage(parent: &Path) -> Result<crate::v3::strip_transaction::PrivateDir, String> {
+    crate::v3::strip_transaction::private_dir(parent, ".aerorepair-private-")
+}
+
+#[cfg(test)]
+pub(crate) fn run_hook(hook: &'static std::thread::LocalKey<Hook>) {
+    if let Some(f) = hook.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
 pub fn verify_repair_sync_file(
     rel_path: &str,
     expected_sha256: &[u8; 32],
     path: &Path,
     sidecar_bytes: &[u8],
 ) -> Result<SyncEcRepairResult, String> {
-    let file_size = std::fs::metadata(path)
-        .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
-        .len();
+    let pinned = crate::lock::anchored(path).map_err(|e| e.to_string())?;
+    let path = pinned.as_path();
+
+    crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
+    let (initial, file_size) = initial_repair_target(path)?;
     let sidecar = validated_sidecar_for(rel_path, expected_sha256, file_size, sidecar_bytes)?;
 
     // Fast path: stream the file once and hash it. Bounded memory (one read chunk).
-    if hash_file_streaming(path)? == *expected_sha256 {
+    let initial_sha256 = hash_file_at_length(initial, path, file_size)?;
+    if initial_sha256 == *expected_sha256 {
         return Ok(SyncEcRepairResult::Verified);
     }
+    #[cfg(test)]
+    run_hook(&AFTER_REPAIR_INITIAL_HASH);
 
     // Repair path: stream window by window into a temp file in the same directory,
     // repairing each window from its own parity, then atomically replace the original
     // ONLY if the whole repaired stream hashes to the expected value. Bounded memory
     // (one window at a time); all-or-nothing (a failed verify leaves the original intact).
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+    let private = repair_stage(parent)?;
+    #[cfg(windows)]
+    let mut private = private;
+    let tmp = tempfile::NamedTempFile::new_in(private.path()).map_err(|e| {
         format!(
             "create AeroSync EC repair temp in {}: {e}",
             parent.display()
         )
     })?;
-    let mut src =
-        File::open(path).map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
+    let mut src = crate::source::open_regular(path)
+        .map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
+    let mut read_hasher = Sha256::new();
     let mut recovered_shards = 0usize;
     {
         let mut out = std::io::BufWriter::new(tmp.as_file());
@@ -431,6 +549,7 @@ pub fn verify_repair_sync_file(
             let mut buf = vec![0u8; seg.window_len as usize];
             src.read_exact(&mut buf)
                 .map_err(|e| format!("read AeroSync EC target window {}: {e}", path.display()))?;
+            read_hasher.update(&buf);
             let mut blocks = vec![buf];
             recovered_shards += reconstruct_from_error_correction(&mut blocks, &seg.avec_bytes)?;
             hasher.update(&blocks[0]);
@@ -444,25 +563,47 @@ pub fn verify_repair_sync_file(
         // tmp is dropped (removed) here; the original file is byte-for-byte untouched.
         return Err("AeroSync EC repair failed post-repair SHA-256 verification".to_string());
     }
+    if finalize_sha256(read_hasher) != initial_sha256 {
+        return Err("Repair target changed between initial hash and staging read; retry".into());
+    }
     // Release the read handle on the target before persisting. On Windows, renaming the
     // repaired temp onto a file that still has a live read handle fails with
     // ERROR_ACCESS_DENIED (os error 5) (audit M1). The repair loop above is the only
     // reader of `src`, so the handle is safe to drop here.
     drop(src);
-    // Preserve the original file's permissions across the atomic replace.
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
-    }
-    // On a persist failure, recover the NamedTempFile from the error and delete it so a
-    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
-    tmp.persist(path).map_err(|e| {
-        let msg = format!(
-            "persist repaired AeroSync EC target {}: {}",
-            path.display(),
-            e.error
-        );
-        let _ = e.file.close();
-        msg
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
+    // On a persist failure (or a refusal) the temp file is removed, so a
+    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
+    // plaintext-at-rest).
+    write_if_unchanged(path, file_size, &initial_sha256, |locked_path| {
+        // The private stage stays private throughout any wait. Permission-only
+        // changes do not affect the content hash, so sample them under guard.
+        #[cfg(unix)]
+        crate::v3::strip_transaction::SavedPermissions::capture(locked_path)?.apply(tmp.path())?;
+        #[cfg(not(unix))]
+        {
+            let permissions = std::fs::metadata(locked_path)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        }
+        #[cfg(windows)]
+        let descriptor = crate::v3::windows_security::capture(locked_path)?;
+        #[cfg(windows)]
+        crate::v3::windows_security::apply(tmp.path(), &descriptor, true)?;
+        tmp.as_file().sync_all().map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        crate::v3::windows_security::persist_repair(tmp, locked_path, &mut private)?;
+        #[cfg(not(windows))]
+        crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
+            format!(
+                "persist repaired AeroSync EC target {}: {e}",
+                path.display()
+            )
+        })?;
+        Ok(())
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
@@ -499,9 +640,22 @@ pub fn verify_repair_sync_file_streamed_with_progress(
     sidecar_path: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<SyncEcRepairResult, String> {
-    let file_size = std::fs::metadata(path)
-        .map_err(|e| format!("stat AeroSync EC target {}: {e}", path.display()))?
-        .len();
+    repair_streamed(rel_path, expected_sha256, path, sidecar_path, progress)
+}
+
+/// The streamed verify/repair shared by the streamed and standalone entry points.
+fn repair_streamed(
+    rel_path: &str,
+    expected_sha256: &[u8; 32],
+    path: &Path,
+    sidecar_path: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<SyncEcRepairResult, String> {
+    let pinned = crate::lock::anchored(path).map_err(|e| e.to_string())?;
+    let path = pinned.as_path();
+
+    crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
+    let (initial, file_size) = initial_repair_target(path)?;
     let mut reader = AeroCorrectSidecarReader::open(sidecar_path)?;
     // Same validation as the in-memory path: content binding, declared length, tiling.
     reader.verify_binding(expected_sha256).map_err(|e| {
@@ -523,24 +677,31 @@ pub fn verify_repair_sync_file_streamed_with_progress(
     .map_err(|e| format!("AeroSync EC sidecar for {rel_path}: {e}"))?;
 
     // Fast path: stream the file once and hash it. Bounded memory.
-    if hash_file_streaming(path)? == *expected_sha256 {
+    let initial_sha256 = hash_file_at_length(initial, path, file_size)?;
+    if initial_sha256 == *expected_sha256 {
         return Ok(SyncEcRepairResult::Verified);
     }
+    #[cfg(test)]
+    run_hook(&AFTER_REPAIR_INITIAL_HASH);
 
     // Repair path: stream window by window into a temp file in the same directory,
     // reading each window's parity from the sidecar on demand, then atomically replace
     // the original ONLY if the whole repaired stream hashes to the expected value.
     // Bounded memory (one window + its parity); all-or-nothing.
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+    let private = repair_stage(parent)?;
+    #[cfg(windows)]
+    let mut private = private;
+    let tmp = tempfile::NamedTempFile::new_in(private.path()).map_err(|e| {
         format!(
             "create AeroSync EC repair temp in {}: {e}",
             parent.display()
         )
     })?;
-    let mut src =
-        File::open(path).map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
+    let mut src = crate::source::open_regular(path)
+        .map_err(|e| format!("open AeroSync EC target {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
+    let mut read_hasher = Sha256::new();
     let mut recovered_shards = 0usize;
     {
         let mut out = std::io::BufWriter::new(tmp.as_file());
@@ -551,6 +712,7 @@ pub fn verify_repair_sync_file_streamed_with_progress(
             let mut buf = vec![0u8; window_len];
             src.read_exact(&mut buf)
                 .map_err(|e| format!("read AeroSync EC target window {}: {e}", path.display()))?;
+            read_hasher.update(&buf);
             let mut blocks = vec![buf];
             recovered_shards += reconstruct_from_error_correction(&mut blocks, &avec)?;
             hasher.update(&blocks[0]);
@@ -570,24 +732,47 @@ pub fn verify_repair_sync_file_streamed_with_progress(
         // tmp is dropped (removed) here; the original file is byte-for-byte untouched.
         return Err("AeroSync EC repair failed post-repair SHA-256 verification".to_string());
     }
+    if finalize_sha256(read_hasher) != initial_sha256 {
+        return Err("Repair target changed between initial hash and staging read; retry".into());
+    }
     // Release the read handle on the target before persisting. On Windows, renaming the
     // repaired temp onto a file that still has a live read handle fails with
     // ERROR_ACCESS_DENIED (os error 5) (audit M1). The repair loop above is the only
     // reader of `src`, so the handle is safe to drop here.
     drop(src);
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(tmp.path(), meta.permissions());
-    }
-    // On a persist failure, recover the NamedTempFile from the error and delete it so a
-    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1 plaintext-at-rest).
-    tmp.persist(path).map_err(|e| {
-        let msg = format!(
-            "persist repaired AeroSync EC target {}: {}",
-            path.display(),
-            e.error
-        );
-        let _ = e.file.close();
-        msg
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync AeroSync EC repair temp {}: {e}", path.display()))?;
+    // On a persist failure (or a refusal) the temp file is removed, so a
+    // decrypted-plaintext `.tmp*` is never left beside the target (audit M1
+    // plaintext-at-rest).
+    write_if_unchanged(path, file_size, &initial_sha256, |locked_path| {
+        // The private stage stays private throughout any wait. Permission-only
+        // changes do not affect the content hash, so sample them under guard.
+        #[cfg(unix)]
+        crate::v3::strip_transaction::SavedPermissions::capture(locked_path)?.apply(tmp.path())?;
+        #[cfg(not(unix))]
+        {
+            let permissions = std::fs::metadata(locked_path)
+                .map_err(|e| e.to_string())?
+                .permissions();
+            std::fs::set_permissions(tmp.path(), permissions).map_err(|e| e.to_string())?;
+        }
+        #[cfg(windows)]
+        let descriptor = crate::v3::windows_security::capture(locked_path)?;
+        #[cfg(windows)]
+        crate::v3::windows_security::apply(tmp.path(), &descriptor, true)?;
+        tmp.as_file().sync_all().map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        crate::v3::windows_security::persist_repair(tmp, locked_path, &mut private)?;
+        #[cfg(not(windows))]
+        crate::v3::vault::persist_over(tmp, locked_path).map_err(|e| {
+            format!(
+                "persist repaired AeroSync EC target {}: {e}",
+                path.display()
+            )
+        })?;
+        Ok(())
     })?;
     Ok(SyncEcRepairResult::Repaired { recovered_shards })
 }
@@ -671,7 +856,8 @@ pub fn scan_standalone_file_streamed(
     )
     .map_err(|e| format!("Standalone EC sidecar for {rel_path}: {e}"))?;
 
-    let mut src = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut src =
+        crate::source::open_regular(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut health = ShardHealth::default();
     for idx in 0..reader.segments().len() {
@@ -741,13 +927,7 @@ pub fn verify_repair_standalone_file_streamed_with_progress(
             ));
         }
     }
-    verify_repair_sync_file_streamed_with_progress(
-        rel_path,
-        &expected,
-        path,
-        sidecar_path,
-        progress,
-    )
+    repair_streamed(rel_path, &expected, path, sidecar_path, progress)
 }
 
 #[cfg(test)]
@@ -763,6 +943,210 @@ mod tests {
         }
         out.truncate(len);
         out
+    }
+
+    fn generate_during_destination_wait(
+        source: &Path,
+        out: &Path,
+        edit: impl FnOnce(),
+    ) -> Result<super::super::CorrectGenerateReport, String> {
+        let guard = crate::lock::acquire(out).unwrap();
+        let (waiting, seen) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                crate::lock::ON_LOCK_CONTENTION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || waiting.send(()).unwrap()))
+                });
+                super::super::correct_generate(
+                    source.to_str().unwrap(),
+                    20,
+                    Some(out.to_str().unwrap()),
+                )
+            });
+            let encountered_held_lock =
+                seen.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            if encountered_held_lock {
+                edit();
+            }
+            drop(guard);
+            let result = worker.join().unwrap();
+            assert!(
+                encountered_held_lock,
+                "writer never encountered the held destination lock"
+            );
+            result
+        })
+    }
+
+    #[test]
+    fn review_generate_rechecks_after_destination_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        std::fs::write(&source, b"original source").unwrap();
+        let out = dir.path().join("out.aerocorrect");
+        std::fs::write(&out, b"keep previous parity").unwrap();
+        let err = generate_during_destination_wait(&source, &out, || {
+            std::fs::write(&source, b"edited source").unwrap()
+        })
+        .unwrap_err();
+        assert!(err.contains("changed"), "{err}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"keep previous parity");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_generate_refuses_retargeted_input_link() {
+        for parent_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            std::fs::create_dir(&a).unwrap();
+            std::fs::create_dir(&b).unwrap();
+            std::fs::write(
+                a.join("source.bin"),
+                b"same contents, different writer namespace",
+            )
+            .unwrap();
+            std::fs::copy(a.join("source.bin"), b.join("source.bin")).unwrap();
+            let link = dir.path().join("link");
+            let (target_a, target_b, input) = if parent_link {
+                (a.clone(), b.clone(), link.join("source.bin"))
+            } else {
+                (a.join("source.bin"), b.join("source.bin"), link.clone())
+            };
+            std::os::unix::fs::symlink(&target_a, &link).unwrap();
+            let out = dir.path().join("out.aerocorrect");
+            std::fs::write(&out, b"keep previous parity").unwrap();
+            let err = generate_during_destination_wait(&input, &out, || {
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(&target_b, &link).unwrap();
+            })
+            .unwrap_err();
+            assert!(err.contains("changed target"), "{err}");
+            assert_eq!(std::fs::read(&out).unwrap(), b"keep previous parity");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_replacement_requires_a_real_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.bin");
+        std::fs::write(&path, b"original").unwrap();
+        let hash = hash_file_streaming(&path).unwrap();
+        let staged = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        std::fs::write(staged.path(), b"replacement").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"").is_ok() {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let mut ran = false;
+        let result = write_if_unchanged(&path, 8, &hash, |_| {
+            ran = true;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::rename(staged.path(), &path).unwrap();
+            Ok(())
+        });
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "replacement accepted without a real lock");
+        assert!(!ran);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn round14_correct_generate_refuses_a_different_length_before_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        std::fs::write(&path, b"small source").unwrap();
+        let replaced = path.clone();
+        BEFORE_WRITE_LOCK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(replaced)
+                    .unwrap()
+                    .set_len(4 * 1024 * 1024 * 1024)
+                    .unwrap();
+                HASH_READS.with(|reads| reads.set(0));
+            }));
+        });
+        let err = super::super::correct_generate(path.to_str().unwrap(), 20, None).unwrap_err();
+        assert!(err.contains("changed while it was being read"), "{err}");
+        assert_eq!(HASH_READS.with(|reads| reads.get()), 0);
+        assert!(!path.with_extension("aerocorrect").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round14_repair_retains_original_group_when_stage_group_differs() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, PermissionsExt},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let original_gid = std::fs::metadata(dir.path()).unwrap().gid();
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0);
+        let mut groups = vec![0; count as usize];
+        assert_eq!(
+            unsafe { libc::getgroups(count, groups.as_mut_ptr()) },
+            count
+        );
+        let probe = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let uid = probe.as_file().metadata().unwrap().uid();
+        let gid = groups.into_iter().find(|&gid| {
+            if gid == original_gid {
+                return false;
+            }
+            if unsafe { libc::fchown(probe.as_file().as_raw_fd(), uid, gid) } == 0 {
+                return true;
+            }
+            let error = std::io::Error::last_os_error();
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EPERM)),
+                "{error}"
+            );
+            false
+        });
+        let Some(gid) = gid else {
+            eprintln!("Distinct assignable group unavailable for native repair fixture");
+            return;
+        };
+        eprintln!("Distinct Unix repair groups exercised: stage={original_gid}, original={gid}");
+        for streamed in [false, true] {
+            let path = dir.path().join("target");
+            let data = sample_data(4096);
+            let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let sidecar = dir.path().join("parity");
+            std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[1] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            let uid = file.metadata().unwrap().uid();
+            assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), uid, gid) }, 0);
+            file.set_permissions(std::fs::Permissions::from_mode(0o640))
+                .unwrap();
+            drop(file);
+            let result = if streamed {
+                verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+            } else {
+                verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+            };
+            assert!(matches!(
+                result.unwrap(),
+                SyncEcRepairResult::Repaired { .. }
+            ));
+            let metadata = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (metadata.uid(), metadata.gid(), metadata.mode() & 0o777),
+                (uid, gid, 0o640)
+            );
+            assert_eq!(std::fs::read(path).unwrap(), data);
+        }
     }
 
     #[test]
@@ -1221,7 +1605,12 @@ mod tests {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n != "payload.bin" && n != "payload.bin.aerocorrect")
+                // `payload.bin.aerolock`: the repair's write lock, left in place on purpose.
+                .filter(|n| {
+                    n != "payload.bin"
+                        && n != "payload.bin.aerocorrect"
+                        && n != "payload.bin.aerolock"
+                })
                 .collect();
             assert!(
                 leftovers.is_empty(),
@@ -1328,5 +1717,445 @@ mod tests {
         assert!(err.contains("post-repair SHA-256"));
         // Original on disk is byte-for-byte untouched (temp discarded).
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn review_repair_applies_permissions_only_after_source_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("payload.bin");
+            let data = sample_data(40_000);
+            let generated = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let sidecar = dir.path().join("parity");
+            std::fs::write(&sidecar, &generated.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[5000] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let parent = dir.path().to_path_buf();
+            let target = path.clone();
+            BEFORE_WRITE_LOCK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let private = std::fs::read_dir(&parent)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| {
+                            p.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".aerorepair-private-")
+                        })
+                        .unwrap();
+                    let stage = std::fs::read_dir(private)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    assert_eq!(
+                        std::fs::metadata(stage).unwrap().permissions().mode() & 0o077,
+                        0
+                    );
+                    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }))
+            });
+            let result = if streamed {
+                verify_repair_sync_file_streamed("rel", &generated.file_sha256, &path, &sidecar)
+            } else {
+                verify_repair_sync_file(
+                    "rel",
+                    &generated.file_sha256,
+                    &path,
+                    &generated.sidecar_bytes,
+                )
+            }
+            .unwrap();
+            assert!(matches!(result, SyncEcRepairResult::Repaired { .. }));
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn round7_generate_pins_alias_before_progress() {
+        for parent_link in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            std::fs::create_dir(&a).unwrap();
+            std::fs::create_dir(&b).unwrap();
+            std::fs::write(a.join("payload"), sample_data(40_000)).unwrap();
+            std::fs::copy(a.join("payload"), b.join("payload")).unwrap();
+            let alias = dir.path().join("alias");
+            let (first, next, input) = if parent_link {
+                (a, b, alias.join("payload"))
+            } else {
+                (a.join("payload"), b.join("payload"), alias.clone())
+            };
+            std::os::unix::fs::symlink(first, &alias).unwrap();
+            let out = dir.path().join("recovery");
+            std::fs::write(&out, b"keep prior parity").unwrap();
+            let mut changed = false;
+            let err = super::super::correct_generate_with_progress(
+                input.to_str().unwrap(),
+                20,
+                Some(out.to_str().unwrap()),
+                &mut |_, _| {
+                    if !changed {
+                        std::fs::remove_file(&alias).unwrap();
+                        std::os::unix::fs::symlink(&next, &alias).unwrap();
+                        changed = true;
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(changed);
+            assert!(err.contains("changed target"), "{err}");
+            assert_eq!(std::fs::read(out).unwrap(), b"keep prior parity");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_repair_keeps_stage_and_target_restricted() {
+        use crate::v3::windows_security as acl;
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            acl::apply(
+                dir.path(),
+                "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+                true,
+            )
+            .unwrap();
+            let path = dir.path().join("private.bin");
+            let data = sample_data(40_000);
+            let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let parity = dir.path().join("recovery");
+            std::fs::write(&parity, &g.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[5000] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            acl::apply(&path, "D:P(D;;FR;;;BG)(A;;FA;;;OW)(A;;FA;;;SY)", true).unwrap();
+            let guard = crate::lock::acquire(&path).unwrap();
+            let target = path.clone();
+            let sidecar = parity.clone();
+            std::thread::scope(|scope| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let worker = scope.spawn(move || {
+                    crate::lock::ON_LOCK_CONTENTION
+                        .with(|h| *h.borrow_mut() = Some(Box::new(move || tx.send(()).unwrap())));
+                    if streamed {
+                        verify_repair_sync_file_streamed("rel", &g.file_sha256, &target, &sidecar)
+                    } else {
+                        verify_repair_sync_file("rel", &g.file_sha256, &target, &g.sidecar_bytes)
+                    }
+                });
+                let waiting = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+                if waiting {
+                    let private = std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| {
+                            p.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".aerorepair-private-")
+                        })
+                        .unwrap();
+                    assert_eq!(acl::guest_effective_rights(&private).unwrap() & 1, 0);
+                    let stage = std::fs::read_dir(private)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    assert_eq!(acl::guest_effective_rights(&stage).unwrap() & 1, 0);
+                }
+                drop(guard);
+                assert!(waiting, "repair never waited for held source guard");
+                assert!(matches!(
+                    worker.join().unwrap().unwrap(),
+                    SyncEcRepairResult::Repaired { .. }
+                ));
+            });
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+            assert_eq!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+        }
+        eprintln!("Windows repair: second-principal read denied during contention and after both repair publications");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round8_generation_rejects_resolved_lock_before_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("private.aerolock");
+        std::fs::write(&lock, sample_data(4096)).unwrap();
+        let link = dir.path().join("ordinary");
+        std::os::unix::fs::symlink(&lock, &link).unwrap();
+        let mut progress = 0;
+        assert!(super::super::correct_generate_with_progress(
+            link.to_str().unwrap(),
+            20,
+            None,
+            &mut |_, _| progress += 1
+        )
+        .is_err());
+        assert_eq!(progress, 0);
+        std::fs::remove_file(&link).unwrap();
+        let source = dir.path().join("data");
+        std::fs::write(&source, sample_data(4096)).unwrap();
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(super::super::correct_generate_with_progress(
+            link.to_str().unwrap(),
+            20,
+            None,
+            &mut |_, _| progress += 1
+        )
+        .is_ok());
+        assert!(progress > 0);
+    }
+
+    #[test]
+    fn round9_repair_initial_size_and_hash_share_one_handle() {
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("target");
+            let incoming = dir.path().join("incoming");
+            let original = sample_data(4_096);
+            let mut damaged = original.clone();
+            damaged[11] ^= 1;
+            let mut newer = original.clone();
+            newer[22] ^= 2;
+            let g = generate_sync_sidecar_for_bytes("rel", &original, 20);
+            let sidecar = dir.path().join("recovery");
+            std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+            std::fs::write(&path, &damaged).unwrap();
+            std::fs::write(&incoming, &newer).unwrap();
+            let target = path.clone();
+            AFTER_REPAIR_INITIAL_SIZE.with(|h| {
+                *h.borrow_mut() =
+                    Some(Box::new(move || std::fs::rename(incoming, target).unwrap()));
+            });
+            let repair = || {
+                if streamed {
+                    verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+                } else {
+                    verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+                }
+            };
+            assert!(repair().unwrap_err().contains("changed"));
+            assert_eq!(std::fs::read(&path).unwrap(), newer);
+            assert!(matches!(
+                repair().unwrap(),
+                SyncEcRepairResult::Repaired { .. }
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn round9_macos_repairs_clear_inherited_acl_before_waiting() {
+        use crate::v3::unix_security as acl;
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new("/bin/chmod")
+                .args([
+                    "+a",
+                    "everyone allow readsecurity,file_inherit,directory_inherit,only_inherit"
+                ])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success());
+            let path = dir.path().join("target");
+            let data = sample_data(4096);
+            let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let sidecar = dir.path().join("recovery");
+            std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[15] ^= 1;
+            std::fs::write(&path, damaged).unwrap();
+            assert!(!acl::capture(&path).unwrap().is_empty());
+            acl::apply(&path, &[]).unwrap();
+            let parent = dir.path().to_owned();
+            BEFORE_WRITE_LOCK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let private = std::fs::read_dir(parent)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| {
+                            p.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".aerorepair-private-")
+                        })
+                        .unwrap();
+                    let staged = std::fs::read_dir(&private)
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path();
+                    assert!(acl::capture(&private).unwrap().is_empty());
+                    assert!(acl::capture(&staged).unwrap().is_empty());
+                    assert_eq!(std::fs::read(staged).unwrap(), data);
+                }));
+            });
+            let result = if streamed {
+                verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+            } else {
+                verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+            };
+            assert!(matches!(
+                result.unwrap(),
+                SyncEcRepairResult::Repaired { .. }
+            ));
+            assert!(acl::capture(&path).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn round8_repair_keeps_initial_generation_before_staging() {
+        for streamed in [false, true] {
+            for truncated in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("target");
+                let data = sample_data(4096);
+                let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+                let sidecar = dir.path().join("parity");
+                std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+                let mut damaged = data.clone();
+                damaged[12] ^= 1;
+                std::fs::write(&path, &damaged).unwrap();
+                let replacement = if truncated {
+                    b"AEROVAULT3truncated".to_vec()
+                } else {
+                    let mut d = data.clone();
+                    d[15] ^= 2;
+                    d[..10].copy_from_slice(b"AEROVAULT3");
+                    d
+                };
+                let later = replacement.clone();
+                let target = path.clone();
+                AFTER_REPAIR_INITIAL_HASH.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || std::fs::write(target, later).unwrap()))
+                });
+                let result = if streamed {
+                    verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+                } else {
+                    verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+                };
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), replacement);
+                std::fs::write(&path, &damaged).unwrap();
+                let result = if streamed {
+                    verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+                } else {
+                    verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+                };
+                assert!(matches!(
+                    result.unwrap(),
+                    SyncEcRepairResult::Repaired { .. }
+                ));
+                assert_eq!(std::fs::read(&path).unwrap(), data);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round7_windows_round8_repair_merge_failure_keeps_inheritance_retryable() {
+        use crate::v3::windows_security as acl;
+        for streamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            acl::apply(
+                dir.path(),
+                "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+                true,
+            )
+            .unwrap();
+            let path = dir.path().join("inherit.bin");
+            let data = sample_data(4096);
+            let g = generate_sync_sidecar_for_bytes("rel", &data, 20);
+            let sidecar = dir.path().join("recovery");
+            std::fs::write(&sidecar, &g.sidecar_bytes).unwrap();
+            let mut damaged = data.clone();
+            damaged[15] ^= 1;
+            std::fs::write(&path, &damaged).unwrap();
+            let before = acl::capture(&path).unwrap();
+            let before_rights = acl::guest_effective_rights(&path).unwrap();
+            eprintln!(
+                "Windows repair streamed={streamed}: before={before}, Guest={before_rights:#x}"
+            );
+            assert!(
+                !before.split("D:").nth(1).unwrap().starts_with('P'),
+                "{before}"
+            );
+            assert_ne!(
+                before_rights & 1,
+                0,
+                "fixture did not inherit Guest read: {before}"
+            );
+            acl::FAIL_REPAIR_REPLACE.with(|f| f.set(true));
+            let repair = || {
+                if streamed {
+                    verify_repair_sync_file_streamed("rel", &g.file_sha256, &path, &sidecar)
+                } else {
+                    verify_repair_sync_file("rel", &g.file_sha256, &path, &g.sidecar_bytes)
+                }
+            };
+            assert!(repair().unwrap_err().contains("merge failure"));
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert_eq!(acl::capture(&path).unwrap(), before);
+            acl::FAIL_REPAIR_WITH_ORIGINAL_INTACT.with(|f| f.set(true));
+            let error = repair().unwrap_err();
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert_eq!(acl::capture(&path).unwrap(), before);
+            assert!(!error.contains("Preserve the recovery"));
+            assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aerorepair-")
+            }));
+            acl::FAIL_REPAIR_AFTER_BACKUP.with(|f| f.set(true));
+            assert!(repair().unwrap_err().contains("replacement"));
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            assert_eq!(acl::capture(&path).unwrap(), before);
+            assert!(matches!(
+                repair().unwrap(),
+                SyncEcRepairResult::Repaired { .. }
+            ));
+            assert!(matches!(repair().unwrap(), SyncEcRepairResult::Verified));
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+            let after = acl::capture(&path).unwrap();
+            let after_rights = acl::guest_effective_rights(&path).unwrap();
+            eprintln!("Windows repair streamed={streamed}: after={after}, Guest={after_rights:#x}");
+            assert!(
+                !after.split("D:").nth(1).unwrap().starts_with('P'),
+                "{after}"
+            );
+            assert_ne!(
+                after_rights & 1,
+                0,
+                "repair lost inherited Guest read: {before} -> {after}"
+            );
+            acl::apply(dir.path(), "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)", true).unwrap();
+            let narrowed = acl::capture(&path).unwrap();
+            let narrowed_rights = acl::guest_effective_rights(&path).unwrap();
+            eprintln!("Windows repair streamed={streamed}: narrowed={narrowed}, Guest={narrowed_rights:#x}");
+            assert_eq!(
+                narrowed_rights & 1,
+                0,
+                "repair must retain live inheritance: {after} -> {narrowed}"
+            );
+        }
     }
 }

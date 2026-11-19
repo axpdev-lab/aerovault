@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString, SecretVec};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::constants::*;
 use crate::crypto;
@@ -106,8 +106,10 @@ impl Vault {
     /// # Errors
     ///
     /// Returns an error if the password is too short (< 8 chars), the chunk
-    /// size is out of range, or the file cannot be written.
-    pub fn create(opts: CreateOptions) -> crate::Result<Self> {
+    /// size is out of range, the file cannot be written, or the write lock is
+    /// refused (another writer keeps it, the path is a symbolic link or names
+    /// a lock file; see `crate::lock`).
+    pub fn create(mut opts: CreateOptions) -> crate::Result<Self> {
         if opts.password.expose_secret().len() < MIN_PASSWORD_LENGTH {
             return Err(crate::Error::PasswordPolicy(format!(
                 "password must be at least {MIN_PASSWORD_LENGTH} characters"
@@ -122,6 +124,12 @@ impl Vault {
             return Err(FormatError::UnsupportedVersion(opts.version).into());
         }
 
+        // The lock first: the mode of an existing vault at this path is read
+        // (for the replacement) only while no other writer can change it, and
+        // a refused lock returns before any key exists.
+        let lock = crate::lock::acquire(&opts.path)?;
+        opts.path = lock.source_path().to_path_buf();
+
         // Generate random salt
         let mut salt = [0u8; SALT_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -130,15 +138,15 @@ impl Vault {
         let base_kek = crypto::derive_key(&opts.password, &salt)?;
         let (kek_master, kek_mac) = crypto::derive_kek_pair(base_kek.expose_secret());
 
-        // Generate random master and MAC keys
-        let mut master_key_raw = [0u8; KEY_SIZE];
-        let mut mac_key_raw = [0u8; KEY_SIZE];
-        rand::rngs::OsRng.fill_bytes(&mut master_key_raw);
-        rand::rngs::OsRng.fill_bytes(&mut mac_key_raw);
+        // Generate random master and MAC keys (zeroized on every return)
+        let mut master_key_raw = Zeroizing::new([0u8; KEY_SIZE]);
+        let mut mac_key_raw = Zeroizing::new([0u8; KEY_SIZE]);
+        rand::rngs::OsRng.fill_bytes(&mut master_key_raw[..]);
+        rand::rngs::OsRng.fill_bytes(&mut mac_key_raw[..]);
 
         // Wrap keys
-        let wrapped_master = crypto::wrap_key(&kek_master, &master_key_raw)?;
-        let wrapped_mac = crypto::wrap_key(&kek_mac, &mac_key_raw)?;
+        let wrapped_master = crypto::wrap_key(&kek_master, &master_key_raw[..])?;
+        let wrapped_mac = crypto::wrap_key(&kek_mac, &mac_key_raw[..])?;
 
         // kek_master and kek_mac are Zeroizing — auto-dropped
 
@@ -158,7 +166,7 @@ impl Vault {
             reserved: [0u8; 320],
             header_mac: [0u8; MAC_SIZE],
         };
-        header.header_mac = header.compute_mac(&mac_key_raw);
+        header.header_mac = header.compute_mac(&mac_key_raw[..]);
 
         // Create empty manifest
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -171,7 +179,7 @@ impl Vault {
 
         let manifest_json =
             serde_json::to_string(&manifest).map_err(|e| crate::Error::Manifest(e.to_string()))?;
-        let encrypted_manifest = crypto::encrypt_filename(&master_key_raw, &manifest_json)?;
+        let encrypted_manifest = crypto::encrypt_filename(&master_key_raw[..], &manifest_json)?;
         let manifest_bytes = encrypted_manifest.as_bytes();
 
         // Write vault file atomically via temp + fsync + rename
@@ -186,12 +194,14 @@ impl Vault {
         drop(writer);
 
         atomic_rename(tmp.path(), &opts.path)?;
+        drop(lock);
+        #[cfg(test)]
+        if let Some(hook) = AFTER_CREATE_COMMIT.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
 
         let master_key = SecretVec::new(master_key_raw.to_vec());
         let mac_key = SecretVec::new(mac_key_raw.to_vec());
-
-        master_key_raw.zeroize();
-        mac_key_raw.zeroize();
 
         Ok(Self {
             path: opts.path,
@@ -210,10 +220,10 @@ impl Vault {
     /// Returns [`CryptoError::KeyUnwrap`] if the password is wrong, or
     /// [`CryptoError::HeaderMacMismatch`] if the header has been tampered with.
     pub fn open(path: impl Into<PathBuf>, password: impl Into<String>) -> crate::Result<Self> {
-        let path = path.into();
+        let path = crate::lock::anchored(&path.into())?;
         let pwd = SecretString::from(password.into());
 
-        let file = File::open(&path)?;
+        let file = crate::source::open_regular(&path)?;
         let mut reader = BufReader::new(file);
 
         // Read header
@@ -242,7 +252,7 @@ impl Vault {
 
     /// Check if a file is an AeroVault v2 container (reads only the first 11 bytes).
     pub fn is_vault(path: impl AsRef<Path>) -> bool {
-        let Ok(file) = File::open(path.as_ref()) else {
+        let Ok(file) = crate::source::open_regular(path.as_ref()) else {
             return false;
         };
         let mut buf = [0u8; 11];
@@ -258,7 +268,7 @@ impl Vault {
     /// Returns basic metadata (version, encryption mode, chunk size) that is
     /// stored unencrypted in the header. Useful for UI display before unlock.
     pub fn peek(path: impl AsRef<Path>) -> crate::Result<PeekInfo> {
-        let file = File::open(path.as_ref())?;
+        let file = crate::source::open_regular(path.as_ref())?;
         let mut reader = BufReader::new(file);
         let mut header_buf = [0u8; HEADER_SIZE];
         reader.read_exact(&mut header_buf)?;
@@ -343,6 +353,8 @@ impl Vault {
         file_paths: &[impl AsRef<Path>],
         target_dir: &str,
     ) -> crate::Result<u32> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let target_dir = target_dir.trim().trim_matches('/');
         if target_dir.contains("..") {
             return Err(crate::Error::InvalidPath(
@@ -355,7 +367,7 @@ impl Vault {
         let bind_chunks = self.header.version >= VERSION;
 
         // Read current vault state
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -401,7 +413,7 @@ impl Vault {
 
         for file_path in file_paths {
             let file_path = file_path.as_ref();
-            let source = File::open(file_path)?;
+            let source = crate::source::open_regular(file_path)?;
             let metadata = source.metadata()?;
 
             let filename = file_path
@@ -426,17 +438,38 @@ impl Vault {
                 continue;
             }
 
-            let mut source_reader = BufReader::new(source);
-            let mut chunk_count = 0u32;
-            let chunk_total = if metadata.len() == 0 {
-                0
+            let mut source = source;
+            let mut measured = Zeroizing::new(Vec::new());
+            if metadata.len() == 0 {
+                // Some regular pseudo-files have no stat size. Bound the
+                // measurement before deriving the authenticated chunk count.
+                let cap = u64::from(MAX_CHUNK_SIZE);
+                crate::secret::read_to_end(
+                    &mut Read::by_ref(&mut source).take(cap + 1),
+                    &mut measured,
+                )?;
+                if measured.len() as u64 > cap {
+                    return Err(crate::Error::Manifest(
+                        "size-unknown source exceeds the bounded add buffer".into(),
+                    ));
+                }
+                if source.metadata()?.len() != 0 {
+                    return Err(crate::Error::Manifest(
+                        "source changed size during add; aborting".into(),
+                    ));
+                }
+            }
+            let mut measured_reader = measured.as_slice();
+            let (source_reader, source_len): (&mut dyn Read, u64) = if measured.is_empty() {
+                (&mut source, metadata.len())
             } else {
-                metadata
-                    .len()
-                    .div_ceil(chunk_size as u64)
-                    .try_into()
-                    .map_err(|_| crate::Error::Manifest("chunk count overflow".into()))?
+                (&mut measured_reader, measured.len() as u64)
             };
+            let mut chunk_count = 0u32;
+            let chunk_total = source_len
+                .div_ceil(chunk_size as u64)
+                .try_into()
+                .map_err(|_| crate::Error::Manifest("chunk count overflow".into()))?;
             let file_id = if bind_chunks {
                 let mut id = [0u8; 16];
                 rand::rngs::OsRng.fill_bytes(&mut id);
@@ -446,13 +479,16 @@ impl Vault {
             };
             let entry_offset = data_offset;
 
-            loop {
-                let mut chunk = vec![0u8; chunk_size];
-                let bytes_read = source_reader.read(&mut chunk)?;
-                if bytes_read == 0 {
-                    break;
+            let mut remaining = source_len;
+            while remaining > 0 {
+                let bytes_read = remaining.min(chunk_size as u64) as usize;
+                let mut chunk = Zeroizing::new(vec![0u8; bytes_read]);
+                source_reader.read_exact(&mut chunk)?;
+                remaining -= bytes_read as u64;
+                #[cfg(test)]
+                if let Some(hook) = AFTER_ADD_SOURCE_CHUNK.with(|h| h.borrow_mut().take()) {
+                    hook();
                 }
-                chunk.truncate(bytes_read);
 
                 let encrypted_chunk = if cascade_mode {
                     crypto::encrypt_chunk_cascade_bound(
@@ -485,8 +521,15 @@ impl Vault {
                 chunk.zeroize();
             }
 
+            let mut extra = Zeroizing::new([0u8; 1]);
+            if source_reader.read(&mut *extra)? != 0 {
+                return Err(crate::Error::Manifest(
+                    "source changed size during add; aborting".into(),
+                ));
+            }
+
             // The v3+ chunk AAD binds `chunk_total`, derived from the pre-stream
-            // `metadata.len()`. Extraction rebuilds the AAD from the manifest's
+            // source length. Extraction rebuilds the AAD from the manifest's
             // stored `chunk_count` (the actual number of chunks streamed). If the
             // source changed size between the stat and the read, the two diverge
             // and every chunk would fail AAD verification on extract: a silently
@@ -509,7 +552,7 @@ impl Vault {
             manifest.entries.push(ManifestEntry {
                 encrypted_name,
                 name: String::new(),
-                size: metadata.len(),
+                size: source_len,
                 offset: entry_offset,
                 chunk_count,
                 file_id,
@@ -533,6 +576,8 @@ impl Vault {
     ///
     /// Intermediate directories are created automatically (like `mkdir -p`).
     pub fn create_directory(&self, dir_name: &str) -> crate::Result<u32> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let dir_name = dir_name.trim().trim_matches('/');
         if dir_name.is_empty() {
             return Err(crate::Error::InvalidPath(
@@ -548,7 +593,7 @@ impl Vault {
             return Err(crate::Error::InvalidPath("directory name too long".into()));
         }
 
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -636,6 +681,15 @@ impl Vault {
         if entry.is_dir {
             let dir_path = output_dir.join(entry_name);
             validate_output_path(&dir_path, output_dir)?;
+            // Every folder this creates is named by the vault: none may take a
+            // lock file name.
+            let mut current = output_dir.to_path_buf();
+            for part in Path::new(entry_name).components() {
+                current.push(part);
+                if !current.exists() {
+                    crate::lock::refuse_lock_named_dir(&current)?;
+                }
+            }
             std::fs::create_dir_all(&dir_path)?;
             return Ok(dir_path);
         }
@@ -649,7 +703,7 @@ impl Vault {
         };
 
         // Open vault and seek to data section
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         // Skip header
@@ -706,7 +760,7 @@ impl Vault {
             let mut encrypted_chunk = vec![0u8; chunk_len];
             reader.read_exact(&mut encrypted_chunk)?;
 
-            let mut plaintext = if cascade_mode {
+            let mut plaintext = Zeroizing::new(if cascade_mode {
                 crypto::decrypt_chunk_cascade_bound(
                     self.master_key.expose_secret(),
                     &chacha_key,
@@ -723,7 +777,7 @@ impl Vault {
                     entry.file_id.as_ref(),
                     entry.chunk_count,
                 )?
-            };
+            });
 
             writer.write_all(&plaintext)?;
             plaintext.zeroize();
@@ -754,7 +808,9 @@ impl Vault {
     /// The encrypted data remains in the file but becomes orphaned.
     /// Use [`Vault::compact`] (future) to reclaim space.
     pub fn delete_entry(&self, entry_name: &str) -> crate::Result<()> {
-        let file = File::open(&self.path)?;
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -799,7 +855,9 @@ impl Vault {
     /// under it (e.g., deleting "docs" also removes "docs/file.txt").
     /// Returns the number of entries removed.
     pub fn delete_entries(&self, names: &[&str], recursive: bool) -> crate::Result<u32> {
-        let file = File::open(&self.path)?;
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -856,6 +914,8 @@ impl Vault {
     /// Supports both file and directory moves. When moving a directory, all
     /// descendant entries are moved as a single atomic manifest update.
     pub fn move_entry(&self, from: &str, to: &str) -> crate::Result<()> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let from = from.trim().trim_matches('/');
         let to = to.trim().trim_matches('/');
 
@@ -882,7 +942,7 @@ impl Vault {
             return Err(crate::Error::InvalidPath("path too long".into()));
         }
 
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1008,6 +1068,8 @@ impl Vault {
     /// The copied entries reuse the existing encrypted data chunk references;
     /// only manifest metadata is duplicated and re-encrypted names are written.
     pub fn copy_entry(&self, from: &str, to: &str) -> crate::Result<()> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         let from = from.trim().trim_matches('/');
         let to = to.trim().trim_matches('/');
 
@@ -1034,7 +1096,7 @@ impl Vault {
             return Err(crate::Error::InvalidPath("path too long".into()));
         }
 
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1136,12 +1198,14 @@ impl Vault {
     ///
     /// Returns a [`CompactResult`] with size savings information.
     pub fn compact(&self) -> crate::Result<CompactResult> {
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
         use std::io::Seek;
 
         let original_size = std::fs::metadata(&self.path)?.len();
 
         // Read header + manifest
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1168,7 +1232,7 @@ impl Vault {
         };
 
         // Re-open for seek-based reads
-        let orig_file = File::open(&self.path)?;
+        let orig_file = crate::source::open_regular(&self.path)?;
         let mut orig_reader = BufReader::new(orig_file);
 
         let mut compacted_data: Vec<u8> = Vec::new();
@@ -1201,7 +1265,7 @@ impl Vault {
                 let mut encrypted_chunk = vec![0u8; encrypted_chunk_len];
                 orig_reader.read_exact(&mut encrypted_chunk)?;
 
-                let mut plaintext = if cascade_mode {
+                let mut plaintext = Zeroizing::new(if cascade_mode {
                     crypto::decrypt_chunk_cascade_bound(
                         self.master_key.expose_secret(),
                         &chacha_key,
@@ -1218,7 +1282,7 @@ impl Vault {
                         entry.file_id.as_ref(),
                         entry.chunk_count,
                     )?
-                };
+                });
 
                 encrypted_chunk.zeroize();
 
@@ -1297,15 +1361,27 @@ impl Vault {
                 "password must be at least {MIN_PASSWORD_LENGTH} characters"
             )));
         }
+        // Held from the read of the vault to the rename (see `crate::lock`).
+        let _lock = crate::lock::acquire(&self.path)?;
 
-        let mut vault_data = std::fs::read(&self.path)?;
-
-        if vault_data.len() < HEADER_SIZE {
+        let mut source = crate::source::open_regular(&self.path)?;
+        let file_len = source.metadata()?.len();
+        if file_len < HEADER_SIZE as u64 {
             return Err(FormatError::TooSmall {
-                actual: vault_data.len(),
+                actual: file_len as usize,
                 expected: HEADER_SIZE,
             }
             .into());
+        }
+        use std::io::{Seek, SeekFrom};
+        source.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        // Validate only the bounded manifest on this same opened handle. The
+        // encrypted body stays on disk throughout password rotation.
+        if !self.manifest_decrypts_reader(&mut source) {
+            return Err(crate::Error::Io(std::io::Error::other(format!(
+                "{}: its manifest does not decrypt under this handle's key, so it is not the vault this handle opened (it was replaced since: open it again) or its manifest is damaged",
+                self.path.display()
+            ))));
         }
 
         // Generate new salt
@@ -1326,7 +1402,7 @@ impl Vault {
         // Build new header
         let mut new_header = VaultHeader {
             magic: *MAGIC,
-            version: VERSION,
+            version: self.header.version,
             flags: self.header.flags,
             salt: new_salt,
             wrapped_master_key: new_wrapped_master,
@@ -1337,24 +1413,51 @@ impl Vault {
         };
         new_header.header_mac = new_header.compute_mac(self.mac_key.expose_secret());
 
-        // Write new header into vault data
-        let header_bytes = new_header.to_bytes();
-        vault_data[..HEADER_SIZE].copy_from_slice(&header_bytes);
-
-        // Atomic write with fsync
-        atomic_write(&self.path, &vault_data, "chpw")?;
-
+        let tmp = temporary_vault_file(&self.path, "chpw")?;
+        {
+            let mut writer = BufWriter::new(tmp.as_file());
+            writer.write_all(&new_header.to_bytes())?;
+            source.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+            let body_len = file_len - HEADER_SIZE as u64;
+            let copied = std::io::copy(&mut (&mut source).take(body_len), &mut writer)?;
+            let mut extra = [0u8; 1];
+            if copied != body_len || source.read(&mut extra)? != 0 {
+                return Err(crate::Error::Io(std::io::Error::other(
+                    "vault changed during password rotation; retry",
+                )));
+            }
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
+        // Windows readers must not keep the old source handle across rename.
+        drop(source);
+        rename_into_place(tmp.path(), &self.path)?;
+        // Rename commits the password change even when directory sync fails.
         self.header = new_header;
-        vault_data.zeroize();
-
+        if let Err(error) = sync_password_change_parent(&self.path) {
+            return Err(crate::Error::Io(std::io::Error::other(format!("Password changed; use the new password, but durability could not be confirmed: {error}"))));
+        }
         Ok(())
     }
 
     // --- Internal Helpers ---
 
+    /// True if `body` (the bytes after the header) starts with a manifest that
+    /// decrypts under this handle's master key. The decrypted manifest is only
+    /// a proof and is wiped at once.
+    fn manifest_decrypts_reader(&self, body: &mut impl Read) -> bool {
+        crypto::read_manifest_bounded(body).is_ok_and(|(_, encrypted)| {
+            std::str::from_utf8(&encrypted).is_ok_and(|text| {
+                crypto::decrypt_filename(self.master_key.expose_secret(), text)
+                    .map(|mut plain| plain.zeroize())
+                    .is_ok()
+            })
+        })
+    }
+
     /// Read and decrypt the vault manifest.
     fn read_manifest(&self) -> crate::Result<VaultManifest> {
-        let file = File::open(&self.path)?;
+        let file = crate::source::open_regular(&self.path)?;
         let mut reader = BufReader::new(file);
 
         let mut header_buf = [0u8; HEADER_SIZE];
@@ -1599,6 +1702,24 @@ fn open_new_output_file(path: &Path, output_dir: &Path) -> crate::Result<File> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_CREATE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! { static FAIL_PASSWORD_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn sync_password_change_parent(path: &Path) -> crate::Result<()> {
+    #[cfg(test)]
+    if FAIL_PASSWORD_SYNC.with(|f| f.replace(false)) {
+        return Err(crate::Error::Io(std::io::Error::other(
+            "injected directory sync failure",
+        )));
+    }
+    fsync_parent_dir(path)
+}
+
 #[cfg(unix)]
 fn fsync_parent_dir(path: &Path) -> crate::Result<()> {
     if let Some(parent) = path.parent() {
@@ -1639,38 +1760,39 @@ fn temporary_vault_file(path: &Path, suffix: &str) -> crate::Result<tempfile::Na
                 ))?;
         }
     }
+    #[cfg(test)]
+    crate::lock::trace("temp");
     Ok(tmp)
 }
 
 /// Atomic rename: tmp -> final as the single visible commit point.
 fn atomic_rename(tmp_path: &Path, final_path: &Path) -> crate::Result<()> {
-    #[cfg(windows)]
-    if final_path.exists() {
-        std::fs::remove_file(final_path)?;
-    }
-
-    std::fs::rename(tmp_path, final_path)?;
+    rename_into_place(tmp_path, final_path)?;
     fsync_parent_dir(final_path)?;
     Ok(())
 }
 
-/// Atomic write: write to temp file with fsync, then rename.
-fn atomic_write(path: &Path, data: &[u8], suffix: &str) -> crate::Result<()> {
-    let tmp = temporary_vault_file(path, suffix)?;
-    let mut writer = BufWriter::new(tmp.as_file());
-    writer.write_all(data)?;
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    drop(writer);
-
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)?;
+/// The single commit point of every write. `std::fs::rename` replaces an
+/// existing file on Windows too, so the vault is never deleted before its
+/// replacement is in place: if the rename fails, the old vault is untouched.
+fn rename_into_place(tmp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    crate::lock::refuse_lock_file_name(final_path)?;
+    #[cfg(test)]
+    if FAIL_NEXT_RENAME.with(|f| f.replace(false)) {
+        return Err(std::io::Error::other("injected rename failure"));
     }
+    std::fs::rename(tmp_path, final_path)
+}
 
-    std::fs::rename(tmp.path(), path)?;
-    fsync_parent_dir(path)?;
-    Ok(())
+#[cfg(test)]
+thread_local! {
+    static AFTER_ADD_SOURCE_CHUNK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes the next commit rename fail.
+    static FAIL_NEXT_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1688,6 +1810,248 @@ mod tests {
     }
 
     #[test]
+    fn review_legacy_source_truncation_with_same_chunk_count_is_refused() {
+        for version in [VERSION, LEGACY_VERSION] {
+            for mode in [EncryptionMode::Standard, EncryptionMode::Cascade] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("legacy.aerovault");
+                let vault = Vault::create(
+                    CreateOptions::new(&path, "test-password-123")
+                        .with_version(version)
+                        .with_mode(mode)
+                        .with_chunk_size(4096),
+                )
+                .unwrap();
+                let source = dir.path().join("source.bin");
+                std::fs::write(&source, vec![7; 8192]).unwrap();
+                let before = std::fs::read(&path).unwrap();
+                let truncate = source.clone();
+                AFTER_ADD_SOURCE_CHUNK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(truncate)
+                            .unwrap()
+                            .set_len(4097)
+                            .unwrap();
+                    }))
+                });
+                assert!(vault.add_files(&[&source]).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                // Same file now stable with a valid partial final chunk.
+                vault.add_files(&[&source]).unwrap();
+                let out = dir.path().join("out");
+                vault.extract("source.bin", &out).unwrap();
+                assert_eq!(
+                    std::fs::read(out.join("source.bin")).unwrap(),
+                    vec![7; 4097]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_add_supports_size_unknown_sources_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.aerovault");
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, []).unwrap();
+        let source = Path::new("/proc/version");
+        assert_eq!(source.metadata().unwrap().len(), 0);
+        let expected = std::fs::read(source).unwrap();
+        assert!(!expected.is_empty());
+        for version in [VERSION, LEGACY_VERSION] {
+            let vault =
+                Vault::create(CreateOptions::new(&path, "test-password-123").with_version(version))
+                    .unwrap();
+            assert_eq!(vault.add_files(&[source, empty.as_path()]).unwrap(), 2);
+            let out = dir.path().join(format!("out-{version}"));
+            vault.extract_all(&out).unwrap();
+            assert_eq!(std::fs::read(out.join("version")).unwrap(), expected);
+            assert!(std::fs::read(out.join("empty")).unwrap().is_empty());
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_fifo_source_is_refused_without_holding_other_writers() {
+        use crate::source::fifo_test;
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(dir) = fifo_test::child_path() {
+            let vault = Vault::open(dir.join("legacy.aerovault"), "test-password-123").unwrap();
+            fifo_test::ready(&dir);
+            let error = vault
+                .add_files(&[dir.join("fifo")])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("regular file"), "{error}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.aerovault");
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        assert!(
+            fifo_test::run(
+                "vault::tests::review_fifo_source_is_refused_without_holding_other_writers",
+                dir.path(),
+                "legacy-source",
+                || {}
+            ),
+            "FIFO child failed or exceeded deadline"
+        );
+        Vault::open(&path, "test-password-123")
+            .unwrap()
+            .create_directory("after-fifo")
+            .unwrap();
+    }
+
+    #[test]
+    fn write_waits_for_another_writer_then_refuses() {
+        crate::lock::set_short_wait_for_this_thread();
+        // Each write holds the vault lock from its read to its rename; while
+        // another writer holds it, a write must give up, not interleave.
+        let path = temp_vault_path();
+        let vault = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let held = crate::lock::acquire(&path).unwrap();
+        let err = vault.create_directory("blocked").unwrap_err();
+        assert!(
+            err.to_string().contains("locked by another writer"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        crate::lock::take_trace();
+        let Err(err) = Vault::create(CreateOptions::new(&path, "test-password-123")) else {
+            panic!("create must refuse while another writer holds the lock");
+        };
+        assert!(
+            err.to_string().contains("locked by another writer"),
+            "{err}"
+        );
+        // Refused before any key was derived or any temp file made.
+        assert_eq!(crate::lock::take_trace(), Vec::<&str>::new());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(held);
+        vault.create_directory("after").unwrap();
+        crate::lock::remove_vault_and_lock(&path);
+    }
+
+    #[test]
+    fn create_takes_the_lock_before_any_key_or_temp_file() {
+        // The lock comes first, so a refused create derives no key, and the
+        // mode of the vault it replaces is read (with the temp file) only while
+        // no other writer can change it. Checked for a new vault and for a
+        // replacement.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        for _ in 0..2 {
+            crate::lock::take_trace();
+            Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+            assert_eq!(crate::lock::take_trace(), ["lock", "derive", "temp"]);
+        }
+    }
+
+    #[test]
+    fn change_password_refuses_a_vault_replaced_since_the_open() {
+        // `Vault::create` replaces the vault while an old handle is open. The
+        // old handle's password change must not wrap its keys over the new
+        // vault's content: refused, the new vault unchanged and readable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        let mut old = Vault::create(CreateOptions::new(&path, "first-password-1")).unwrap();
+        let input = dir.path().join("a.txt");
+        std::fs::write(&input, b"second vault's file").unwrap();
+        let new = Vault::create(CreateOptions::new(&path, "second-password-2")).unwrap();
+        new.add_files(&[&input]).unwrap();
+        let replaced = std::fs::read(&path).unwrap();
+
+        let err = old.change_password("third-password-3").unwrap_err();
+        assert!(
+            err.to_string().contains("not the vault this handle opened"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), replaced);
+        let reopened = Vault::open(&path, "second-password-2").unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let got = reopened.extract("a.txt", &out).unwrap();
+        assert_eq!(std::fs::read(got).unwrap(), b"second vault's file");
+
+        // A handle of the same vault (same keys) still changes the password.
+        let mut again = Vault::open(&path, "second-password-2").unwrap();
+        again.change_password("fourth-password-4").unwrap();
+        assert!(Vault::open(&path, "fourth-password-4").is_ok());
+    }
+
+    #[test]
+    fn a_short_new_password_is_refused_before_the_lock() {
+        // The policy error comes at once, not after waiting for another writer.
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        let mut vault = Vault::create(CreateOptions::new(&path, "first-password-1")).unwrap();
+        let held = crate::lock::acquire(&path).unwrap();
+        let err = vault.change_password("short").unwrap_err();
+        assert!(matches!(err, crate::Error::PasswordPolicy(_)), "{err}");
+        drop(held);
+    }
+
+    #[test]
+    fn change_password_rewrites_a_damaged_header_of_its_own_vault() {
+        // The check is on the content, not the header: an open handle whose
+        // vault header was damaged on disk still writes a new, valid header.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.aerovault");
+        let mut vault = Vault::create(CreateOptions::new(&path, "first-password-1")).unwrap();
+        let input = dir.path().join("a.txt");
+        std::fs::write(&input, b"kept").unwrap();
+        vault.add_files(&[&input]).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[HEADER_SIZE - 1] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(Vault::open(&path, "first-password-1").is_err());
+
+        vault.change_password("second-password-2").unwrap();
+        let reopened = Vault::open(&path, "second-password-2").unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let got = reopened.extract("a.txt", &out).unwrap();
+        assert_eq!(std::fs::read(got).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn failed_commit_rename_leaves_the_old_vault_intact() {
+        // Each write commits by one rename over the vault. When that rename
+        // fails, the original must still be there and open, on every platform.
+        let path = temp_vault_path();
+        let vault = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        let input =
+            std::env::temp_dir().join(format!("aerovault-rename-{}.txt", rand::random::<u64>()));
+        std::fs::write(&input, b"kept").unwrap();
+        vault.add_files(&[&input]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        FAIL_NEXT_RENAME.with(|f| f.set(true));
+        assert!(vault.create_directory("later").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let mut vault = Vault::open(&path, "test-password-123").unwrap();
+        FAIL_NEXT_RENAME.with(|f| f.set(true));
+        assert!(vault.change_password("other-password-456").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let vault = Vault::open(&path, "test-password-123").unwrap();
+        assert_eq!(vault.list().unwrap().len(), 1);
+        crate::lock::remove_vault_and_lock(&path);
+        std::fs::remove_file(&input).ok();
+    }
+
+    #[test]
     fn test_create_and_open() {
         let path = temp_vault_path();
         let opts = CreateOptions::new(&path, "test-password-123");
@@ -1699,7 +2063,7 @@ mod tests {
         let entries = vault.list().unwrap();
         assert!(entries.is_empty());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1711,7 +2075,7 @@ mod tests {
         let result = Vault::open(&path, "wrong-password");
         assert!(result.is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1720,7 +2084,7 @@ mod tests {
         let opts = CreateOptions::new(&path, "short");
         let result = Vault::create(opts);
         assert!(result.is_err());
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1732,7 +2096,7 @@ mod tests {
         let opts = CreateOptions::new(&path, "test-password-123").with_chunk_size(32 * 1024 * 1024); // too large
         assert!(Vault::create(opts).is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1765,7 +2129,7 @@ mod tests {
         assert_eq!(content, "Hello from AeroVault!");
 
         // Cleanup
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -1823,8 +2187,8 @@ mod tests {
         )
         .is_err());
 
-        std::fs::remove_file(&v2_path).ok();
-        std::fs::remove_file(&v3_path).ok();
+        crate::lock::remove_vault_and_lock(&v2_path);
+        crate::lock::remove_vault_and_lock(&v3_path);
         std::fs::remove_file(&input).ok();
         std::fs::remove_dir_all(&out2).ok();
         std::fs::remove_dir_all(&out3).ok();
@@ -1855,7 +2219,7 @@ mod tests {
         let content = std::fs::read_to_string(&extracted).unwrap();
         assert_eq!(content, "Cascade mode test");
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -1878,7 +2242,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.is_dir));
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1900,7 +2264,7 @@ mod tests {
         // Deleting again should fail
         assert!(vault.delete_entry("aerovault-delete-input.txt").is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
     }
 
@@ -1925,16 +2289,16 @@ mod tests {
         let entries = vault2.list().unwrap();
         assert_eq!(entries.len(), 1);
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
     }
 
     #[test]
     fn test_is_vault_negative() {
-        let path = std::env::temp_dir().join("not-a-vault.txt");
-        std::fs::write(&path, b"just text").ok();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-vault.txt");
+        std::fs::write(&path, b"just text").unwrap();
         assert!(!Vault::is_vault(&path));
-        std::fs::remove_file(&path).ok();
 
         assert!(!Vault::is_vault("/nonexistent/path"));
     }
@@ -1948,7 +2312,7 @@ mod tests {
         let display = format!("{info}");
         assert!(display.contains("AES-256-GCM-SIV"));
         assert!(display.contains("128 MiB"));
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -1982,7 +2346,7 @@ mod tests {
         let extracted = vault.extract("renamed.txt", &out_dir).unwrap();
         assert!(extracted.ends_with("renamed.txt"));
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -2018,7 +2382,7 @@ mod tests {
         let content = std::fs::read_to_string(extracted).unwrap();
         assert_eq!(content, "move me");
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -2032,7 +2396,7 @@ mod tests {
         vault.create_directory("docs/old").unwrap();
         assert!(vault.move_entry("docs", "docs/archive").is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[test]
@@ -2061,7 +2425,7 @@ mod tests {
         let content = std::fs::read_to_string(extracted).unwrap();
         assert_eq!(content, "copy me");
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
         std::fs::remove_dir_all(&out_dir).ok();
     }
@@ -2092,7 +2456,7 @@ mod tests {
             .iter()
             .any(|n| n == "archive/original-copy/aerovault-copy-tree-input.txt"));
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
         std::fs::remove_file(&test_file).ok();
     }
 
@@ -2105,7 +2469,7 @@ mod tests {
         vault.create_directory("docs/original").unwrap();
         assert!(vault.copy_entry("docs", "docs/archive").is_err());
 
-        std::fs::remove_file(&path).ok();
+        crate::lock::remove_vault_and_lock(&path);
     }
 
     #[cfg(unix)]
@@ -2191,20 +2555,116 @@ mod tests {
         vault.change_password("new-password-456").unwrap();
         assert_eq!(mode(&path), 0o640, "password change");
 
-        // Special bits are never carried over, and a symlinked vault path does
-        // not lend its link mode (0777 on Linux) to the replacement file.
+        // Special bits are never carried over.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4640)).unwrap();
         let second = dir.path().join("second.txt");
         std::fs::write(&second, b"second payload").unwrap();
         vault.add_files(&[&second]).unwrap();
         assert_eq!(mode(&path), 0o640, "setuid dropped");
+        // A write through a symlinked vault path is refused (0.6.9): it would
+        // replace the link, not the vault behind it. Link and vault stay as
+        // they were.
         let target = dir.path().join("real.aerovault");
         std::fs::rename(&path, &target).unwrap();
         symlink(&target, &path).unwrap();
+        let before = std::fs::read(&target).unwrap();
         let reopened = Vault::open(&path, "new-password-456").unwrap();
         let third = dir.path().join("third.txt");
         std::fs::write(&third, b"third payload").unwrap();
-        reopened.add_files(&[&third]).unwrap();
-        assert_eq!(mode(&path), 0o600, "symlink mode not copied");
+        let err = reopened.add_files(&[&third]).unwrap_err().to_string();
+        assert!(err.contains("is a symbolic link"), "{err}");
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(mode(&target), 0o640);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_legacy_password_rotation_streams_under_memory_limit() {
+        const KEY: &str = "AEROVAULT_LEGACY_MEMORY_PATH";
+        if let Some(path) = std::env::var_os(KEY) {
+            crate::source::memory_test::limit();
+            let path = PathBuf::from(path);
+            let len = std::fs::metadata(&path).unwrap().len();
+            let mut vault = Vault::open(&path, "initial-password-123").unwrap();
+            vault.change_password("replacement-password-123").unwrap();
+            let again = Vault::open(&path, "replacement-password-123").unwrap();
+            assert_eq!(again.header.version, LEGACY_VERSION);
+            assert!(again.list().unwrap().is_empty());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+            assert!(Vault::open(&path, "initial-password-123").is_err());
+            crate::source::memory_test::complete();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-v2.aerovault");
+        Vault::create(
+            CreateOptions::new(&path, "initial-password-123").with_version(LEGACY_VERSION),
+        )
+        .unwrap();
+        // Valid legacy manifests need not reference every byte of an old body.
+        // A sparse tail exercises the real large-file rewrite without a fixture.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(512 * 1024 * 1024 + 4096)
+            .unwrap();
+        crate::source::memory_test::run(
+            "vault::tests::review_legacy_password_rotation_streams_under_memory_limit",
+            KEY,
+            &path,
+        );
+    }
+    #[test]
+    fn review_legacy_password_sync_failure_reports_committed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("password.aerovault");
+        let mut vault = Vault::create(CreateOptions::new(&path, "old-password-123")).unwrap();
+        FAIL_PASSWORD_SYNC.with(|f| f.set(true));
+        let error = vault
+            .change_password("new-password-123")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Password changed") && error.contains("durability"),
+            "{error}"
+        );
+        assert!(Vault::open(&path, "old-password-123").is_err());
+        assert!(Vault::open(&path, "new-password-123").is_ok());
+        vault.create_directory("after-sync-failure").unwrap();
+        assert!(Vault::open(&path, "old-password-123").is_err());
+        assert!(Vault::open(&path, "new-password-123").is_ok());
+        assert_eq!(
+            vault.header.to_bytes().as_slice(),
+            &std::fs::read(&path).unwrap()[..HEADER_SIZE]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_create_returns_committed_path_when_parent_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("created.aerovault");
+        let expected = std::fs::canonicalize(&parent)
+            .unwrap()
+            .join("created.aerovault");
+        let moved = dir.path().join("moved");
+        let original = parent.clone();
+        let destination = moved.clone();
+        AFTER_CREATE_COMMIT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(original, destination).unwrap();
+            }))
+        });
+        let vault = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        assert_eq!(vault.path, expected);
+        assert!(!parent.exists());
+        assert!(Vault::open(moved.join("created.aerovault"), "test-password-123").is_ok());
     }
 }

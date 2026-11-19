@@ -22,11 +22,17 @@ pub mod block;
 pub mod chunking;
 pub mod constants;
 pub mod ec;
+mod extraction_stage;
 pub mod format;
 pub mod manifest;
 pub mod packing;
+pub(crate) mod strip_transaction;
 pub mod telemetry;
+#[cfg(unix)]
+pub(crate) mod unix_security;
 pub mod vault;
+#[cfg(windows)]
+pub(crate) mod windows_security;
 
 pub use chunking::{chunk_ranges_with, gear_table, keyed_chunk_id, CdcBounds};
 pub use ec::{

@@ -122,11 +122,14 @@ pub fn derive_base_kek(password: &str, salt: &[u8; SALT_SIZE]) -> Result<[u8; KE
     let params = argon2::Params::new(ARGON2_MEM_KIB, ARGON2_TIME, ARGON2_LANES, Some(KEY_SIZE))
         .map_err(|e| format!("Argon2 params: {e}"))?;
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut key = [0u8; KEY_SIZE];
+    #[cfg(test)]
+    crate::lock::trace("derive");
+    // Wiped here on every return; the caller wraps the returned copy.
+    let mut key = zeroize::Zeroizing::new([0u8; KEY_SIZE]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into(password.as_bytes(), salt, &mut key[..])
         .map_err(|e| format!("Argon2 derive: {e}"))?;
-    Ok(key)
+    Ok(*key)
 }
 
 /// HKDF-SHA256 expand of `ikm` under a domain-separating `label`.
@@ -156,10 +159,11 @@ pub fn unwrap_key(
     wrapped: &[u8; WRAPPED_KEY_SIZE],
 ) -> Result<[u8; KEY_SIZE], String> {
     let kek = Kek::from(*kek);
-    let mut out = [0u8; KEY_SIZE];
-    kek.unwrap(wrapped, &mut out)
+    // Wiped here on every return; the caller wraps the returned copy.
+    let mut out = zeroize::Zeroizing::new([0u8; KEY_SIZE]);
+    kek.unwrap(wrapped, &mut out[..])
         .map_err(|_| "AES-KW unwrap failed".to_string())?;
-    Ok(out)
+    Ok(*out)
 }
 
 /// Encrypt `plaintext` with AES-256-GCM-SIV under `key`, binding `aad`.

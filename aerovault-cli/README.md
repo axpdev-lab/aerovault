@@ -102,6 +102,9 @@ aerovault vault add-dir my.aerovault ./project --prefix work
 # List, extract, info (all honor --json)
 aerovault vault list my.aerovault -H
 aerovault vault extract my.aerovault -o ./out
+
+# Explicitly extract an unencrypted plaintext-lane archive, without a password
+aerovault vault extract archive.aerozip --plaintext -o ./out
 aerovault --json vault info my.aerovault
 
 # Read-only damage report, then repair from parity if needed
@@ -178,3 +181,5 @@ payload metadata rather than from a CLI-level assumption.
 ## License
 
 MPL-2.0. See [LICENSE](https://github.com/axpdev-lab/aerovault/blob/main/LICENSE).
+
+`vault extract --plaintext` explicitly calls the plaintext opening API. Password-based commands keep encrypted-only unlock behavior and never fall back to plaintext.

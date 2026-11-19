@@ -11,6 +11,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::constants::{CDC_AVG, CDC_MAX, CDC_MIN};
 use crate::aerocrypt::KEY_SIZE;
@@ -140,7 +141,7 @@ pub struct StreamingChunker<R: std::io::Read> {
     mask: u64,
     /// Bytes of the current in-progress chunk, starting at its boundary, plus
     /// any lookahead already pulled from the reader but not yet emitted.
-    buf: Vec<u8>,
+    buf: Zeroizing<Vec<u8>>,
     /// Count of `buf` bytes already folded into `rolling` == current chunk len.
     scanned: usize,
     rolling: u64,
@@ -154,7 +155,7 @@ impl<R: std::io::Read> StreamingChunker<R> {
             table: gear_table(),
             mask: (bounds.avg as u64) - 1,
             bounds,
-            buf: Vec::new(),
+            buf: Zeroizing::new(Vec::new()),
             scanned: 0,
             rolling: 0,
             eof: false,
@@ -168,6 +169,7 @@ impl<R: std::io::Read> StreamingChunker<R> {
     /// special handling, the next `fill` on the following loop turn appends more.
     fn fill(&mut self) -> std::io::Result<()> {
         let old = self.buf.len();
+        crate::secret::reserve(&mut self.buf, STREAM_READ_CHUNK)?;
         self.buf.resize(old + STREAM_READ_CHUNK, 0);
         let n = self.reader.read(&mut self.buf[old..])?;
         self.buf.truncate(old + n);
@@ -179,7 +181,10 @@ impl<R: std::io::Read> StreamingChunker<R> {
 
     /// Return the next chunk's bytes, or `None` once the stream is exhausted.
     /// The returned `Vec` is exactly the bytes `chunk_ranges_with` would have
-    /// delimited for the same `(start, end)` range.
+    /// delimited for the same `(start, end)` range. Ownership transfers to the
+    /// caller: wrap returned plaintext in `Zeroizing` when it is sensitive.
+    /// This preserves the public `Vec<u8>` API; internal staging wipes on drop
+    /// and before growth frees an old allocation.
     pub fn next_chunk(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         loop {
             // Fold any buffered-but-unscanned bytes, breaking at the first
@@ -208,7 +213,10 @@ impl<R: std::io::Read> StreamingChunker<R> {
                 if self.buf.is_empty() {
                     return Ok(None);
                 }
-                let chunk = std::mem::take(&mut self.buf);
+                // Do not transfer spare staging capacity containing drained
+                // earlier chunks to a plain caller-owned Vec.
+                let chunk = self.buf.to_vec();
+                self.buf.zeroize();
                 self.rolling = 0;
                 self.scanned = 0;
                 return Ok(Some(chunk));
@@ -227,22 +235,81 @@ pub fn zstd_compress(chunk: &[u8], level: i32) -> Result<Vec<u8>, String> {
 
 /// Bounded per-chunk zstd decompression. Reads at most `plaintext_len + 1`
 /// bytes so a malicious frame cannot expand past one legitimate chunk
-/// (CLAUDE-AV-005); the caller verifies the exact length afterwards.
+/// (CLAUDE-AV-005); the caller verifies the exact length afterwards. The
+/// returned plaintext belongs to the caller, which should use `Zeroizing` for
+/// sensitive data. AeroVault's Rust output Vec and read-helper scratch buffer
+/// wipe on errors and before growth; libzstd's internal storage is outside this
+/// guarantee.
 pub fn zstd_decompress_bounded(compressed: &[u8], plaintext_len: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let decoder = zstd::stream::read::Decoder::new(compressed)
         .map_err(|e| format!("zstd decoder init failed: {e}"))?;
-    let mut out = Vec::with_capacity(plaintext_len.min(1 << 20) as usize);
-    decoder
-        .take(plaintext_len + 1)
-        .read_to_end(&mut out)
+    let mut out = Zeroizing::new(Vec::new());
+    let limit = plaintext_len
+        .checked_add(1)
+        .ok_or("plaintext length overflow")?;
+    crate::secret::read_to_end(&mut decoder.take(limit), &mut out)
         .map_err(|e| format!("zstd decompress failed: {e}"))?;
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_eof_tail_does_not_transfer_old_staging_capacity() {
+        let size = 1024 * 1024;
+        let bytes = vec![7; size + 1];
+        let bounds = CdcBounds {
+            min: size,
+            avg: size,
+            max: size,
+        };
+        let mut chunker = StreamingChunker::new(bytes.as_slice(), bounds);
+        assert_eq!(chunker.next_chunk().unwrap().unwrap().len(), size);
+        let capacity = chunker.buf.capacity();
+        let tail = chunker.next_chunk().unwrap().unwrap();
+        assert_eq!(tail, [7]);
+        assert!(
+            tail.capacity() < capacity,
+            "old staging allocation escaped to caller"
+        );
+        assert!(chunker.buf.is_empty());
+        assert_eq!(
+            chunker.buf.capacity(),
+            capacity,
+            "staging must remain under its zeroizing owner"
+        );
+        assert!(chunker.next_chunk().unwrap().is_none());
+    }
+
+    #[test]
+    fn review_plaintext_growth_wipes_released_storage() {
+        use crate::secret::WIPED_GROWTH;
+        let bytes = vec![7; 3 * 1024 * 1024];
+        WIPED_GROWTH.with(|n| n.set(0));
+        let compressed = zstd_compress(&bytes, 3).unwrap();
+        assert_eq!(
+            zstd_decompress_bounded(&compressed, bytes.len() as u64).unwrap(),
+            bytes
+        );
+        assert!(WIPED_GROWTH.with(|n| n.get()) > 0);
+        assert!(zstd_decompress_bounded(&compressed, u64::MAX).is_err());
+        WIPED_GROWTH.with(|n| n.set(0));
+        let bounds = CdcBounds {
+            min: 2 * 1024 * 1024,
+            avg: 2 * 1024 * 1024,
+            max: 4 * 1024 * 1024,
+        };
+        let mut chunks = StreamingChunker::new(bytes.as_slice(), bounds);
+        let mut all = Vec::new();
+        while let Some(chunk) = chunks.next_chunk().unwrap() {
+            all.extend(chunk);
+        }
+        assert_eq!(all, bytes);
+        assert!(WIPED_GROWTH.with(|n| n.get()) > 0);
+    }
 
     #[test]
     fn cdc_bounds_validate_and_profiles() {

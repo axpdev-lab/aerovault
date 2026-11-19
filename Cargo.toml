@@ -3,8 +3,9 @@ members = ["aerovault", "aerovault-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.8"
+version = "0.6.9"
 edition = "2021"
+rust-version = "1.89"
 license = "MPL-2.0"
 authors = ["axpdev-lab <dev@axpdev.it>"]
 repository = "https://github.com/axpdev-lab/aerovault"
@@ -15,7 +16,8 @@ keywords = ["encryption", "vault", "argon2", "error-correction", "reed-solomon"]
 categories = ["cryptography", "command-line-utilities"]
 
 [workspace.dependencies]
-aerovault = { path = "aerovault", version = "0.6.8" }
+same-file = "1.0"
+aerovault = { path = "aerovault", version = "0.6.9" }
 aes-gcm-siv = "0.11"
 aes-kw = { version = "0.2", features = ["std"] }
 aes-siv = "0.7"
@@ -40,3 +42,5 @@ walkdir = "2"
 hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 libc = "0.2"
+unicode-normalization = "=0.1.26"
+unicode-casefold = "=0.2.0"

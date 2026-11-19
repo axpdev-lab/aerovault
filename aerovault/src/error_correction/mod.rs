@@ -143,6 +143,24 @@ impl ErrorCorrectionPayloadHeader {
                 "invalid Error Correction payload header (zero shard geometry)".to_string(),
             );
         }
+        if u32::from(h.data_shards) + u32::from(h.parity_shards) >= 256 {
+            return Err("invalid Error Correction group width".to_string());
+        }
+        // Every supported v2 writer chooses S from L and K by this rule
+        // (including the original fixed K=10/P=2 releases). Serialized byte
+        // limits alone cannot bound K zero-padding allocations during repair.
+        let expected_shard = h.total_data_len.div_ceil(u64::from(h.data_shards)).clamp(
+            ERROR_CORRECTION_MIN_SHARD as u64,
+            ERROR_CORRECTION_MAX_SHARD as u64,
+        );
+        if u64::from(h.shard_size) != expected_shard {
+            return Err(
+                "Error Correction geometry exceeds the supported reconstruction working set"
+                    .to_string(),
+            );
+        }
+        usize::try_from(h.total_data_len)
+            .map_err(|_| "Error Correction protected stream length exceeds usize")?;
         Ok(h)
     }
 }
@@ -268,6 +286,51 @@ pub(crate) fn compute_error_correction_shards(data_blocks: &[&[u8]]) -> (Vec<u8>
     )
 }
 
+/// Monotone bound for any protected length up to L and every supported grid.
+/// Independent parity/checksum bounds avoid shard-boundary count reductions.
+pub(crate) fn parity_payload_bound(l: u64) -> Result<u64, String> {
+    if l == 0 {
+        return Ok(0);
+    }
+    let shard = l.div_ceil(2).clamp(
+        ERROR_CORRECTION_MIN_SHARD as u64,
+        ERROR_CORRECTION_MAX_SHARD as u64,
+    );
+    let checksums = l
+        .div_ceil(ERROR_CORRECTION_MIN_SHARD as u64)
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_mul(ERROR_CORRECTION_SHARD_CKSUM_LEN as u64));
+    l.checked_add(shard.checked_mul(2).ok_or("parity bound overflow")?)
+        .and_then(|n| n.checked_add(checksums?))
+        .and_then(|n| n.checked_add(32))
+        .ok_or_else(|| "parity bound overflow".to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn parity_payload_len(l: u64, k: u64, p: u64) -> Result<u64, String> {
+    if l == 0 {
+        return Ok(0);
+    }
+    if k == 0 {
+        return Err("zero parity data-shard count".to_string());
+    }
+    let size = l.div_ceil(k).clamp(
+        ERROR_CORRECTION_MIN_SHARD as u64,
+        ERROR_CORRECTION_MAX_SHARD as u64,
+    );
+    let data = l.div_ceil(size);
+    let parity = data
+        .div_ceil(k)
+        .checked_mul(p)
+        .ok_or("parity size overflow")?;
+    data.checked_add(parity)
+        .and_then(|v| v.checked_mul(ERROR_CORRECTION_SHARD_CKSUM_LEN as u64))
+        .and_then(|v| v.checked_add(parity.checked_mul(size)?))
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| "parity size overflow".to_string())
+}
+
 /// As `compute_error_correction_shards`, with an explicit (K data, P parity) group so
 /// the QR-style overhead level (#276) is honored. The grid is recorded in the AVEC
 /// payload header, so reconstruction reads K/P back from the payload regardless of the
@@ -374,6 +437,53 @@ pub(crate) fn compute_metadata_parity(region: &[u8], k: usize, p: usize) -> Vec<
     payload
 }
 
+// Reconstruction allocates these buffers at their final sizes. Reed-Solomon
+// can write recovered shards into them without allocating unowned copies.
+struct ReconstructionBuffer(Vec<u8>, #[cfg(test)] bool);
+
+impl ReconstructionBuffer {
+    fn new(bytes: Vec<u8>, _is_stream: bool) -> Self {
+        Self(
+            bytes,
+            #[cfg(test)]
+            _is_stream,
+        )
+    }
+}
+
+impl AsRef<[u8]> for ReconstructionBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsMut<[u8]> for ReconstructionBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl Drop for ReconstructionBuffer {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        #[cfg(test)]
+        let had_data = self.0.iter().any(|&b| b != 0);
+        self.0.as_mut_slice().zeroize();
+        #[cfg(test)]
+        RECONSTRUCTION_WIPES.with(|count| {
+            assert!(self.0.iter().all(|&b| b == 0));
+            let mut wipes = count.get();
+            wipes[usize::from(self.1)] += usize::from(had_data);
+            count.set(wipes);
+        });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECONSTRUCTION_WIPES: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
 /// Reconstruct damaged bytes in the protected block stream using the v2 Error
 /// Correction payload.
 ///
@@ -412,22 +522,13 @@ pub(crate) fn reconstruct_from_error_correction(
         ));
     }
 
-    let mut d = Vec::with_capacity(l);
+    let mut stream = ReconstructionBuffer::new(Vec::with_capacity(l), true);
     for b in blocks.iter() {
-        d.extend_from_slice(b);
+        stream.0.extend_from_slice(b);
     }
+    let d = stream.as_mut();
 
     let (num_data_shards, num_groups) = error_correction_geometry(&payload.header);
-
-    let shard_at = |d: &[u8], idx: usize| -> Vec<u8> {
-        let start = idx * s;
-        let end = (start + s).min(l);
-        let mut v = vec![0u8; s];
-        if start < end {
-            v[..end - start].copy_from_slice(&d[start..end]);
-        }
-        v
-    };
 
     let rs = ReedSolomon::<reed_solomon_erasure::galois_8::Field>::new(k, p)
         .map_err(|e| format!("RS create for reconstruct: {:?}", e))?;
@@ -436,20 +537,24 @@ pub(crate) fn reconstruct_from_error_correction(
     let mut changed = false;
 
     for g in 0..num_groups {
-        let mut opt: Vec<Option<Vec<u8>>> = vec![None; k + p];
+        let mut opt: Vec<_> = (0..k + p)
+            .map(|_| (ReconstructionBuffer::new(vec![0u8; s], false), false))
+            .collect();
         let mut erased_data = 0usize;
 
-        for (local, slot) in opt.iter_mut().take(k).enumerate() {
+        for (local, (shard, present)) in opt.iter_mut().take(k).enumerate() {
             let gi = g * k + local;
             if gi < num_data_shards {
-                let sh = shard_at(&d, gi);
-                if error_correction_shard_checksum(&sh) == payload.data_checksums[gi] {
-                    *slot = Some(sh); // shard intact
+                let start = gi * s;
+                let end = (start + s).min(l);
+                shard.as_mut()[..end - start].copy_from_slice(&d[start..end]);
+                if error_correction_shard_checksum(shard.as_ref()) == payload.data_checksums[gi] {
+                    *present = true;
                 } else {
                     erased_data += 1; // damaged -> RS erasure
                 }
             } else {
-                *slot = Some(vec![0u8; s]); // virtual zero-pad slot
+                *present = true; // virtual zero-pad slot
             }
         }
 
@@ -457,9 +562,10 @@ pub(crate) fn reconstruct_from_error_correction(
             let pidx = g * p + pp;
             let start = pidx * s;
             if start + s <= payload.parity_data.len() {
-                let par = payload.parity_data[start..start + s].to_vec();
-                if error_correction_shard_checksum(&par) == payload.parity_checksums[pidx] {
-                    opt[k + pp] = Some(par); // parity intact
+                let par = &payload.parity_data[start..start + s];
+                if error_correction_shard_checksum(par) == payload.parity_checksums[pidx] {
+                    opt[k + pp].0.as_mut().copy_from_slice(par);
+                    opt[k + pp].1 = true;
                 }
                 // else: rotted parity -> leave None so RS routes around it
             }
@@ -472,18 +578,17 @@ pub(crate) fn reconstruct_from_error_correction(
             continue; // more erasures than parity can cover; leave group untouched
         }
 
-        for (local, slot) in opt.iter().take(k).enumerate() {
+        for (local, (shard, _)) in opt.iter().take(k).enumerate() {
             let gi = g * k + local;
             if gi >= num_data_shards {
                 continue;
             }
-            if let Some(sh) = slot {
-                let start = gi * s;
-                let end = (start + s).min(l);
-                if d[start..end] != sh[..end - start] {
-                    d[start..end].copy_from_slice(&sh[..end - start]);
-                    changed = true;
-                }
+            let start = gi * s;
+            let end = (start + s).min(l);
+            let shard = shard.as_ref();
+            if d[start..end] != shard[..end - start] {
+                d[start..end].copy_from_slice(&shard[..end - start]);
+                changed = true;
             }
         }
         recovered += erased_data;
@@ -689,12 +794,19 @@ pub fn correct_generate_with_progress(
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<CorrectGenerateReport, String> {
     let path = Path::new(file);
+    // Refused before the file is read: the write at the end would refuse it.
+    crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
+    if let Some(out) = out {
+        crate::lock::refuse_destination(Path::new(out), path).map_err(|e| e.to_string())?;
+    }
+    let locked = std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
+    crate::lock::refuse_lock_file_name(&locked).map_err(|e| e.to_string())?;
     let rel = rel_name(file);
     // No minimum-benefit gate here: `correct gen` is an explicit per-file request, so honor
     // it even for tiny files (the gate is a sync-pipeline opt-in, not a CLI-of-one concern).
     let result = sync::generate_sync_sidecar_for_file_capped_with_progress(
         &rel,
-        path,
+        &locked,
         pct,
         sync::AEROSYNC_EC_MAX_FILE_SIZE,
         0,
@@ -718,8 +830,45 @@ pub fn correct_generate_with_progress(
     let sidecar_path = out
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
-    std::fs::write(&sidecar_path, &generated.sidecar_bytes)
-        .map_err(|e| format!("write sidecar {sidecar_path}: {e}"))?;
+    // Temp file + rename, like every vault write: a symlink planted at the
+    // sidecar path is replaced, never followed. Written under the lock of the
+    // file, and only if the file is still the one the parity was built from.
+    // `file` may be a link: the sidecar goes next to the link, as before, but
+    // the lock and the check are those of the file it names, so a link to a
+    // vault shares that vault's lock. Nothing is written over the link itself.
+    {
+        #[cfg(test)]
+        sync::run_hook(&sync::BEFORE_WRITE_LOCK);
+        let source_guard = crate::lock::acquire(&locked).map_err(|e| e.to_string())?;
+        // Every destination can hold a vault, including the default sidecar.
+        crate::lock::refuse_destination(Path::new(&sidecar_path), path)
+            .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(crate::v3::vault::output_parent_dir(Path::new(
+            &sidecar_path,
+        )))
+        .map_err(|e| e.to_string())?;
+        let destination =
+            crate::lock::anchored(Path::new(&sidecar_path)).map_err(|e| e.to_string())?;
+        let _out_lock = crate::lock::acquire_destination(&destination, &locked, &source_guard)
+            .map_err(|e| e.to_string())?;
+        if out.is_none() {
+            crate::v3::ec::validate_standalone_sidecar_destination(&destination)?;
+        }
+        if path != locked {
+            let current =
+                std::fs::canonicalize(path).map_err(|e| format!("resolve {file}: {e}"))?;
+            if current != locked {
+                return Err(format!(
+                    "{file} changed target while it was being read; retry"
+                ));
+            }
+        }
+        sync::assert_unchanged(&locked, generated.file_size, &generated.file_sha256)?;
+        #[cfg(test)]
+        sync::run_hook(&sync::IN_WRITE_WINDOW);
+        crate::v3::vault::atomic_write(&destination, &generated.sidecar_bytes)
+            .map_err(|e| format!("write sidecar {sidecar_path}: {e}"))
+    }?;
     let segments =
         sidecar::aerocorrect_windows(generated.file_size, sidecar::AEROCORRECT_WINDOW_SIZE).len()
             as u64;
@@ -804,6 +953,7 @@ pub fn correct_repair_anchored_with_progress(
 ) -> Result<CorrectRepairReport, String> {
     let path = Path::new(file);
     let rel = rel_name(file);
+    // The sync repair below takes the file's lock for its write.
     let sidecar_path = parity
         .map(|s| s.to_string())
         .unwrap_or_else(|| sidecar::aerocorrect_sidecar_path(file));
@@ -944,6 +1094,24 @@ mod tests {
     }
 
     #[test]
+    fn round11_reconstruction_wipes_discarded_stream_and_shards() {
+        let original = vec![0xa7; 40 * 1024];
+        let parity = compute_metadata_parity(&original, 10, 2);
+        let mut damaged = original.clone();
+        damaged[37] ^= 1;
+        let mut blocks = [damaged];
+        RECONSTRUCTION_WIPES.with(|count| count.set([0; 2]));
+        assert_eq!(
+            reconstruct_from_error_correction(&mut blocks, &parity).unwrap(),
+            1
+        );
+        assert_eq!(blocks[0], original);
+        let [shards, stream] = RECONSTRUCTION_WIPES.with(|count| count.get());
+        assert!(shards > 0);
+        assert_eq!(stream, 1);
+    }
+
+    #[test]
     fn reconstruct_rejects_wrong_total_len() {
         let data = sample(20_000);
         let (payload, _s, _p, _o) = compute_error_correction_shards_grid(&[&data], 10, 2);
@@ -1042,6 +1210,275 @@ mod tests {
         assert!(v.verified && v.status == "verified");
         let r = correct_repair(&file, None).unwrap();
         assert!(!r.repaired && r.status == "verified");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn correct_generate_explicitly_replaces_a_planted_symlink_instead_of_following_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_file(dir.path(), "data.bin", &sample(40_000));
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"do not overwrite").unwrap();
+        let sidecar = aerocorrect_sidecar_path_for(&file);
+        std::os::unix::fs::symlink(&sentinel, &sidecar).unwrap();
+
+        correct_generate(&file, 15, Some(&sidecar)).unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not overwrite");
+        let meta = std::fs::symlink_metadata(&sidecar).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn correct_generate_refuses_an_automatic_symlink_and_preserves_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_file(dir.path(), "data.bin", &sample(40_000));
+        let sentinel = dir.path().join("sentinel");
+        std::fs::write(&sentinel, b"do not overwrite").unwrap();
+        let sidecar = aerocorrect_sidecar_path_for(&file);
+        std::os::unix::fs::symlink(&sentinel, &sidecar).unwrap();
+        let error = correct_generate(&file, 15, None).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert_eq!(std::fs::read_link(&sidecar).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not overwrite");
+    }
+
+    /// A 50 kB file with its sidecar, then damaged so a repair has to write.
+    fn damaged_with_sidecar(dir: &Path, name: &str) -> (String, Vec<u8>) {
+        let original = sample(50_000);
+        let file = write_file(dir, name, &original);
+        correct_generate(&file, 25, None).unwrap();
+        let mut bytes = original.clone();
+        for b in bytes.iter_mut().take(1_000).skip(100) {
+            *b ^= 0xFF;
+        }
+        std::fs::write(&file, &bytes).unwrap();
+        (file, original)
+    }
+
+    fn is_v3_container(path: &str) -> bool {
+        std::fs::read(path)
+            .unwrap()
+            .starts_with(crate::v3::constants::MAGIC)
+    }
+
+    /// Replace `path` with a new (plaintext) vault, as another writer would.
+    fn create_vault_at(path: &str) -> Result<(), String> {
+        use crate::v3::vault::{CreateOptionsV3, VaultV3};
+        VaultV3::create(&CreateOptionsV3::new_plaintext(path))
+    }
+
+    /// The three writes of the correct tools: `correct gen` (sidecar), the
+    /// in-memory sync repair and the streamed repair behind `correct repair`.
+    fn run_write(site: &str, file: &str) -> Result<(), String> {
+        let sidecar_path = sidecar::aerocorrect_sidecar_path(file);
+        match site {
+            "gen" => correct_generate(file, 25, None).map(drop),
+            "sync" => {
+                let expected = sidecar::AeroCorrectSidecarReader::open(Path::new(&sidecar_path))?
+                    .content_sha256;
+                let bytes = std::fs::read(&sidecar_path).unwrap();
+                sync::verify_repair_sync_file("f", &expected, Path::new(file), &bytes).map(drop)
+            }
+            "repair" => correct_repair(file, None).map(drop),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn gen_refuses_a_lock_file_name_before_reading_the_file() {
+        // The write would refuse it anyway; the refusal comes before the file
+        // is read and its parity computed (no progress is reported).
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("v.aerovault.aerolock");
+        let plain = dir.path().join("plain.bin");
+        std::fs::write(&named, vec![3u8; 50_000]).unwrap();
+        std::fs::write(&plain, vec![3u8; 50_000]).unwrap();
+        let out = dir.path().join("w.aerolock");
+        for (file, out) in [
+            (&named, None),
+            (&plain, Some(out.to_str().unwrap())),
+            (&plain, Some(plain.to_str().unwrap())),
+        ] {
+            let mut read = false;
+            let err =
+                correct_generate_with_progress(file.to_str().unwrap(), 10, out, &mut |_, _| {
+                    read = true
+                })
+                .map(drop)
+                .unwrap_err();
+            assert!(
+                err.contains("vault lock file") || err.contains("the file it is built from"),
+                "{err}"
+            );
+            assert!(!read, "the file was read before the refusal");
+        }
+        assert!(!out.exists());
+        assert!(!crate::lock::lock_path(&plain).exists());
+        // `correct repair` (and `verify_repair_sync_file`) also refuses a
+        // lock-named file before reading it, whether intact or damaged.
+        let report = correct_generate(plain.to_str().unwrap(), 25, None).unwrap();
+        let sidecar_bytes = std::fs::read(&report.sidecar).unwrap();
+        let expected: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(vec![3u8; 50_000]).into()
+        };
+        for damaged in [false, true] {
+            let mut bytes = vec![3u8; 50_000];
+            if damaged {
+                bytes[200..400].fill(0xAA);
+            }
+            std::fs::write(&named, &bytes).unwrap();
+            let mut read = false;
+            let err = correct_repair_anchored_with_progress(
+                named.to_str().unwrap(),
+                Some(&report.sidecar),
+                None,
+                &mut |_, _| read = true,
+            )
+            .map(drop)
+            .unwrap_err();
+            assert!(err.contains("vault lock file"), "{err}");
+            assert!(!read, "repair read the lock-named file before refusing");
+            let err = sync::verify_repair_sync_file("plain.bin", &expected, &named, &sidecar_bytes)
+                .map(drop)
+                .unwrap_err();
+            assert!(err.contains("vault lock file"), "{err}");
+        }
+    }
+
+    #[test]
+    fn correct_tools_write_only_under_the_files_lock() {
+        // Any file, not only a vault: the file could become a vault meanwhile.
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        for site in ["gen", "sync", "repair"] {
+            let (file, _) = damaged_with_sidecar(dir.path(), &format!("{site}.bin"));
+            let before = std::fs::read(&file).unwrap();
+            let sidecar_before = std::fs::read(sidecar::aerocorrect_sidecar_path(&file)).unwrap();
+            let held = crate::lock::acquire(Path::new(&file)).unwrap();
+            let err = run_write(site, &file).unwrap_err();
+            assert!(err.contains("locked by another writer"), "{site}: {err}");
+            assert_eq!(std::fs::read(&file).unwrap(), before, "{site}");
+            assert_eq!(
+                std::fs::read(sidecar::aerocorrect_sidecar_path(&file)).unwrap(),
+                sidecar_before,
+                "{site}"
+            );
+            drop(held);
+            run_write(site, &file).unwrap();
+        }
+        // A verify that finds the file intact writes nothing and needs no lock.
+        let intact = write_file(dir.path(), "intact.bin", &sample(30_000));
+        correct_generate(&intact, 15, None).unwrap();
+        let held = crate::lock::acquire(Path::new(&intact)).unwrap();
+        assert_eq!(correct_repair(&intact, None).unwrap().status, "verified");
+        drop(held);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gen_through_a_link_locks_its_target_and_repair_through_it_is_refused() {
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let real = write_file(dir.path(), "real.bin", &sample(50_000));
+        let link = dir.path().join("link.bin").to_string_lossy().into_owned();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let is_link = || {
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        };
+        // gen writes `link.bin.aerocorrect` under the lock of `real.bin`.
+        let held = crate::lock::acquire(Path::new(&real)).unwrap();
+        let err = correct_generate(&link, 25, None).unwrap_err();
+        assert!(err.contains("locked by another writer"), "{err}");
+        drop(held);
+        let report = correct_generate(&link, 25, None).unwrap();
+        assert_eq!(report.sidecar, sidecar::aerocorrect_sidecar_path(&link));
+        assert!(Path::new(&report.sidecar).exists());
+        assert!(crate::lock::lock_path(Path::new(&real)).exists());
+        assert!(!crate::lock::lock_path(Path::new(&link)).exists());
+        assert!(is_link());
+        // repair would replace the link with the repaired bytes: refused.
+        let mut bytes = std::fs::read(&real).unwrap();
+        bytes[500] ^= 0xFF;
+        std::fs::write(&real, &bytes).unwrap();
+        let err = correct_repair(&link, None).unwrap_err();
+        assert!(err.contains("is a symbolic link"), "{err}");
+        assert!(is_link());
+        assert_eq!(std::fs::read(&real).unwrap(), bytes);
+        // Through the target path, with the link's sidecar, it repairs.
+        let fixed = correct_repair(&real, Some(&report.sidecar)).unwrap();
+        assert_eq!(fixed.status, "repaired");
+        assert_eq!(std::fs::read(&real).unwrap(), sample(50_000));
+    }
+
+    #[test]
+    fn a_vault_created_before_the_write_is_not_overwritten() {
+        // The correct tools read the file without the lock. If a vault is
+        // created at that path before they take it, the write is refused.
+        let dir = tempfile::tempdir().unwrap();
+        for site in ["gen", "sync", "repair"] {
+            let (file, _) = damaged_with_sidecar(dir.path(), &format!("{site}.bin"));
+            let sidecar_before = std::fs::read(sidecar::aerocorrect_sidecar_path(&file)).unwrap();
+            let path = file.clone();
+            sync::BEFORE_WRITE_LOCK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || create_vault_at(&path).unwrap()));
+            });
+            let err = run_write(site, &file).unwrap_err();
+            assert!(
+                err.contains("changed while it was being read"),
+                "{site}: {err}"
+            );
+            assert!(
+                is_v3_container(&file),
+                "{site}: the new vault was overwritten"
+            );
+            assert_eq!(
+                std::fs::read(sidecar::aerocorrect_sidecar_path(&file)).unwrap(),
+                sidecar_before,
+                "{site}: sidecar written for a file that changed"
+            );
+        }
+        // No temp file is left behind by a refused write.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.starts_with(".tmp") && !n.starts_with(".aerovault-v3-")),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn a_vault_cannot_be_created_inside_the_write_window() {
+        // Between the unchanged check and the write the tools hold the lock: a
+        // vault creation at that path must wait and give up, not slip in.
+        crate::lock::set_short_wait_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        for site in ["gen", "sync", "repair"] {
+            let (file, _) = damaged_with_sidecar(dir.path(), &format!("{site}.bin"));
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let (path, out) = (file.clone(), seen.clone());
+            sync::IN_WRITE_WINDOW.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    *out.borrow_mut() = Some(create_vault_at(&path));
+                }));
+            });
+            run_write(site, &file).unwrap();
+            let created = seen.borrow_mut().take().expect("hook ran");
+            let err = created.unwrap_err();
+            assert!(err.contains("locked by another writer"), "{site}: {err}");
+            assert!(!is_v3_container(&file), "{site}");
+        }
     }
 
     #[test]
@@ -1154,5 +1591,178 @@ mod tests {
             b_bytes,
             "B untouched after failed repair"
         );
+    }
+    #[test]
+    fn review_relative_generate_hashes_once_after_destination_lock() {
+        const KEY: &str = "AEROVAULT_RELATIVE_GENERATE_CHILD";
+        if std::env::var_os(KEY).is_some() {
+            std::fs::write("input.bin", sample(32000)).unwrap();
+            sync::HASH_READS.with(|n| n.set(0));
+            correct_generate("input.bin", 20, None).unwrap();
+            assert_eq!(sync::HASH_READS.with(|n| n.get()), 1);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "error_correction::tests::review_relative_generate_hashes_once_after_destination_lock"])
+            .current_dir(dir.path()).env(KEY, "1").status().unwrap();
+        assert!(status.success(), "{status}");
+    }
+    #[test]
+    fn review_parity_length_matches_generator_and_bounds_every_supported_grid() {
+        let mut grids = std::collections::BTreeSet::new();
+        for pct in ERROR_CORRECTION_MIN_PCT..=ERROR_CORRECTION_MAX_PCT {
+            let (k, p) = error_correction_grid(pct);
+            assert!(k >= 2 && p <= 2);
+            grids.insert((k, p));
+            for len in [1, 256, ERROR_CORRECTION_MIN_SHARD - 1, 9001] {
+                let input = vec![0x5a; len];
+                let actual = compute_error_correction_shards_grid(&[&input], k, p)
+                    .0
+                    .len() as u64;
+                assert_eq!(
+                    parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
+                    actual
+                );
+                assert!(actual <= parity_payload_bound(len as u64).unwrap());
+            }
+        }
+        for (k, p) in grids {
+            for len in [
+                0,
+                k * ERROR_CORRECTION_MIN_SHARD - 1,
+                k * ERROR_CORRECTION_MIN_SHARD + 1,
+            ] {
+                let input = vec![0x5a; len];
+                assert_eq!(
+                    parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
+                    compute_error_correction_shards_grid(&[&input], k, p)
+                        .0
+                        .len() as u64
+                );
+            }
+        }
+        for (k, p) in [(4, 2), (13, 2)] {
+            let len = k * ERROR_CORRECTION_MAX_SHARD + 1;
+            let input = vec![0x5a; len];
+            assert_eq!(
+                parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
+                compute_error_correction_shards_grid(&[&input], k, p)
+                    .0
+                    .len() as u64
+            );
+        }
+    }
+    #[test]
+    fn review_parity_bound_covers_checksum_discontinuities() {
+        let mut previous = 0;
+        for len in 0..=100_000 {
+            let bound = parity_payload_bound(len).unwrap();
+            assert!(bound >= previous, "bound must remain monotone at {len}");
+            previous = bound;
+            for pct in ERROR_CORRECTION_MIN_PCT..=ERROR_CORRECTION_MAX_PCT {
+                let (k, p) = error_correction_grid(pct);
+                assert!(
+                    bound >= parity_payload_len(len, k as u64, p as u64).unwrap(),
+                    "{len}/{pct}"
+                );
+            }
+        }
+        assert_eq!(parity_payload_len(8193, 10, 2).unwrap(), 8304);
+        assert!(parity_payload_len(8193, 2, 2).unwrap() < 8304);
+        for pct in ERROR_CORRECTION_MIN_PCT..=ERROR_CORRECTION_MAX_PCT {
+            let (k, p) = error_correction_grid(pct);
+            for len in [
+                2,
+                k as u64 * ERROR_CORRECTION_MAX_SHARD as u64 - 1,
+                k as u64 * ERROR_CORRECTION_MAX_SHARD as u64 + 1,
+                u32::MAX as u64,
+            ] {
+                assert!(
+                    parity_payload_bound(len).unwrap()
+                        >= parity_payload_len(len, k as u64, p as u64).unwrap()
+                );
+            }
+        }
+        assert!(parity_payload_bound(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn review_serialized_payload_cap_does_not_authorize_working_set_amplification() {
+        for shard_size in [512 * 1024, 2 * 1024 * 1024] {
+            let header = ErrorCorrectionPayloadHeader {
+                data_shards: 200,
+                parity_shards: 1,
+                shard_size,
+                total_data_len: 1024 * 1024,
+            };
+            let (data, groups) = error_correction_geometry(&header);
+            let length = 32
+                + (data + groups) * ERROR_CORRECTION_SHARD_CKSUM_LEN
+                + groups * shard_size as usize;
+            let mut bytes = vec![0; length];
+            bytes[..32].copy_from_slice(&header.to_bytes());
+            assert!(length as u64 <= parity_payload_bound(header.total_data_len).unwrap());
+            let error = ErrorCorrectionPayload::from_bytes(&bytes).unwrap_err();
+            assert!(error.contains("working set"), "{error}");
+        }
+    }
+
+    #[test]
+    fn review_supported_grids_reconstruct_with_bounded_working_set() {
+        let grids: std::collections::BTreeSet<_> = (ERROR_CORRECTION_MIN_PCT
+            ..=ERROR_CORRECTION_MAX_PCT)
+            .map(error_correction_grid)
+            .chain([(10, 2)])
+            .collect();
+        for (k, p) in grids {
+            for length in [1, 4097, 16385] {
+                let original = vec![0x5a; length];
+                let (bytes, _, _, _) = compute_error_correction_shards_grid(&[&original], k, p);
+                ErrorCorrectionPayload::from_bytes(&bytes).unwrap();
+                let mut blocks = vec![original.clone()];
+                blocks[0][0] ^= 1;
+                assert!(reconstruct_from_error_correction(&mut blocks, &bytes).unwrap() > 0);
+                assert_eq!(blocks[0], original, "{k}/{p}, {length}");
+            }
+        }
+    }
+
+    #[test]
+    fn review_correct_generate_preserves_vault_published_during_destination_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        std::fs::write(&source, sample(32000)).unwrap();
+        let foreign = dir.path().join("foreign.aerozip");
+        crate::v3::VaultV3::create(&crate::v3::CreateOptionsV3::new_plaintext(&foreign)).unwrap();
+        let foreign_bytes = std::fs::read(&foreign).unwrap();
+        let destination =
+            std::path::PathBuf::from(sidecar::aerocorrect_sidecar_path(source.to_str().unwrap()));
+        let held = crate::lock::acquire(&destination).unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = source.clone();
+            let worker = scope.spawn(move || {
+                crate::lock::ON_LOCK_CONTENTION.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        tx.send(()).unwrap();
+                    }))
+                });
+                correct_generate(path.to_str().unwrap(), 20, None)
+            });
+            let waited = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+            if waited {
+                std::fs::write(&destination, &foreign_bytes).unwrap();
+            }
+            drop(held);
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(
+                waited,
+                "generation did not encounter destination contention"
+            );
+            assert!(error.contains("contains a vault"), "{error}");
+        });
+        assert_eq!(std::fs::read(&destination).unwrap(), foreign_bytes);
+        assert!(crate::v3::VaultV3::open_plaintext(&destination).is_ok());
     }
 }
