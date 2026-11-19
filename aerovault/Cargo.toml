@@ -29,6 +29,7 @@ test-vectors = []
 fast-kdf-for-tests = []
 
 [dependencies]
+same-file = { workspace = true }
 aes-gcm-siv = { workspace = true }
 aes-kw = { workspace = true }
 aes-siv = { workspace = true }

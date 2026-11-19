@@ -14,7 +14,7 @@ fn plaintext_extract_is_explicit_and_does_not_prompt_for_a_password() {
     assert!(VaultV3::open(&path, "any-password-123").is_err());
     for selected in [false, true] {
         let out = dir.path().join(if selected { "selected" } else { "all" });
-        std::fs::create_dir(&out).unwrap();
+        assert!(!out.exists());
         let mut command = Command::new(env!("CARGO_BIN_EXE_aerovault"));
         command
             .args(["--json", "vault", "extract"])

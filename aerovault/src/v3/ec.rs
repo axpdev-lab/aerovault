@@ -143,6 +143,12 @@ fn recovery_sidecar_path(vault: &Path) -> PathBuf {
     native
 }
 
+pub(super) fn header_recovery_candidate(path: &Path) -> bool {
+    std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|p| recovery_sidecar_path(&p).exists())
+}
+
 /// An automatic recovery filename is not authorization to replace another
 /// vault or a non-file. Call only while its destination guard is held.
 pub(crate) fn validate_automatic_sidecar_destination(path: &Path) -> Result<(), String> {
@@ -255,15 +261,8 @@ fn vault_sidecar_parity(sidecar: &AeroCorrectSidecar, role: usize) -> &[u8] {
         .unwrap_or(&[])
 }
 
-/// Seed an empty three-region sidecar at create time (detached/both placements),
-/// so the file exists from creation; `export_parity` fills it once files are
-/// added. `container_bytes` are the just-written empty-vault bytes. The caller
-/// holds the destination guard from before replacing the source through this write.
-pub(super) fn seed_empty_sidecar(
-    path: &Path,
-    container_bytes: &[u8],
-    _out_lock: &Option<crate::lock::WriteLock>,
-) -> Result<(), String> {
+/// Build the empty three-region seed before either create destination changes.
+pub(super) fn empty_sidecar_bytes(container_bytes: &[u8]) -> Vec<u8> {
     let segments = vec![
         AeroCorrectSegment {
             window_offset: 0,
@@ -286,8 +285,7 @@ pub(super) fn seed_empty_sidecar(
         container_bytes.len() as u64,
         segments,
     );
-    let out = default_sidecar_path(path);
-    atomic_write(&out, &sidecar.to_bytes())
+    sidecar.to_bytes()
 }
 
 /// Collect the live on-disk blocks in data-section order ([u64 len][ciphertext]),
@@ -957,6 +955,11 @@ pub(super) fn recover_header_from_sidecar(
     on_disk_header: &[u8],
     password: &str,
 ) -> Result<Option<UnlockedHeader>, String> {
+    // Automatic encrypted-header recovery must use the physical namespace
+    // that password rotation refreshes. Alias-local parity remains available
+    // for authenticated manifest recovery, never for superseded key wrapping.
+    let physical = std::fs::canonicalize(vault_path).map_err(|e| e.to_string())?;
+    let vault_path = physical.as_path();
     let sidecar_path = recovery_sidecar_path(vault_path);
     if !sidecar_path.exists() {
         return Ok(None);
@@ -3238,5 +3241,43 @@ mod tests {
         assert_eq!(acl::guest_effective_rights(&rollback).unwrap() & 1, 0);
         assert!(VaultV3::open(&rollback, PW).is_ok());
         eprintln!("Windows DACL: second-principal read denied in private staging, publication and rollback");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_alias_header_recovery_cannot_restore_old_password() {
+        for physical_sidecar in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("target.aerovault");
+            let alias = dir.path().join("alias.aerovault");
+            VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            VaultV3::export_parity(&alias, PW, None).unwrap();
+            let alias_parity = std::fs::read(default_sidecar_path(&alias)).unwrap();
+            if physical_sidecar {
+                VaultV3::export_parity(&path, PW, None).unwrap();
+            }
+            let mut vault = VaultV3::open(&path, PW).unwrap();
+            VaultV3::change_password(&mut vault, "new-password-123").unwrap();
+            for name in [&path, &alias] {
+                assert!(VaultV3::open(name, PW).is_err());
+                assert!(VaultV3::open(name, "new-password-123").is_ok());
+            }
+            assert_eq!(
+                std::fs::read(default_sidecar_path(&alias)).unwrap(),
+                alias_parity
+            );
+            if physical_sidecar {
+                let mut bytes = std::fs::read(&path).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(&path, bytes).unwrap();
+                assert!(VaultV3::open(&alias, PW).is_err());
+                assert!(
+                    VaultV3::open(&alias, "new-password-123")
+                        .unwrap()
+                        .header_repaired_on_open
+                );
+            }
+        }
     }
 }

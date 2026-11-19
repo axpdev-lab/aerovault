@@ -195,12 +195,16 @@ impl Vault {
 
         atomic_rename(tmp.path(), &opts.path)?;
         drop(lock);
+        #[cfg(test)]
+        if let Some(hook) = AFTER_CREATE_COMMIT.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
 
         let master_key = SecretVec::new(master_key_raw.to_vec());
         let mac_key = SecretVec::new(mac_key_raw.to_vec());
 
         Ok(Self {
-            path: crate::lock::anchored(&opts.path)?,
+            path: opts.path,
             header,
             master_key,
             mac_key,
@@ -1678,6 +1682,11 @@ fn open_new_output_file(path: &Path, output_dir: &Path) -> crate::Result<File> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static AFTER_CREATE_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 thread_local! { static FAIL_PASSWORD_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 fn sync_password_change_parent(path: &Path) -> crate::Result<()> {
@@ -2587,5 +2596,29 @@ mod tests {
             vault.header.to_bytes().as_slice(),
             &std::fs::read(&path).unwrap()[..HEADER_SIZE]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_create_returns_committed_path_when_parent_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("created.aerovault");
+        let expected = std::fs::canonicalize(&parent)
+            .unwrap()
+            .join("created.aerovault");
+        let moved = dir.path().join("moved");
+        let original = parent.clone();
+        let destination = moved.clone();
+        AFTER_CREATE_COMMIT.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(original, destination).unwrap();
+            }))
+        });
+        let vault = Vault::create(CreateOptions::new(&path, "test-password-123")).unwrap();
+        assert_eq!(vault.path, expected);
+        assert!(!parent.exists());
+        assert!(Vault::open(moved.join("created.aerovault"), "test-password-123").is_ok());
     }
 }

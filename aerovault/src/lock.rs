@@ -563,6 +563,15 @@ impl WriteLock {
         &self.source
     }
 
+    /// Match an ingestion candidate to the held lock by open-file identity.
+    pub(crate) fn holds_file(&self, path: &Path) -> io::Result<bool> {
+        let Some(file) = &self._file else {
+            return Ok(false);
+        };
+        let held = same_file::Handle::from_file(file.try_clone()?)?;
+        Ok(held == same_file::Handle::from_path(path)?)
+    }
+
     /// Only a real guard of this very lock file can cover a second namespace.
     /// Never reconstruct the held path through the caller's mutable aliases.
     pub(crate) fn covers_namespace(&self, source: &Path) -> bool {

@@ -45,10 +45,9 @@ fn same_generation_handles_preserve_each_successful_add() {
     let mut fresh = VaultV3::open_plaintext(&path).unwrap();
     VaultV3::add_files(&mut fresh, &[(source, "second".into())]).unwrap();
     let reopened = VaultV3::open_plaintext(&path).unwrap();
-    assert!(VaultV3::summary(&reopened)
-        .entries
-        .iter()
-        .any(|e| e.path == "second"));
+    let final_entries = VaultV3::summary(&reopened).entries;
+    assert!(final_entries.iter().any(|e| e.path == "first"));
+    assert!(final_entries.iter().any(|e| e.path == "second"));
 }
 
 #[test]

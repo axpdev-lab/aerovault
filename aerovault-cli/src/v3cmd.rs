@@ -466,6 +466,9 @@ fn cmd_extract(
     } else {
         unlock(vault)?
     };
+    // The CLI's output is a directory, including for a selected entry. Open
+    // and validate the archive before creating any destination on disk.
+    std::fs::create_dir_all(output)?;
     if let Some(name) = entry {
         let pb = spinner("Extracting...");
         let dest = VaultV3::extract_entry(&v, name, output)?;

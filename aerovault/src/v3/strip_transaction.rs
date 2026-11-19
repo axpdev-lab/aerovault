@@ -41,6 +41,14 @@ pub(super) fn generation(path: &Path) -> Result<Generation, String> {
     })
 }
 
+fn generation_if_present(path: &Path) -> Result<Option<Generation>, String> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(_) => generation(path).map(Some),
+    }
+}
+
 pub(super) fn journal_path(source: &Path) -> PathBuf {
     let lock = crate::lock::lock_path(source);
     let hash = blake3::hash(lock.file_name().unwrap_or_default().as_encoded_bytes());
@@ -112,9 +120,9 @@ impl SavedPermissions {
 struct Journal {
     version: u8,
     source_name: Vec<u8>,
-    old_vault: Generation,
+    old_vault: Option<Generation>,
     new_vault: Generation,
-    old_sidecar: Generation,
+    old_sidecar: Option<Generation>,
     new_sidecar: Generation,
     #[serde(default)]
     old_vault_permissions: Option<SavedPermissions>,
@@ -352,7 +360,7 @@ fn load(path: &Path, source: &Path) -> Result<(Journal, PathBuf), String> {
     let journal: Journal =
         serde_json::from_slice(&bytes).map_err(|e| format!("invalid strip journal: {e}"))?;
     let recorded = recorded_source(output_parent_dir(source), &journal.source_name)?;
-    if journal.version != 1
+    if !matches!(journal.version, 1 | 2)
         || (native_name(source) != journal.source_name && !same_existing_file(source, &recorded))
     {
         return Err(
@@ -379,11 +387,11 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         return Err("strip recorded source lock namespace changed".to_string());
     }
     let sidecar = super::ec::default_sidecar_path(source);
-    let vault_now =
-        generation(source).map_err(|e| conflict(path, &format!("vault unavailable: {e}")))?;
-    let sidecar_now =
-        generation(&sidecar).map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
-    if vault_now == journal.new_vault && sidecar_now == journal.new_sidecar {
+    let vault_now = generation_if_present(source)
+        .map_err(|e| conflict(path, &format!("vault unavailable: {e}")))?;
+    let sidecar_now = generation_if_present(&sidecar)
+        .map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
+    if vault_now == Some(journal.new_vault) && sidecar_now == Some(journal.new_sidecar) {
         // A crash can occur just after rename and before inheritance restoration.
         restore_published_permissions(source, &sidecar, &journal)?;
         cleanup(path)?;
@@ -394,19 +402,19 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         cleanup(path)?;
         return Ok(RecoveryOutcome::Original);
     }
-    if ![journal.old_vault, journal.new_vault].contains(&vault_now)
-        || ![journal.old_sidecar, journal.new_sidecar].contains(&sidecar_now)
+    if ![journal.old_vault, Some(journal.new_vault)].contains(&vault_now)
+        || ![journal.old_sidecar, Some(journal.new_sidecar)].contains(&sidecar_now)
     {
         return Err(conflict(path, "newer or damaged vault or sidecar"));
     }
     // Verify both copies before replacing either original.
-    if generation(&path.join("old-vault"))? != journal.old_vault
-        || generation(&path.join("old-sidecar"))? != journal.old_sidecar
+    if generation_if_present(&path.join("old-vault"))? != journal.old_vault
+        || generation_if_present(&path.join("old-sidecar"))? != journal.old_sidecar
     {
         return Err("strip rollback generation check failed; files left untouched".to_string());
     }
     if vault_now != journal.old_vault {
-        replace_from(
+        restore_original(
             &path.join("old-vault"),
             source,
             journal.old_vault,
@@ -415,7 +423,7 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
         )?;
     }
     if sidecar_now != journal.old_sidecar {
-        replace_from(
+        restore_original(
             &path.join("old-sidecar"),
             &sidecar,
             journal.old_sidecar,
@@ -425,6 +433,34 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     }
     cleanup(path)?;
     Ok(RecoveryOutcome::Original)
+}
+
+fn restore_original(
+    backup: &Path,
+    target: &Path,
+    original: Option<Generation>,
+    current: Option<Generation>,
+    permissions: Option<&SavedPermissions>,
+) -> Result<(), String> {
+    if let Some(original) = original {
+        return replace_from(
+            backup,
+            target,
+            original,
+            current.ok_or("rollback target unexpectedly absent")?,
+            permissions,
+        );
+    }
+    // Absence is an original state too. Remove only the exact recorded new
+    // generation; preserve any later file as a recovery conflict.
+    if generation_if_present(target)? != current {
+        return Err("strip target changed before restoring absence".into());
+    }
+    if current.is_some() {
+        fs::remove_file(target).map_err(|e| e.to_string())?;
+        sync_dir(output_parent_dir(target))?;
+    }
+    Ok(())
 }
 
 fn restore_published_permissions(
@@ -485,18 +521,26 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
 pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> Result<(), String> {
     let sidecar = super::ec::default_sidecar_path(source);
     let journal = Journal {
-        version: 1,
+        version: 2,
         source_name: native_name(source),
-        old_vault: generation(&prepared.path().join("old-vault"))?,
+        old_vault: generation_if_present(&prepared.path().join("old-vault"))?,
         new_vault: generation(&prepared.path().join("new-vault"))?,
-        old_sidecar: generation(&prepared.path().join("old-sidecar"))?,
+        old_sidecar: generation_if_present(&prepared.path().join("old-sidecar"))?,
         new_sidecar: generation(&prepared.path().join("new-sidecar"))?,
-        old_vault_permissions: Some(SavedPermissions::capture(source)?),
-        old_sidecar_permissions: Some(SavedPermissions::capture(&sidecar)?),
+        old_vault_permissions: if source.exists() {
+            Some(SavedPermissions::capture(source)?)
+        } else {
+            None
+        },
+        old_sidecar_permissions: if sidecar.exists() {
+            Some(SavedPermissions::capture(&sidecar)?)
+        } else {
+            None
+        },
     };
     if !lock.covers_namespace(source)
-        || generation(source)? != journal.old_vault
-        || generation(&sidecar)? != journal.old_sidecar
+        || generation_if_present(source)? != journal.old_vault
+        || generation_if_present(&sidecar)? != journal.old_sidecar
     {
         return Err(
             "vault or sidecar changed while preparing strip; originals left unchanged".to_string(),

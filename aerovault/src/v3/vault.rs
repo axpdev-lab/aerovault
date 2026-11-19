@@ -351,7 +351,10 @@ impl VaultV3 {
     /// path, else detached sidecar, else embedded extension). All-or-nothing:
     /// every reconstructed block is re-verified against the manifest
     /// `cipher_hash` and persisted only if all pass; on `dry_run` nothing is
-    /// written. Returns `(repaired_block_count, parity_source)`.
+    /// written. Returns `(repaired_block_count, parity_source)`; zero means
+    /// no damaged content blocks were detected. Detected damage that cannot be
+    /// fully repaired from available parity returns `Err`, including in dry-run
+    /// mode, rather than `Ok((0, _))`.
     pub fn repair(
         vault: &mut OpenVaultV3,
         dry_run: bool,
@@ -480,7 +483,7 @@ impl VaultV3 {
 
     /// Add files into the vault at the given vault-relative paths, then persist.
     pub fn add_files(vault: &mut OpenVaultV3, sources: &[(PathBuf, String)]) -> Result<(), String> {
-        write_op(vault, |v, lock| {
+        write_op(vault, |v, lock, _| {
             append_sources_batched(v, sources)?;
             save_locked(v, lock)
         })
@@ -505,7 +508,7 @@ impl VaultV3 {
             };
             mapped.push((source.clone(), entry_path));
         }
-        write_op(vault, |v, lock| {
+        write_op(vault, |v, lock, _| {
             if !target.is_empty() {
                 create_directory_in_manifest(&mut v.manifest, target)?;
             }
@@ -518,7 +521,7 @@ impl VaultV3 {
     /// Returns `true` when the leaf directory was newly created, `false` when it
     /// already existed.
     pub fn create_directory(vault: &mut OpenVaultV3, dir_path: &str) -> Result<bool, String> {
-        write_op(vault, |v, lock| {
+        write_op(vault, |v, lock, _| {
             let created = create_directory_in_manifest(&mut v.manifest, dir_path)?;
             save_locked(v, lock)?;
             Ok(created)
@@ -532,8 +535,8 @@ impl VaultV3 {
         source_dir: &Path,
         target_prefix: Option<&str>,
     ) -> Result<(usize, usize), String> {
-        write_op(vault, |v, lock| {
-            add_directory_into(v, source_dir, target_prefix, lock)
+        write_op(vault, |v, lock, sidecar| {
+            add_directory_into(v, source_dir, target_prefix, lock, sidecar)
         })
     }
 
@@ -548,7 +551,7 @@ impl VaultV3 {
         entry_names: &[String],
         recursive: bool,
     ) -> Result<usize, String> {
-        write_op(vault, |v, lock| {
+        write_op(vault, |v, lock, _| {
             // Compaction replaces the data section: keep the old one until the
             // save succeeds, so a failed delete leaves the handle as it was.
             let (removed, replaced) = delete_entries_from_manifest(v, entry_names, recursive)?;
@@ -564,7 +567,7 @@ impl VaultV3 {
 
     /// Move (or rename across directories) an entry/subtree, then persist.
     pub fn move_entry(vault: &mut OpenVaultV3, from: &str, to: &str) -> Result<(), String> {
-        write_op(vault, |v, lock| {
+        write_op(vault, |v, lock, _| {
             move_entry_in_manifest(v, from, to)?;
             save_locked(v, lock)
         })
@@ -582,7 +585,7 @@ impl VaultV3 {
             Some(parent) => join_vault_path(parent, &leaf),
             None => leaf,
         };
-        write_op(vault, |v, lock| {
+        write_op(vault, |v, lock, _| {
             move_entry_in_manifest(v, &current, &target)?;
             save_locked(v, lock)
         })
@@ -590,7 +593,7 @@ impl VaultV3 {
 
     /// Copy an entry/subtree (reusing the same content chunks), then persist.
     pub fn copy_entry(vault: &mut OpenVaultV3, from: &str, to: &str) -> Result<(), String> {
-        write_op(vault, |v, lock| {
+        write_op(vault, |v, lock, _| {
             copy_entry_in_manifest(v, from, to)?;
             save_locked(v, lock)
         })
@@ -1261,14 +1264,14 @@ fn progress_total(entries: &[&ManifestEntryV3]) -> u64 {
 /// it themselves.
 fn write_op<T>(
     vault: &mut OpenVaultV3,
-    op: impl FnOnce(&mut OpenVaultV3, &WriteLock) -> Result<T, String>,
+    op: impl FnOnce(&mut OpenVaultV3, &WriteLock, Option<&WriteLock>) -> Result<T, String>,
 ) -> Result<T, String> {
     let lock = write_lock(&vault.path)?;
     #[cfg(test)]
     if let Some(hook) = BEFORE_MUTATION_SIDECAR_LOCK.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let _sidecar_lock = lock_default_sidecar(&vault.path)?;
+    let sidecar_lock = lock_default_sidecar(&vault.path)?;
     if (has_embedded_parity(vault) || super::ec::detached_recovery_needs_protection(&vault.path))
         && !super::ec::scrub_vault(vault).is_empty()
     {
@@ -1276,7 +1279,7 @@ fn write_op<T>(
     }
     let manifest = vault.manifest.clone();
     let data_len = vault.data.len();
-    let result = op(vault, &lock);
+    let result = op(vault, &lock, sidecar_lock.as_ref());
     if result.is_err() {
         vault.manifest = manifest;
         vault.data.truncate(data_len);
@@ -2177,14 +2180,24 @@ fn create_empty_vault(
     } else {
         None
     };
-    atomic_write(path, &bytes)?;
-
-    // Detached/both placements seed the sidecar so the file exists from
-    // creation. An empty vault has an empty parity payload; re-run
-    // `export-parity` after adding files (par2 semantics).
     if error_correction.is_some_and(|p| p.writes_sidecar()) {
-        super::ec::seed_empty_sidecar(path, &bytes, &sidecar_lock)?;
+        let sidecar = super::ec::default_sidecar_path(path);
+        let prepared =
+            super::strip_transaction::private_dir(output_parent_dir(path), ".aerocreate-prepare-")?;
+        if path.exists() {
+            super::strip_transaction::copy_file(path, &prepared.path().join("old-vault"))?;
+        }
+        if sidecar.exists() {
+            super::strip_transaction::copy_file(&sidecar, &prepared.path().join("old-sidecar"))?;
+        }
+        atomic_write(&prepared.path().join("new-vault"), &bytes)?;
+        let seed = super::ec::empty_sidecar_bytes(&bytes);
+        atomic_write(&prepared.path().join("new-sidecar"), &seed)?;
+        super::strip_transaction::publish(path, prepared, &_lock)?;
+    } else {
+        atomic_write(path, &bytes)?;
     }
+    drop(sidecar_lock);
     Ok(())
 }
 
@@ -2381,6 +2394,12 @@ fn open_vault_with_guard(
             Ok((h, mac, master)) => (h, mac, master, false),
             Err(orig) => {
                 if recovery_guard.is_none() {
+                    let physical = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+                    if !super::ec::header_recovery_candidate(&path)
+                        && !super::strip_transaction::journal_path(&physical).exists()
+                    {
+                        return Err(orig);
+                    }
                     drop(file);
                     return retry_open_for_recovery(&path, password, encrypted_only);
                 }
@@ -2969,6 +2988,7 @@ fn add_directory_into(
     source_dir: &Path,
     target_prefix: Option<&str>,
     lock: &WriteLock,
+    sidecar_lock: Option<&WriteLock>,
 ) -> Result<(usize, usize), String> {
     let source = source_dir
         .canonicalize()
@@ -2998,6 +3018,16 @@ fn add_directory_into(
         .filter_map(|e| e.ok())
     {
         if entry.path() == source {
+            continue;
+        }
+        if entry.file_type().is_file()
+            && (lock.holds_file(entry.path()).map_err(|e| e.to_string())?
+                || sidecar_lock
+                    .map(|guard| guard.holds_file(entry.path()))
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(false))
+        {
             continue;
         }
         if all_entries.len() >= 500_000 {
@@ -5642,6 +5672,108 @@ mod tests {
                     .unwrap()
                     .header_repaired_on_open
             );
+        }
+    }
+
+    #[test]
+    fn round6_wrong_password_without_recovery_does_not_wait_for_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-recovery.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        let expected = VaultV3::open(&path, "wrong-password-123").err().unwrap();
+        let _guard = crate::lock::acquire(&path).unwrap();
+        crate::lock::set_short_wait_for_this_thread();
+        crate::lock::take_trace();
+        let actual = VaultV3::open(&path, "wrong-password-123").err().unwrap();
+        assert_eq!(actual, expected);
+        assert!(!actual.contains("locked"));
+        let events = crate::lock::take_trace();
+        assert!(!events.contains(&"lock"), "{events:?}");
+        assert_eq!(
+            events.iter().filter(|&&e| e == "derive").count(),
+            1,
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn round6_directory_import_excludes_only_held_lock_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let path = source.join("inside.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        std::fs::write(source.join("ordinary.txt"), b"ordinary data").unwrap();
+        std::fs::write(source.join("unrelated.aerolock"), b"ordinary named file").unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_directory(&mut vault, &source, None).unwrap();
+        let reopened = VaultV3::open_plaintext(&path).unwrap();
+        let entries = VaultV3::list(&reopened);
+        assert!(entries.iter().any(|e| e.path == "ordinary.txt"));
+        assert!(entries.iter().any(|e| e.path == "unrelated.aerolock"));
+        for held in [&path, &super::super::ec::default_sidecar_path(&path)] {
+            let name = crate::lock::lock_path(held).file_name().unwrap().to_owned();
+            assert!(!entries.iter().any(|e| e.path == name.to_string_lossy()));
+        }
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let dest = VaultV3::extract_entry(&reopened, "ordinary.txt", &out).unwrap();
+        assert_eq!(std::fs::read(dest).unwrap(), b"ordinary data");
+    }
+
+    #[test]
+    fn round6_detached_create_failure_restores_original_pair_or_absence() {
+        use super::super::ec::{default_sidecar_path, RecoveryPlacement};
+        for placement in [RecoveryPlacement::Detached, RecoveryPlacement::Both] {
+            for existing in [false, true] {
+                for had_sidecar in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("create.aerovault");
+                    let sidecar = default_sidecar_path(&path);
+                    if existing {
+                        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+                        let input = dir.path().join("input");
+                        std::fs::write(&input, b"keep original").unwrap();
+                        let mut v = VaultV3::open(&path, PW).unwrap();
+                        VaultV3::add_files(&mut v, &[(input, "original".into())]).unwrap();
+                    }
+                    if had_sidecar {
+                        let seed = super::super::ec::empty_sidecar_bytes(b"prior source");
+                        std::fs::write(&sidecar, seed).unwrap();
+                    }
+                    let old_vault = std::fs::read(&path).ok();
+                    let old_sidecar = std::fs::read(&sidecar).ok();
+                    let source = path.clone();
+                    super::super::strip_transaction::AFTER_STRIP_VAULT.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move || {
+                            let journal = super::super::strip_transaction::journal_path(&source);
+                            std::fs::remove_file(journal.join("new-sidecar")).unwrap();
+                        }));
+                    });
+                    let error = VaultV3::create_with_error_correction(
+                        &CreateOptionsV3::new(&path, "new-password-123"),
+                        placement,
+                        20,
+                    )
+                    .unwrap_err();
+                    assert!(error.contains("original vault restored"), "{error}");
+                    assert_eq!(std::fs::read(&path).ok(), old_vault);
+                    assert_eq!(std::fs::read(&sidecar).ok(), old_sidecar);
+                    if existing {
+                        assert!(VaultV3::list(&VaultV3::open(&path, PW).unwrap())
+                            .iter()
+                            .any(|e| e.path == "original"));
+                    }
+                    VaultV3::create_with_error_correction(
+                        &CreateOptionsV3::new(&path, "new-password-123"),
+                        placement,
+                        20,
+                    )
+                    .unwrap();
+                    assert!(VaultV3::open(&path, "new-password-123").is_ok());
+                    assert!(sidecar.is_file());
+                }
+            }
         }
     }
 }

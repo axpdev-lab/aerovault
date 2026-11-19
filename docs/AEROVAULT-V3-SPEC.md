@@ -350,3 +350,9 @@ On Windows, pair preparation directories and their new children grant access onl
 AVEC reconstruction checks its declared shard size against the supported generator rule, `clamp(ceil(L/K), 4096, 1048576)`, before any shard allocation. The original fixed K=10/P=2 release and all percentage-selected grids use this rule. Serialized parity byte caps remain unchanged. This rejects padding amplification even when the serialized input fits its byte cap.
 
 Healthy opens remain lock-free. If a header or manifest needs recovery, the reader acquires the source coordination guard, recovers any pending pair and reopens the physical source under that guard before consulting recovery data. This covers a reader that passed its initial journal check before rotation published its journal. Read-only media retain the documented unlocked-read limitation when a missing source guard cannot be created; pending pair recovery still requires a real guard.
+
+### Automatic header recovery and symbolic aliases
+
+Automatic encrypted-header recovery uses only the physical container's native or validated legacy recovery namespace, which password rotation refreshes or requires the owner to retire. An alias-local sidecar may still recover a manifest after authenticated header unlock; it cannot supply encrypted key wrapping. Export from the physical container name when automatic header recovery is required. Custom-path backups still require explicit re-export or retirement.
+
+Detached/Both creation prepares the new container and empty recovery seed before replacing either destination. Pair journal version 2 records original absence as well as file generations; interrupted creation restores the original files or absence and preserves conflicting later writes. Existing version-1 journals remain readable. A complete new pair may remain committed when the final durability sync reports an error, as reported by the publication diagnostic.
