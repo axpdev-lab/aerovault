@@ -785,6 +785,32 @@ fn recover_locked(source: &Path, path: &Path, lock: &WriteLock) -> Result<Recove
     let sidecar_now =
         recorded_generation(&sidecar, &[journal.old_sidecar, Some(journal.new_sidecar)])
             .map_err(|e| conflict(path, &format!("sidecar unavailable: {e}")))?;
+    // Publishing a generation consumes its staged entry. A matching
+    // destination while the entry is still present came from another writer.
+    // This evidence remains in the journal across recovery attempts.
+    for (staged, old, new, current) in [
+        ("new-vault", journal.old_vault, journal.new_vault, vault_now),
+        (
+            "new-sidecar",
+            journal.old_sidecar,
+            journal.new_sidecar,
+            sidecar_now,
+        ),
+    ] {
+        if current == old || current != Some(new) {
+            continue;
+        }
+        match fs::symlink_metadata(path.join(staged)) {
+            Ok(_) => {
+                return Err(conflict(
+                    path,
+                    &format!("destination matches unpublished staged content ({staged})"),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(conflict(path, &format!("cannot verify {staged}: {error}"))),
+        }
+    }
     let original_pair = vault_now == journal.old_vault && sidecar_now == journal.old_sidecar;
     if original_pair
         && path
@@ -1312,7 +1338,9 @@ mod tests {
 
     #[test]
     fn strip_publication_keeps_byte_only_edits_at_both_rename_boundaries() {
-        for edit_before_vault in [true, false] {
+        for (edit_before_vault, matches_stage) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
             let dir = tempfile::tempdir().unwrap();
             let source = dir.path().join("source.aerozip");
             let sidecar = super::super::ec::default_sidecar_path(&source);
@@ -1324,10 +1352,11 @@ mod tests {
             fs::write(prepared.path().join("new-vault"), b"vault new").unwrap();
             fs::write(prepared.path().join("new-sidecar"), b"sidecar new").unwrap();
             let target = if edit_before_vault { &source } else { &sidecar };
-            let edited = if edit_before_vault {
-                &b"vault ext"[..]
-            } else {
-                &b"sidecar ext"[..]
+            let edited: &[u8] = match (edit_before_vault, matches_stage) {
+                (true, false) => b"vault ext",
+                (false, false) => b"sidecar ext",
+                (true, true) => b"vault new",
+                (false, true) => b"sidecar new",
             };
             let path = target.clone();
             let slot = if edit_before_vault {
@@ -1346,6 +1375,25 @@ mod tests {
             );
             assert!(journal_path(&source).is_dir());
             assert_eq!(fs::read(target).unwrap(), edited);
+            let staged = if edit_before_vault {
+                "new-vault"
+            } else {
+                "new-sidecar"
+            };
+            assert!(journal_path(&source).join(staged).is_file());
+            let until_retry = (fs::read(&source).unwrap(), fs::read(&sidecar).unwrap());
+            for _ in 0..2 {
+                let error = recover_under_guard(&lock).unwrap_err();
+                if matches_stage {
+                    assert!(
+                        error.contains("matches unpublished staged content"),
+                        "{error}"
+                    );
+                }
+                assert_eq!(fs::read(&source).unwrap(), until_retry.0);
+                assert_eq!(fs::read(&sidecar).unwrap(), until_retry.1);
+                assert!(journal_path(&source).join(staged).is_file());
+            }
         }
     }
 
