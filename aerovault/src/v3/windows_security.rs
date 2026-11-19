@@ -218,9 +218,26 @@ pub(super) fn capture(path: &Path) -> Result<String, String> {
     if len == 0 || len > 65536 {
         return Err("File DACL text exceeds limit".to_string());
     }
-    let units = unsafe { std::slice::from_raw_parts(owned.0.cast::<u16>(), len as usize) };
-    let units = units.strip_suffix(&[0]).unwrap_or(units);
-    String::from_utf16(units).map_err(|e| e.to_string())
+    // Windows returns the buffer capacity in WCHARs, not the string length.
+    // Only the prefix through the first NUL is initialized string content.
+    unsafe { decode_sddl_buffer(owned.0.cast::<u16>(), len as usize) }
+}
+
+/// Read a Windows-allocated, NUL-terminated SDDL string within its buffer bound.
+/// The caller guarantees readable initialized units through the first NUL.
+unsafe fn decode_sddl_buffer(text: *const u16, capacity: usize) -> Result<String, String> {
+    if text.is_null() || capacity == 0 || capacity > 65536 {
+        return Err("Invalid bounded file DACL buffer".into());
+    }
+    let mut units = Vec::new();
+    for index in 0..capacity {
+        let unit = unsafe { text.add(index).read() };
+        if unit == 0 {
+            return String::from_utf16(&units).map_err(|e| e.to_string());
+        }
+        units.push(unit);
+    }
+    Err("Unterminated file DACL buffer".into())
 }
 
 /// Seal inheritance while a file is staged under a different parent. After
@@ -406,7 +423,24 @@ pub(super) fn guest_effective_rights(path: &Path) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::protected_aces;
+    use super::{capture, decode_sddl_buffer, protected_aces};
+
+    #[test]
+    fn captured_sddl_ends_at_first_nul_within_api_capacity() {
+        let sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
+        let mut buffer: Vec<u16> = sddl.encode_utf16().collect();
+        buffer.extend([0, 0, 0xd800]);
+        assert_eq!(
+            unsafe { decode_sddl_buffer(buffer.as_ptr(), buffer.len()) }.unwrap(),
+            sddl
+        );
+        let unterminated: Vec<u16> = sddl.encode_utf16().collect();
+        assert!(unsafe { decode_sddl_buffer(unterminated.as_ptr(), unterminated.len()) }.is_err());
+        let captured = capture(&std::env::temp_dir()).unwrap();
+        assert!(!captured.contains('\0'));
+        assert!(captured.starts_with("O:"));
+    }
+
     #[test]
     fn private_dacl_comparison_ignores_formatting_but_rejects_access_changes() {
         let expected = protected_aces("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)").unwrap();

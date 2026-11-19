@@ -3119,8 +3119,12 @@ mod tests {
     #[test]
     fn review_default_leaf_link_export_supports_manifest_recovery_through_alias() {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("real.aerovault");
-        let alias = dir.path().join("alias.aerovault");
+        // Exercise a noncanonical parent on every Unix platform, including
+        // macOS where the system temporary path itself can contain /var links.
+        let parent = dir.path().join("parent-link");
+        std::os::unix::fs::symlink(dir.path(), &parent).unwrap();
+        let source = parent.join("real.aerovault");
+        let alias = parent.join("alias.aerovault");
         VaultV3::create(&CreateOptionsV3::new(&source, PW)).unwrap();
         let mut vault = VaultV3::open(&source, PW).unwrap();
         seed_tree(&mut vault, dir.path());
@@ -3128,7 +3132,10 @@ mod tests {
         drop(vault);
         std::os::unix::fs::symlink(&source, &alias).unwrap();
         let report = VaultV3::export_parity(&alias, PW, None).unwrap();
-        assert_eq!(report.path, default_sidecar_path(&alias));
+        let pinned_alias = std::fs::canonicalize(&parent)
+            .unwrap()
+            .join("alias.aerovault");
+        assert_eq!(report.path, default_sidecar_path(&pinned_alias));
         assert!(!default_sidecar_path(&source).exists());
         let mut bytes = std::fs::read(&source).unwrap();
         bytes[manifest + 4] ^= 1;
