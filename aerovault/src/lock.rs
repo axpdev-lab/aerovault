@@ -197,7 +197,7 @@ pub(crate) fn refuse_lock_named_dir(dir: &Path) -> io::Result<()> {
 /// characters HFS+ ignores in names would see it, so no other spelling of a
 /// lock file name gets through. Lowercasing with Unicode rules also maps the
 /// Kelvin sign (U+212A), which macOS treats as `K`, to `k`.
-fn is_lock_file_name(name: &str) -> bool {
+pub(crate) fn is_lock_file_name(name: &str) -> bool {
     let visible: String = name.chars().filter(|&c| !ignored_in_names(c)).collect();
     visible
         .trim_end_matches(['.', ' '])
@@ -1385,6 +1385,7 @@ mod tests {
                 .file_type()
                 .is_symlink());
             assert_eq!(std::fs::read(&path).unwrap(), before);
+            eprintln!("Windows dotted symlink refusal exercised for legacy={legacy}");
         }
     }
 }

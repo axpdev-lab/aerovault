@@ -4146,6 +4146,15 @@ mod tests {
             panic!("rollback seam not reached");
         }
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        use super::super::windows_security as acl;
+        #[cfg(windows)]
+        acl::apply(
+            dir.path(),
+            "D:P(A;OICI;FA;;;OW)(A;OICI;FR;;;BG)(A;OICI;FA;;;SY)",
+            true,
+        )
+        .unwrap();
         let path = dir.path().join("restart.aerovault");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new(&path, PW),
@@ -4155,6 +4164,11 @@ mod tests {
         .unwrap();
         VaultV3::export_parity(&path, PW, None).unwrap();
         let before = std::fs::read(&path).unwrap();
+        #[cfg(windows)]
+        let original_dacl = {
+            assert_ne!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+            acl::capture(&path).unwrap()
+        };
         let sidecar = default_sidecar_path(&path);
         let before_sidecar = std::fs::read(&sidecar).unwrap();
         for recover in [false, true] {
@@ -4177,8 +4191,18 @@ mod tests {
         let journal = tx::journal_path(&path);
         assert!(journal.join("rollback-intent").exists());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        #[cfg(windows)]
+        {
+            assert_eq!(acl::capture(&path).unwrap(), original_dacl);
+            assert_ne!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+        }
         assert!(VaultV3::open(&path, PW).is_ok());
         assert!(!journal.exists());
         assert_eq!(std::fs::read(&sidecar).unwrap(), before_sidecar);
+        #[cfg(windows)]
+        {
+            acl::apply(dir.path(), "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)", true).unwrap();
+            assert_eq!(acl::guest_effective_rights(&path).unwrap() & 1, 0);
+        }
     }
 }

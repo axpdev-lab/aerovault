@@ -1941,10 +1941,10 @@ fn extract_file_entry(
     } else {
         let destination = crate::lock::anchored(output_path).map_err(|e| e.to_string())?;
         crate::lock::refuse_destination(&destination, &vault.path).map_err(|e| e.to_string())?;
-        match tmp.persist_noclobber(&destination) {
+        let guard = crate::lock::acquire(&destination).map_err(|e| e.to_string())?;
+        match tmp.persist_noclobber(guard.source_path()) {
             Ok(_) => {}
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let guard = crate::lock::acquire(&destination).map_err(|e| e.to_string())?;
                 guard_extraction_replacement(guard.source_path())?;
                 e.file
                     .persist(guard.source_path())
@@ -3031,7 +3031,7 @@ fn extract_entry(
                 .iter()
                 .filter(|entry| entry.path == entry_name || entry.path.starts_with(&prefix))
                 .collect();
-            descendants.sort_by(|a, b| a.path.cmp(&b.path));
+            sort_extraction_entries(&mut descendants);
 
             for entry in descendants {
                 normalize_vault_relative_path(&entry.path)?;
@@ -3080,6 +3080,17 @@ fn extract_all_entries(vault: &OpenVaultV3, dest_root: &Path) -> Result<u64, Str
     extract_all_entries_with_progress(vault, dest_root, &mut |_, _| {})
 }
 
+fn sort_extraction_entries(entries: &mut [&ManifestEntryV3]) {
+    // Extract named lock-file entries first. The later guarded writes can
+    // then share those lock files without creating an empty placeholder over
+    // an entry the user is trying to restore.
+    entries.sort_by_cached_key(|&entry| {
+        let lock_entry =
+            !entry.is_dir && crate::lock::is_lock_file_name(path_basename(&entry.path));
+        (!lock_entry, entry.path.as_str())
+    });
+}
+
 /// `extract_all_entries` with a `(bytes_done, bytes_total)` progress callback
 /// invoked after each file is written (#5: progress for extract). `bytes_total`
 /// is the sum of file-entry plaintext sizes; directory entries do not move it.
@@ -3090,7 +3101,7 @@ fn extract_all_entries_with_progress(
 ) -> Result<u64, String> {
     std::fs::create_dir_all(dest_root).map_err(|e| format!("Create output dir: {e}"))?;
     let mut entries: Vec<&ManifestEntryV3> = vault.manifest.entries.iter().collect();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    sort_extraction_entries(&mut entries);
     let total = progress_total(&entries);
     let mut done = 0u64;
     let mut files_written = 0u64;
@@ -3276,6 +3287,36 @@ mod tests {
         std::fs::write(&path, damaged).unwrap();
         assert!(VaultV3::open(&path, PW).is_err());
         assert!(VaultV3::open(&path, PW_A).unwrap().header_repaired_on_open);
+    }
+
+    #[test]
+    fn round10_extraction_waits_for_rotation_lock_on_an_absent_sidecar() {
+        const NEW: &str = "replacement-password-123";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotation.aerovault");
+        let sidecar = super::super::ec::default_sidecar_path(&path);
+        VaultV3::create(&CreateOptionsV3::new(&path, PW)).unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
+        let backup = dir.path().join("backup.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&backup)).unwrap();
+        let mut archived = VaultV3::open_plaintext(&backup).unwrap();
+        VaultV3::add_files(&mut archived, &[(sidecar.clone(), "old-parity".into())]).unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        let output = sidecar.clone();
+        IN_SAVE_WINDOW.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                assert!(!output.exists());
+                crate::lock::set_short_wait_for_this_thread();
+                let error = VaultV3::extract_entry(&archived, "old-parity", &output).unwrap_err();
+                assert!(error.contains("locked by another writer"), "{error}");
+                assert!(!output.exists());
+            }));
+        });
+        VaultV3::change_password(&mut vault, NEW).unwrap();
+        assert!(!sidecar.exists());
+        assert!(VaultV3::open(&path, PW).is_err());
+        assert!(VaultV3::open(&path, NEW).is_ok());
     }
 
     #[cfg(unix)]
