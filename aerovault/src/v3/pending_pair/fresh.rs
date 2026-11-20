@@ -341,7 +341,6 @@ impl Plan {
             &serde_json::to_vec(&record).map_err(|e| e.to_string())?,
         )?;
         sync_dir(prepared.path())?;
-        state::remember_location(&self.source, &self.root)?;
         publish_index(prepared.path(), &active)?;
         sync_dir(&self.root)?;
         #[cfg(test)]
@@ -351,8 +350,7 @@ impl Plan {
                 "Fresh pair recovery pending at {}: {error}",
                 active.display()
             )
-        })?;
-        state::forget_location(&self.source)
+        })
     }
 }
 
@@ -610,10 +608,6 @@ mod tests {
                         "{error}"
                     );
                 }
-                "untrusted-locator" => {
-                    let error = VaultV3::open(&path, PASSWORD).unwrap_err();
-                    assert!(error.contains("trusted ownership and access"), "{error}");
-                }
                 "untrusted-pending" => {
                     let error = VaultV3::open(&path, PASSWORD).unwrap_err();
                     assert!(error.contains("Run chmod g-w"), "{error}");
@@ -673,14 +667,25 @@ mod tests {
                 .env(TARGET, target)
                 .env(ACTION, action)
                 .env("HOME", &home);
-            if action == "absent-state" {
-                command
-                    .env_remove("HOME")
-                    .env("XDG_STATE_HOME", &state_home);
-            } else if action == "unsafe-home" {
-                command
-                    .env("HOME", fixture.path().join("group-parent"))
-                    .env("XDG_STATE_HOME", &state_home);
+            if action == "absent-state" || variant == "no-home" {
+                command.env_remove("HOME").env(
+                    "XDG_STATE_HOME",
+                    if action == "absent-state" {
+                        fixture.path().join("group-parent/state")
+                    } else {
+                        state_home.clone()
+                    },
+                );
+            } else if action == "unsafe-home" || variant == "unsafe-home" {
+                let group = fixture.path().join("group-parent");
+                command.env("HOME", &group).env(
+                    "XDG_STATE_HOME",
+                    if action == "unsafe-home" {
+                        group.join("state")
+                    } else {
+                        state_home.clone()
+                    },
+                );
             } else if action == "blocked-state" || variant == "group" {
                 command.env("XDG_STATE_HOME", fixture.path().join("group-parent/state"));
             } else if variant == "default" {
@@ -811,26 +816,46 @@ mod tests {
         run(&target, "sidecar@group", 77);
         let alternate_journal = alternate.join(state::source_key(&target).to_hex().as_str());
         assert!(alternate_journal.join(RECORD).is_file());
-        let locator = alternate.join(format!(".location-{}", state::source_key(&target).to_hex()));
-        assert!(locator.is_file());
         for directory in [alternate.parent().unwrap(), alternate.as_path()] {
             assert_eq!(directory.metadata().unwrap().mode() & 0o777, 0o700);
         }
         assert!(!group_parent.join("state/aerovault").exists());
-        // An untrusted locator cannot authorize automatic recovery.
-        fs::set_permissions(&locator, fs::Permissions::from_mode(0o660)).unwrap();
-        let old_sidecar = fs::read(default_sidecar_path(&target)).unwrap();
-        run(&target, "untrusted-locator@new", 0);
-        assert!(!target.exists() && alternate_journal.exists());
-        assert_eq!(
-            fs::read(default_sidecar_path(&target)).unwrap(),
-            old_sidecar
-        );
-        fs::set_permissions(&locator, fs::Permissions::from_mode(0o600)).unwrap();
         // A different, healthy XDG selection still finds the fallback journal.
         run(&target, "open@new", 0);
         assert!(!alternate_journal.exists());
-        assert!(!locator.exists());
+        assert!(alternate.read_dir().unwrap().next().is_none());
+
+        for variant in ["no-home", "unsafe-home"] {
+            let target = fresh_target(variant);
+            run(&target, &format!("sidecar@{variant}"), 77);
+            assert!(journal(&target).join(RECORD).is_file());
+            run(&target, &format!("open@{variant}"), 0);
+            assert!(target.is_file());
+            assert!(!journal(&target).exists());
+        }
+        if unsafe { libc::geteuid() } != 0 {
+            let target = fresh_target("inaccessible-unused-fallback");
+            fs::set_permissions(
+                alternate.parent().unwrap(),
+                fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            // Ordinary successful creation must not report an error after publishing.
+            run(&target, "detached", 0);
+            assert!(target.is_file());
+            // Pending work in the healthy XDG must also recover successfully.
+            let target = fresh_target("recover-with-inaccessible-unused-fallback");
+            run(&target, "sidecar", 77);
+            assert!(journal(&target).join(RECORD).is_file());
+            run(&target, "open", 0);
+            assert!(target.is_file());
+            assert!(!journal(&target).exists());
+            fs::set_permissions(
+                alternate.parent().unwrap(),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
 
         let target = fresh_target("unsafe-home");
         run(&target, "unsafe-home", 0);
@@ -860,46 +885,25 @@ mod tests {
         let old_journal = journal(&target);
         let key = state::source_key(&target).to_hex();
         let alias = alternate.join(key.as_str());
-        let locator_name = format!(".location-{key}");
-        // Inject a trusted test hint to a journal outside the fixed roots.
-        write_input(
-            &alternate,
-            &locator_name,
-            old_journal.parent().unwrap().as_os_str().as_encoded_bytes(),
-        )
-        .unwrap();
         fs::DirBuilder::new().mode(0o700).create(&alias).unwrap();
         for leaf in [RECORD, "new-vault", "new-sidecar"] {
             fs::copy(old_journal.join(leaf), alias.join(leaf)).unwrap();
         }
         let sidecar = fs::read(default_sidecar_path(&target)).unwrap();
-        run(&target, "duplicate-roots@new", 0);
+        run(&target, "duplicate-roots", 0);
         assert!(!target.exists());
         assert_eq!(fs::read(default_sidecar_path(&target)).unwrap(), sidecar);
         assert!(old_journal.join(RECORD).is_file() && alias.join(RECORD).is_file());
         fs::remove_dir_all(alias).unwrap();
 
         fs::set_permissions(&state_home, fs::Permissions::from_mode(0o775)).unwrap();
-        run(&target, "untrusted-pending@new", 0);
+        run(&target, "untrusted-pending", 0);
         assert!(!target.exists() && old_journal.join(RECORD).is_file());
         assert_eq!(fs::read(default_sidecar_path(&target)).unwrap(), sidecar);
         fs::set_permissions(&state_home, fs::Permissions::from_mode(0o700)).unwrap();
-        run(&target, "open@new", 0);
+        run(&target, "open", 0);
         assert!(target.is_file());
         assert!(!old_journal.exists());
-        assert!(!alternate.join(locator_name).exists());
-
-        let target = fresh_target("stale-locator");
-        let stale = format!(".location-{}", state::source_key(&target).to_hex());
-        write_input(
-            &alternate,
-            &stale,
-            fixture.path().join("absent").as_os_str().as_encoded_bytes(),
-        )
-        .unwrap();
-        run(&target, "detached", 0);
-        assert!(target.is_file());
-        assert!(!alternate.join(stale).exists());
 
         let target = fresh_target("absent-state");
         run(&target, "absent-state", 0);

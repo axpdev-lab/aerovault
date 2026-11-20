@@ -89,14 +89,11 @@ pub(super) fn recover_private(lock: &crate::lock::WriteLock, active: &Path) -> R
         )),
     };
     match (exists(fresh::RECORD)?, exists(update::RECORD)?) {
-        (true, false) => fresh::recover(lock, active)?,
-        (false, true) => update::recover(lock, active)?,
-        _ => {
-            return Err(format!(
-                "Private pair journal at {} has missing or conflicting records",
-                active.display()
-            ))
-        }
+        (true, false) => fresh::recover(lock, active),
+        (false, true) => update::recover(lock, active),
+        _ => Err(format!(
+            "Private pair journal at {} has missing or conflicting records",
+            active.display()
+        )),
     }
-    state::forget_location(lock.source_path())
 }
