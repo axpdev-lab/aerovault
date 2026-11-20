@@ -898,6 +898,24 @@ mod tests {
                     assert!(error.starts_with("Password changed on disk"), "{error}");
                     VaultV3::create_directory(&mut vault, "after-cleanup-retry").unwrap();
                 }
+                "inaccessible-default-journal" => {
+                    let export = path.with_file_name("unexpected-export.aerocorrect");
+                    for error in [
+                        VaultV3::open(&path, OLD).unwrap_err(),
+                        VaultV3::open(&path, NEW).unwrap_err(),
+                        VaultV3::export_parity(&path, OLD, Some(&export)).unwrap_err(),
+                        VaultV3::strip_parity(&path, OLD, false).unwrap_err(),
+                    ] {
+                        assert!(error.contains("publication is pending"), "{error}");
+                        assert!(
+                            error.contains("originating recovery record is missing"),
+                            "{error}"
+                        );
+                    }
+                    let error = VaultV3::create(&CreateOptionsV3::new(&path, NEW)).unwrap_err();
+                    assert!(error.contains("publication is pending"), "{error}");
+                    assert!(!export.exists());
+                }
                 "wrong-xdg" => {
                     let error = VaultV3::open(&path, OLD).unwrap_err();
                     assert!(
@@ -1148,5 +1166,99 @@ mod tests {
         assert_eq!(bytes(&target), visible);
         assert_eq!(fs::read(&candidate).unwrap(), foreign);
         assert!(active.join(RECORD).is_file());
+    }
+
+    #[test]
+    fn inaccessible_default_journal_preserves_pending_updates_under_new_xdg() {
+        // Linux root can traverse a directory even when its mode is 000.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let fixture = tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let home = fixture.path().join("home");
+        let alternate_xdg = fixture.path().join("xdg");
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&alternate_xdg).unwrap();
+        fs::set_permissions(&alternate_xdg, Permissions::from_mode(0o700)).unwrap();
+        let hidden_ancestor = home.join(".local");
+        let journals = hidden_ancestor.join("state/aerovault/journals");
+
+        for boundary in 1..=3 {
+            let directory = fixture.path().join(boundary.to_string());
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, Permissions::from_mode(0o775)).unwrap();
+            let target = directory.join("fixture.aerovault");
+            let sidecar = default_sidecar_path(&target);
+            let snapshot = || [fs::read(&target).unwrap(), fs::read(&sidecar).unwrap()];
+            let run = |action: &str, changed_xdg: bool, expected: i32| {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(PATH, &target)
+                    .env(ACTION, action)
+                    .env("HOME", &home)
+                    .env_remove("XDG_STATE_HOME");
+                if changed_xdg {
+                    command.env("XDG_STATE_HOME", &alternate_xdg);
+                }
+                let child = command.output().unwrap();
+                assert_eq!(
+                    child.status.code(),
+                    Some(expected),
+                    "{boundary}/{action}: {}{}",
+                    String::from_utf8_lossy(&child.stdout),
+                    String::from_utf8_lossy(&child.stderr)
+                );
+            };
+            run("create", false, 0);
+            let original = snapshot();
+            run(&format!("rotate-{boundary}"), false, 77);
+            let active = journals.join(state::source_key(&target).to_hex().as_str());
+            assert!(active.join(RECORD).is_file());
+            let interrupted = snapshot();
+            assert_eq!(
+                interrupted[0].starts_with(super::super::MAGIC),
+                boundary < 3
+            );
+
+            let mode = hidden_ancestor.metadata().unwrap().permissions();
+            fs::set_permissions(&hidden_ancestor, Permissions::from_mode(0o000)).unwrap();
+            let inaccessible = std::panic::catch_unwind(|| {
+                assert_eq!(
+                    fs::symlink_metadata(active.join(RECORD))
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::PermissionDenied
+                );
+                if boundary < 3 {
+                    run("inaccessible-default-journal", true, 0);
+                } else {
+                    // The final exchange has already published a coherent pair.
+                    run("open-new", true, 0);
+                    run("reject-old", true, 0);
+                }
+                assert_eq!(snapshot(), interrupted);
+            });
+            fs::set_permissions(&hidden_ancestor, mode).unwrap();
+            if let Err(error) = inaccessible {
+                std::panic::resume_unwind(error);
+            }
+            assert!(active.join(RECORD).is_file());
+
+            if boundary < 3 {
+                run("open-old", false, 0);
+                assert_eq!(snapshot(), original);
+            } else {
+                run("open-new", false, 0);
+                assert_eq!(snapshot(), interrupted);
+                run("reject-old", false, 0);
+            }
+            assert!(!active.exists());
+        }
     }
 }
