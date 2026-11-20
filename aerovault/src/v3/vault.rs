@@ -2335,8 +2335,25 @@ fn create_empty_vault(
     // key. The lock file lives next to the vault: create the folder first, as
     // `atomic_write` would, unless the vault path names a lock file.
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(output_parent_dir(path))
+    let writes_sidecar = error_correction.is_some_and(|p| p.writes_sidecar());
+    let mut parent_builder = std::fs::DirBuilder::new();
+    parent_builder.recursive(true);
+    #[cfg(unix)]
+    if writes_sidecar {
+        use std::os::unix::fs::DirBuilderExt;
+        // Create missing ancestors with private permissions. Existing
+        // permissions still belong to the caller and are only checked.
+        parent_builder.mode(0o700);
+    }
+    parent_builder
+        .create(output_parent_dir(path))
         .map_err(|e| format!("Create parent dir: {e}"))?;
+    #[cfg(unix)]
+    if writes_sidecar {
+        // An ancestry refusal must happen before either stable lock exists.
+        // Publication checks the ancestry again while both locks are held.
+        super::strip_transaction::validate_publication_parent(path)?;
+    }
     let _lock = write_lock(path)?;
     let path = _lock.source_path();
 
@@ -2433,7 +2450,7 @@ fn create_empty_vault(
     )?;
     drop((master_key, mac_key));
     // Refuse sidecar contention before replacing even the container itself.
-    let sidecar_lock = if error_correction.is_some_and(|p| p.writes_sidecar()) {
+    let sidecar_lock = if writes_sidecar {
         let out = super::ec::default_sidecar_path(path);
         let guard =
             crate::lock::acquire_destination(&out, path, &_lock).map_err(|e| e.to_string())?;
@@ -2442,7 +2459,7 @@ fn create_empty_vault(
     } else {
         None
     };
-    if error_correction.is_some_and(|p| p.writes_sidecar()) {
+    if writes_sidecar {
         let sidecar = super::ec::default_sidecar_path(path);
         let prepared =
             super::strip_transaction::private_dir(output_parent_dir(path), ".aerocreate-prepare-")?;

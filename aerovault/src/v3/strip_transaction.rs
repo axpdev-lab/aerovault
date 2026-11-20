@@ -707,6 +707,14 @@ fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub(super) fn validate_publication_parent(source: &Path) -> Result<PathBuf, String> {
+    let parent = fs::canonicalize(output_parent_dir(source)).map_err(|e| e.to_string())?;
+    validate_journal_ancestry(&parent)
+        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
+    Ok(parent)
+}
+
 #[cfg(target_os = "macos")]
 fn mac_acl_may_mutate(ace: &[u8]) -> bool {
     let mut fields = ace.rsplit(|&b| b == b':');
@@ -1114,10 +1122,7 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
 /// directory under the source parent, while holding both namespace guards.
 pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> Result<(), String> {
     #[cfg(unix)]
-    let trusted_parent = fs::canonicalize(output_parent_dir(source)).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    validate_journal_ancestry(&trusted_parent)
-        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
+    let trusted_parent = validate_publication_parent(source)?;
     let sidecar = super::ec::default_sidecar_path(source);
     let journal = Journal {
         version: 4,
@@ -1434,6 +1439,60 @@ mod tests {
         assert_eq!(fs::read(&sidecar).unwrap(), old_sidecar);
         assert!(VaultV3::open(&source, password).is_ok());
         assert!(VaultV3::open(&source, "different-password-123").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_creation_makes_missing_parents_private() {
+        use super::super::{
+            ec::RecoveryPlacement,
+            vault::{CreateOptionsV3, VaultV3},
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let parent = dir.path().join("new");
+        let nested = parent.join("nested");
+        let source = nested.join("source.aerovault");
+        let password = "new-directories-test-password";
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&source, password),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        for created in [parent, nested] {
+            assert_eq!(created.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        assert!(super::super::ec::default_sidecar_path(&source).is_file());
+        assert!(VaultV3::open(&source, password).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_pair_creation_leaves_no_locks_or_recovery_files() {
+        use super::super::{
+            ec::RecoveryPlacement,
+            vault::{CreateOptionsV3, VaultV3},
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o775, 0o777] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+            let source = dir.path().join("shared.aerovault");
+            let error = VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&source, "shared-group-test-password"),
+                RecoveryPlacement::Detached,
+                20,
+            )
+            .unwrap_err();
+            assert!(error.contains("ancestry permits replacement"), "{error}");
+            assert!(dir.path().read_dir().unwrap().next().is_none());
+        }
     }
 
     #[cfg(unix)]
