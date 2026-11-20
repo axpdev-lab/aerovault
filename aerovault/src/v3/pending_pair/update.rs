@@ -20,13 +20,15 @@ use std::ffi::{CStr, CString};
 use std::fs::{self, File, Permissions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const RECORD: &str = "update.json";
 const VERSION: u8 = 1;
 const LIMIT: u64 = 4096;
 const SLOTS: [&CStr; 3] = [c"marker", c"sidecar", c"vault"];
+const CLEANUP: [(&str, usize); 2] = [("cleanup-original", 0), ("cleanup-replacement", 3)];
+const PREPARED_FILES: [&str; 4] = ["old-vault", "old-sidecar", "new-vault", "new-sidecar"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,9 +172,17 @@ impl Stage {
     }
 
     fn open(parent: &Destination, transaction: &[u8; 16]) -> Result<Self, String> {
+        Self::find(parent, transaction)?.ok_or("Protected pair stage is missing".into())
+    }
+
+    fn find(parent: &Destination, transaction: &[u8; 16]) -> Result<Option<Self>, String> {
         let name = Self::name(transaction);
-        let directory = open_member(&parent.directory, &name, libc::O_RDONLY | libc::O_DIRECTORY)
-            .map_err(|error| format!("Open protected pair stage: {error}"))?;
+        let directory =
+            match open_member(&parent.directory, &name, libc::O_RDONLY | libc::O_DIRECTORY) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(format!("Open protected pair stage: {error}")),
+            };
         let meta = directory.metadata().map_err(|error| error.to_string())?;
         if !meta.is_dir()
             || meta.uid() != unsafe { libc::geteuid() }
@@ -181,11 +191,11 @@ impl Stage {
         {
             return Err("Pair stage does not have trusted ownership and private access".into());
         }
-        Ok(Self {
+        Ok(Some(Self {
             directory,
             name,
             identity: (meta.dev(), meta.ino()),
-        })
+        }))
     }
 
     fn recheck(&self, parent: &Destination, transaction: &[u8; 16]) -> Result<(), String> {
@@ -286,6 +296,8 @@ impl Stage {
                         io::Error::last_os_error()
                     ));
                 }
+                #[cfg(test)]
+                stop_after(5);
             }
         }
         // SAFETY: only remove an empty directory at the known name.
@@ -566,7 +578,9 @@ fn phase(
             *candidate &= observed == expected[index];
         }
         if !candidates.iter().any(|&value| value) {
-            return Err("Visible or staged pair member has an unexpected generation".into());
+            return Err(
+                "Visible or staged pair member has unexpected bytes or access permissions".into(),
+            );
         }
     }
     candidates
@@ -624,6 +638,77 @@ fn exchange(
     Ok(())
 }
 
+fn cleanup_phase(active: &Path) -> Result<Option<usize>, String> {
+    let mut outcome = None;
+    for (name, phase) in CLEANUP {
+        let path = active.join(name);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Inspect pair cleanup outcome: {error}")),
+            Ok(_) => {
+                TrustedJournal::open(&path)?;
+                if outcome.replace(phase).is_some() {
+                    return Err("Private pair has conflicting cleanup outcomes".into());
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn cleanup_pair(
+    destination: &Destination,
+    active: &Path,
+    journal: TrustedJournal<'_>,
+    record: &Record,
+    phase: &[Snapshot; 5],
+    leaves: [&CStr; 2],
+) -> Result<(), String> {
+    destination.recheck()?;
+    for (leaf, expected) in leaves.into_iter().zip(phase[..2].iter()) {
+        if read_snapshot(&destination.directory, leaf, &[expected.bytes.len])? != *expected {
+            return Err("Visible pair changed before cleanup".into());
+        }
+    }
+    if let Some(stage) = Stage::find(destination, &record.transaction)? {
+        if stage.identity != record.stage {
+            return Err("Private cleanup does not match the protected pair stage".into());
+        }
+        let mut present = [false; 3];
+        for ((leaf, expected), present) in SLOTS.into_iter().zip(&phase[2..]).zip(&mut present) {
+            let file = match open_member(&stage.directory, leaf, libc::O_RDONLY) {
+                Ok(file) => file,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Open pair cleanup slot: {error}")),
+            };
+            if inspect(&file, &[expected.bytes.len])? != *expected {
+                return Err("Protected pair cleanup slot has changed".into());
+            }
+            *present = true;
+        }
+        stage.remove(destination, &record.transaction, present)?;
+    } else {
+        // Retry a failed parent fsync if an earlier process removed the stage.
+        destination
+            .directory
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+    }
+    #[cfg(test)]
+    stop_after(6);
+    // Once the rollback decision is durable, these copies are no longer
+    // recovery inputs. Remove them before retiring the discoverable journal.
+    for leaf in PREPARED_FILES {
+        match fs::remove_file(active.join(leaf)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Remove private pair copy: {error}")),
+        }
+    }
+    sync_dir(active)?;
+    journal.retire()
+}
+
 fn finish(
     source: &Path,
     destination: &Destination,
@@ -641,21 +726,34 @@ fn finish(
     {
         return Err("Private record does not match the pinned vault destination".into());
     }
+    let sidecar = default_sidecar_path(source);
+    let vault_leaf = destination.leaf(source)?;
+    let sidecar_leaf = destination.leaf(&sidecar)?;
+    let leaves = [vault_leaf.as_c_str(), sidecar_leaf.as_c_str()];
+    check_locks(source, &sidecar, lock, sidecar_lock)?;
+    // Recovery might be retrying a failed directory fsync after registration.
+    sync_dir(output_parent_dir(active))?;
+    let phases = record.phases();
+    if let Some(outcome) = cleanup_phase(active)? {
+        sync_dir(active)?;
+        return cleanup_pair(
+            destination,
+            active,
+            journal,
+            &record,
+            &phases[outcome],
+            leaves,
+        );
+    }
     let stage = Stage::open(destination, &record.transaction)?;
     if stage.identity != record.stage {
         return Err("Private record does not match the protected pair stage".into());
     }
-    let sidecar = default_sidecar_path(source);
-    let vault_leaf = destination.leaf(source)?;
-    let sidecar_leaf = destination.leaf(&sidecar)?;
     let check = || {
         check_locks(source, &sidecar, lock, sidecar_lock)?;
         stage.recheck(destination, &record.transaction)
     };
     check()?;
-    // Recovery might be retrying a failed directory fsync after registration.
-    sync_dir(output_parent_dir(active))?;
-    let phases = record.phases();
     let current = phase(destination, &stage, &vault_leaf, &sidecar_leaf, &phases)?;
     let step = |slot: usize, phase: usize| {
         check()?;
@@ -705,8 +803,33 @@ fn finish(
         return Err("Private pair changed before journal retirement".into());
     }
     stage.sync(destination)?;
-    journal.retire()?;
-    stage.remove(destination, &record.transaction, [true; 3])
+    let name = if expected == 0 {
+        CLEANUP[0].0
+    } else {
+        CLEANUP[1].0
+    };
+    // The empty marker is created atomically. No private copy is removed
+    // before the cleanup outcome is committed in the user's state directory.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(active.join(name))
+        .map_err(|error| format!("Record verified pair cleanup outcome: {error}"))?;
+    sync_dir(active)?;
+    #[cfg(test)]
+    {
+        stop_after(4);
+        if FAIL_CLEANUP.with(|fail| fail.replace(false)) {
+            return Err("Injected private pair cleanup error".into());
+        }
+    }
+    cleanup_pair(
+        destination,
+        active,
+        journal,
+        &record,
+        &phases[expected],
+        leaves,
+    )
 }
 
 #[cfg(test)]
@@ -724,6 +847,7 @@ thread_local! {
         std::cell::RefCell::new(None)
     };
     static STOP_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static FAIL_CLEANUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -771,6 +895,16 @@ mod tests {
                         b"isolated bytes that must survive all checkpoints"
                     );
                 }
+                "reject-old" => {
+                    assert!(VaultV3::open(&path, OLD).is_err());
+                }
+                "rotate-cleanup-error" => {
+                    let mut vault = VaultV3::open(&path, OLD).unwrap();
+                    FAIL_CLEANUP.with(|fail| fail.set(true));
+                    let error = VaultV3::change_password(&mut vault, NEW).unwrap_err();
+                    assert!(error.starts_with("Password changed on disk"), "{error}");
+                    VaultV3::create_directory(&mut vault, "after-cleanup-retry").unwrap();
+                }
                 "missing" | "conflict" => {
                     let error = VaultV3::open(&path, OLD).unwrap_err();
                     let detail = if action == "missing" {
@@ -797,12 +931,19 @@ mod tests {
                     if let Ok(boundary) = boundary.parse::<usize>() {
                         STOP_AFTER.with(|stop| stop.set(Some(boundary)));
                     }
-                    if operation == "strip" {
-                        VaultV3::strip_parity(&path, OLD, false).unwrap();
-                    } else {
-                        let mut vault = VaultV3::open(&path, OLD).unwrap();
-                        VaultV3::change_password(&mut vault, NEW).unwrap();
-                    }
+                    match operation {
+                        "strip" => {
+                            VaultV3::strip_parity(&path, OLD, false).unwrap();
+                        }
+                        "recover" => {
+                            VaultV3::open(&path, OLD).unwrap();
+                        }
+                        "rotate" => {
+                            let mut vault = VaultV3::open(&path, OLD).unwrap();
+                            VaultV3::change_password(&mut vault, NEW).unwrap();
+                        }
+                        _ => unreachable!("unknown test operation"),
+                    };
                     assert_eq!(boundary, "complete");
                 }
             }
@@ -846,7 +987,7 @@ mod tests {
                 fs::read(default_sidecar_path(target)).unwrap(),
             ]
         };
-        let cleanup = |target: &Path| {
+        let no_recovery_assets = |target: &Path| {
             assert!(!journal(target).exists());
             assert!(target.parent().unwrap().read_dir().unwrap().all(|entry| {
                 !entry
@@ -855,6 +996,9 @@ mod tests {
                     .to_string_lossy()
                     .starts_with(".aerostrip-prepare-")
             }));
+        };
+        let cleanup = |target: &Path| {
+            no_recovery_assets(target);
             for path in [target.to_owned(), default_sidecar_path(target)] {
                 assert_eq!(path.metadata().unwrap().mode() & 0o777, 0o640);
             }
@@ -894,7 +1038,7 @@ mod tests {
                 0,
             );
             cleanup(&complete);
-            for boundary in 0..=3 {
+            for boundary in 0..=6 {
                 let target = make(&format!("{operation}-{boundary}"));
                 let original = bytes(&target);
                 run(&target, &format!("{operation}-{boundary}"), 77);
@@ -920,7 +1064,7 @@ mod tests {
                 }
                 run(
                     &target,
-                    if boundary == 3 && operation == "rotate" {
+                    if boundary >= 3 && operation == "rotate" {
                         "open-new"
                     } else {
                         "open-old"
@@ -929,11 +1073,41 @@ mod tests {
                 );
                 assert_eq!(
                     bytes(&target),
-                    if boundary == 3 { final_bytes } else { original }
+                    if boundary >= 3 { final_bytes } else { original }
                 );
+                if boundary >= 3 && operation == "rotate" {
+                    run(&target, "reject-old", 0);
+                }
                 cleanup(&target);
             }
         }
+
+        let rotated = make("rotate-cleanup-error");
+        run(&rotated, "rotate-cleanup-error", 0);
+        run(&rotated, "reject-old", 0);
+        run(&rotated, "open-new", 0);
+        no_recovery_assets(&rotated);
+
+        for boundary in 4..=6 {
+            let target = make(&format!("rollback-cleanup-{boundary}"));
+            let original = bytes(&target);
+            run(&target, "strip-2", 77);
+            run(&target, &format!("recover-{boundary}"), 77);
+            assert_eq!(bytes(&target), original);
+            run(&target, "open-old", 0);
+            assert_eq!(bytes(&target), original);
+            cleanup(&target);
+        }
+
+        let narrowed = make("narrowed-permissions");
+        run(&narrowed, "rotate-2", 77);
+        let narrowed_sidecar = default_sidecar_path(&narrowed);
+        fs::set_permissions(&narrowed_sidecar, Permissions::from_mode(0o600)).unwrap();
+        let contents = bytes(&narrowed);
+        run(&narrowed, "conflict", 0);
+        assert_eq!(bytes(&narrowed), contents);
+        assert_eq!(narrowed_sidecar.metadata().unwrap().mode() & 0o777, 0o600);
+        assert!(journal(&narrowed).join(RECORD).is_file());
 
         let target = make("unexpected");
         run(&target, "strip-2", 77);

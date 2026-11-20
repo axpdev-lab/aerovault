@@ -10,7 +10,8 @@ use std::ffi::OsStr;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-pub(super) const VERSION: u8 = 1;
+const FIXED_OFFSET_VERSION: u8 = 1;
+pub(super) const VERSION: u8 = 2;
 const MAX_RECORD_SIZE: u64 = 4096;
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -18,8 +19,13 @@ const MAX_RECORD_SIZE: u64 = 4096;
 pub(super) struct Header {
     pub(super) transaction: [u8; 16],
     pub(super) payload_len: u64,
+    #[serde(default = "fixed_payload_offset")]
     pub(super) payload_offset: u64,
     pub(super) payload_hash: [u8; 32],
+}
+
+fn fixed_payload_offset() -> u64 {
+    HEADER_SIZE as u64
 }
 
 impl Header {
@@ -41,13 +47,17 @@ impl Header {
     }
 
     pub(super) fn decode(bytes: &[u8], file_len: u64) -> Option<Self> {
-        if !bytes.starts_with(MAGIC) || bytes.get(MAGIC.len()) != Some(&VERSION) {
+        if !bytes.starts_with(MAGIC) {
             return None;
         }
+        let payload_offset = match *bytes.get(MAGIC.len())? {
+            FIXED_OFFSET_VERSION => fixed_payload_offset(),
+            VERSION => u64::from_le_bytes(bytes.get(72..80)?.try_into().ok()?),
+            _ => return None,
+        };
         let transaction = bytes.get(16..32)?.try_into().ok()?;
         let payload_len = u64::from_le_bytes(bytes.get(32..40)?.try_into().ok()?);
         let payload_hash = bytes.get(40..72)?.try_into().ok()?;
-        let payload_offset = u64::from_le_bytes(bytes.get(72..80)?.try_into().ok()?);
         if payload_len < HEADER_SIZE as u64
             || payload_offset < HEADER_SIZE as u64
             || payload_offset.checked_add(payload_len) != Some(file_len)
@@ -157,10 +167,10 @@ fn find_at(root: &Path, source: &Path, header: &Header) -> Result<bool, String> 
     }
     let record: Record = serde_json::from_slice(&data)
         .map_err(|error| format!("Decode private transaction record: {error}"))?;
-    if record.version != VERSION
-        || record.source_key != *key.as_bytes()
-        || record.envelope != *header
-    {
+    let supported = record.version == VERSION
+        || (record.version == FIXED_OFFSET_VERSION
+            && record.envelope.payload_offset == fixed_payload_offset());
+    if !supported || record.source_key != *key.as_bytes() || record.envelope != *header {
         return Err(
             "Private transaction record does not match this vault and pending image".into(),
         );
@@ -231,6 +241,16 @@ mod tests {
         assert!(Header::decode(&bytes, u64::MAX).is_none());
         bytes[MAGIC.len()] += 1;
         assert!(Header::decode(&bytes, (2 * HEADER_SIZE) as u64).is_none());
+
+        bytes[MAGIC.len()] = FIXED_OFFSET_VERSION;
+        bytes[32..40].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+        bytes[72..80].fill(0);
+        assert_eq!(
+            Header::decode(&bytes, (2 * HEADER_SIZE) as u64)
+                .unwrap()
+                .payload_offset,
+            fixed_payload_offset(),
+        );
     }
 
     #[test]
@@ -258,6 +278,16 @@ mod tests {
         };
         assert!(!find_at(&state, &file, &envelope()).unwrap());
         let journal_dir = record_at(&state, &file, envelope());
+        assert!(find_at(&state, &file, &envelope()).unwrap());
+        let record_path = journal_dir.join("pair.json");
+        let mut old_record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        old_record["version"] = FIXED_OFFSET_VERSION.into();
+        old_record["envelope"]
+            .as_object_mut()
+            .unwrap()
+            .remove("payload_offset");
+        fs::write(&record_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
         assert!(find_at(&state, &file, &envelope()).unwrap());
         assert!(!find_at(&state, &moved, &envelope()).unwrap());
         let sidecar = default_sidecar_path(&file);
