@@ -70,6 +70,7 @@ impl VaultHeaderV3 {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        super::pending_pair::require_ordinary(data)?;
         if data.len() < HEADER_SIZE {
             return Err("AeroVault v3 header is truncated".to_string());
         }

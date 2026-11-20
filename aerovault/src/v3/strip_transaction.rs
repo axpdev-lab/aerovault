@@ -60,7 +60,7 @@ fn generation_if_present(path: &Path) -> Result<Option<Generation>, String> {
     }
 }
 
-fn recorded_generation(
+pub(super) fn recorded_generation(
     path: &Path,
     candidates: &[Option<Generation>],
 ) -> Result<Option<Generation>, String> {
@@ -530,7 +530,7 @@ fn conflict(path: &Path, reason: &str) -> String {
     format!("pending strip transaction conflicts ({reason}); files left untouched; preserve the vault, sidecar and rollback directory {}, then follow the pending-strip conflict procedure in AEROVAULT-V3-SPEC.md before reopening", path.display())
 }
 
-struct TrustedJournal<'a> {
+pub(super) struct TrustedJournal<'a> {
     path: &'a Path,
     directory: same_file::Handle,
     #[cfg(windows)]
@@ -540,7 +540,7 @@ struct TrustedJournal<'a> {
 }
 
 impl<'a> TrustedJournal<'a> {
-    fn open(path: &'a Path) -> Result<Self, String> {
+    pub(super) fn open(path: &'a Path) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if !metadata.is_dir() {
             return Err("strip transaction path is not a regular directory".into());
@@ -584,7 +584,7 @@ impl<'a> TrustedJournal<'a> {
         Ok(())
     }
 
-    fn open_input(&self, name: &str) -> Result<fs::File, String> {
+    pub(super) fn open_input(&self, name: &str) -> Result<fs::File, String> {
         #[cfg(unix)]
         let file = {
             use std::os::fd::{AsRawFd, FromRawFd};

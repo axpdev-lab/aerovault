@@ -26,6 +26,7 @@ mod extraction_stage;
 pub mod format;
 pub mod manifest;
 pub mod packing;
+mod pending_pair;
 pub(crate) mod strip_transaction;
 pub mod telemetry;
 #[cfg(unix)]

@@ -2356,6 +2356,7 @@ fn create_empty_vault(
     }
     let _lock = write_lock(path)?;
     let path = _lock.source_path();
+    super::pending_pair::require_replaceable(path)?;
 
     // Keys are zeroized on every return, the early ones included.
     let (salt, wrapped_master_key, wrapped_mac_key, master_key, mac_key, flags) = if plaintext {
@@ -2629,6 +2630,8 @@ fn open_vault_with_guard(
     let mut header_bytes = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_bytes)
         .map_err(|e| format!("Read header: {e}"))?;
+    // This is a publication state, not damaged AEROVAULT3 metadata.
+    super::pending_pair::require_ordinary_at_open(source, &mut file, &header_bytes, file_len)?;
 
     // Plaintext (`.aerovz`) lane: when the header parses and carries
     // FLAG_PLAINTEXT_CONTENT, there is no password — verify the header MAC under
@@ -6980,6 +6983,56 @@ mod tests {
             KEY,
             &path,
         );
+    }
+
+    #[test]
+    fn pending_pair_refuses_open_and_create_even_with_a_valid_detached_sidecar() {
+        use super::super::{ec::RecoveryPlacement, pending_pair};
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(not(unix))]
+        let _ = &mut builder;
+        let dir = builder.tempdir().unwrap();
+
+        for plaintext in [false, true] {
+            let path = dir.path().join(if plaintext {
+                "pending.aerozip"
+            } else {
+                "pending.aerovault"
+            });
+            let options = if plaintext {
+                CreateOptionsV3::new_plaintext(&path)
+            } else {
+                CreateOptionsV3::new(&path, PW)
+            };
+            VaultV3::create_with_error_correction(&options, RecoveryPlacement::Both, 20).unwrap();
+            VaultV3::export_parity(&path, if plaintext { "" } else { PW }, None).unwrap();
+            let sidecar = super::super::ec::default_sidecar_path(&path);
+            let recovery = std::fs::read(&sidecar).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut pending = vec![0x9b; HEADER_SIZE];
+            pending[..pending_pair::MAGIC.len()].copy_from_slice(pending_pair::MAGIC);
+            pending.extend_from_slice(&original);
+            std::fs::write(&path, &pending).unwrap();
+
+            crate::lock::take_trace();
+            let error = if plaintext {
+                VaultV3::open_plaintext(&path).unwrap_err()
+            } else {
+                VaultV3::open(&path, PW).unwrap_err()
+            };
+            assert!(error.contains("publication is pending"), "{error}");
+            assert!(!crate::lock::take_trace().contains(&"lock"));
+            assert_eq!(VaultV3::peek(&path).unwrap_err(), error);
+            assert_eq!(VaultV3::has_error_correction(&path).unwrap_err(), error);
+            assert_eq!(VaultV3::create(&options).unwrap_err(), error);
+            assert_eq!(std::fs::read(&path).unwrap(), pending);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), recovery);
+        }
     }
 
     #[test]
