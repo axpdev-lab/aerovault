@@ -46,4 +46,5 @@ pub use manifest::{
 pub use telemetry::VaultTelemetrySink;
 pub use vault::{
     CreateOptionsV3, EntryInfo, OpenVaultV3, PeekInfo, VaultLane, VaultSummaryV3, VaultV3,
+    VaultV3Limits,
 };

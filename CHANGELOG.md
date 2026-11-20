@@ -2,6 +2,16 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.7.0] - Unreleased
+
+### Fixed
+
+- Restored open, extraction and writes for large v3 vaults and plaintext archives created by 0.6.8. Version 0.6.9 imposed a default 1 GiB data-section ceiling and a separate 4 GiB generation ceiling. Normal v3 operations now stream the generation hash over the actual file extent and retain the locked generation check before publication. Opening hashes the whole file and then reads the data section into memory. The on-disk format is unchanged.
+
+### Added
+
+- Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The existing opt-in `AEROVAULT_V3_DATA_BUDGET_BYTES` setting still applies to callers that use the original entry points.
+
 ## [0.6.9] - 2026-11-19
 
 ### Security

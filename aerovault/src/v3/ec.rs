@@ -34,6 +34,7 @@ use super::format::VaultHeaderV3;
 use super::manifest::{ChunkRecordV3, ExtensionEntryV3};
 use super::vault::{
     atomic_write, open_header_bytes, read_capped, save_open_vault, OpenVaultV3, UnlockedHeader,
+    VaultV3Limits,
 };
 use crate::error_correction::{
     compute_error_correction_shards_grid, compute_metadata_parity, manifest_error_correction_grid,
@@ -205,17 +206,14 @@ fn container_sha256(data: &[u8]) -> [u8; 32] {
 
 fn container_sha256_file(path: &Path) -> Result<([u8; 32], u64), String> {
     use sha2::{Digest, Sha256};
-    let file = crate::source::open_regular(path).map_err(|e| e.to_string())?;
+    let mut file = crate::source::open_regular(path).map_err(|e| e.to_string())?;
     let expected_len = file.metadata().map_err(|e| e.to_string())?.len();
-    if expected_len > super::vault::MAX_GENERATION_EXTENT {
-        return Err("Vault container exceeds the 4 GiB generation scan budget".into());
-    }
-    let mut file = file.take(expected_len + 1);
+    let mut reader = Read::by_ref(&mut file).take(expected_len);
     let mut hash = Sha256::new();
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
     let mut len = 0u64;
     loop {
-        let n = file.read(&mut *buf).map_err(|e| e.to_string())?;
+        let n = reader.read(&mut *buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
@@ -224,7 +222,9 @@ fn container_sha256_file(path: &Path) -> Result<([u8; 32], u64), String> {
             .checked_add(n as u64)
             .ok_or("container length overflow")?;
     }
-    if len != expected_len {
+    if len != expected_len
+        || std::io::copy(&mut file.take(1), &mut std::io::sink()).map_err(|e| e.to_string())? != 0
+    {
         return Err("Vault changed while its parity binding was being read".into());
     }
     Ok((hash.finalize().into(), len))
@@ -500,6 +500,7 @@ pub(super) fn export_parity(
     vault_path: &Path,
     password: &str,
     out_path: Option<&Path>,
+    limits: VaultV3Limits,
 ) -> Result<ExportParityResult, String> {
     if let Some(p) = out_path {
         crate::lock::refuse_destination(p, vault_path).map_err(|e| e.to_string())?;
@@ -537,6 +538,7 @@ pub(super) fn export_parity(
         &out,
         out_path.is_none(),
         &lock,
+        limits,
     )
 }
 
@@ -555,6 +557,7 @@ pub(super) fn export_parity_locked(
     out: &Path,
     automatic: bool,
     source_lock: &crate::lock::WriteLock,
+    limits: VaultV3Limits,
 ) -> Result<ExportParityResult, String> {
     std::fs::create_dir_all(super::vault::output_parent_dir(out)).map_err(|e| e.to_string())?;
     let out = crate::lock::anchored(out).map_err(|e| e.to_string())?;
@@ -568,7 +571,7 @@ pub(super) fn export_parity_locked(
     if automatic {
         validate_automatic_sidecar_destination(&out)?;
     }
-    export_parity_under_locks(vault_path, password, &out, source_lock, &out_lock)
+    export_parity_under_locks(vault_path, password, &out, source_lock, &out_lock, limits)
 }
 
 /// Export with both namespace locks held; also used by password-change refresh,
@@ -579,8 +582,9 @@ pub(super) fn export_parity_under_locks(
     out: &Path,
     _source_lock: &crate::lock::WriteLock,
     _out_lock: &Option<crate::lock::WriteLock>,
+    limits: VaultV3Limits,
 ) -> Result<ExportParityResult, String> {
-    let vault = super::vault::open_vault_under_guard(vault_path, password, _source_lock)?;
+    let vault = super::vault::open_vault_under_guard(vault_path, password, _source_lock, limits)?;
     export_parity_from_sealed(&vault, vault_path, out)
 }
 
@@ -590,7 +594,6 @@ pub(super) fn export_parity_from_sealed(
     vault_path: &Path,
     out: &Path,
 ) -> Result<ExportParityResult, String> {
-    vault.writable_generation()?;
     if vault.manifest_repaired_on_open {
         return Err(
             "Vault manifest was recovered on open: run repair before exporting parity".to_string(),
@@ -671,14 +674,14 @@ pub(super) fn strip_parity(
     vault_path: &Path,
     password: &str,
     force: bool,
+    limits: VaultV3Limits,
 ) -> Result<StripParityResult, String> {
     // Under the lock from the sidecar check to the save, so a writer that
     // removes the sidecar meanwhile (a failed password-change refresh) cannot
     // leave the vault with no recovery at all.
     let lock = super::vault::write_lock(vault_path)?;
     let vault_path = lock.source_path();
-    let mut vault = super::vault::open_vault_under_guard(vault_path, password, &lock)?;
-    vault.writable_generation()?;
+    let mut vault = super::vault::open_vault_under_guard(vault_path, password, &lock, limits)?;
     let had_embedded = vault
         .extensions
         .iter()
@@ -775,6 +778,7 @@ pub(super) fn strip_parity(
             &prepared.path().join("new-sidecar"),
             &lock,
             &_sidecar_lock,
+            limits,
         )?;
         super::strip_transaction::publish(vault_path, prepared, &lock)?;
     }

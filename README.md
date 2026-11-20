@@ -178,6 +178,14 @@ vault.move_entry("secret.pdf", "archive/secret.pdf")?;
 vault.copy_entry("archive/secret.pdf", "backup/secret.pdf")?;
 ```
 
+### Large v3 vaults and resource limits
+
+V3 keeps the stored data section in memory. Opening, extracting and writing existing vaults has no fixed container-size ceiling. Opening validates file ranges and metadata and reserves the data buffer with a fallible allocation. Writes still hash and compare the source generation under the writer lock before publishing.
+
+Embedders can cap the stored data section by passing `VaultV3Limits::default().with_max_data_bytes(bytes)` to `VaultV3::open_with_limits` or `VaultV3::open_plaintext_with_limits`. The handle applies the same limit to later writes. Detached export and strip also provide `*_with_limits` variants. This limit covers stored data bytes. Compression, encryption and recovery may need additional memory. A pending recovery journal may be finished before the open checks the budget.
+
+For CLI use and existing library entry points, `AEROVAULT_V3_DATA_BUDGET_BYTES` remains an optional decimal-byte limit of at least 1 GiB. Explicit limits are independent of that environment variable.
+
 ### Error Correction API
 
 ```rust

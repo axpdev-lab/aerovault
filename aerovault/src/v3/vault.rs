@@ -47,46 +47,43 @@ use crate::aerocrypt::{
     wrap_key, KEY_SIZE, SALT_SIZE, WRAPPED_KEY_SIZE,
 };
 
-// Bound the generation scan independently of the in-memory data allocation.
-// The remainder covers the manifest, extension directory, parity and any
-// trailing bytes accepted from existing containers.
-pub(super) const MAX_GENERATION_EXTENT: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
 const DATA_BUDGET_ENV: &str = "AEROVAULT_V3_DATA_BUDGET_BYTES";
 
-fn data_budget() -> u64 {
-    #[cfg(test)]
-    if let Some(limit) = TEST_DATA_BUDGET.with(|limit| limit.get()) {
-        return limit;
-    }
-    std::env::var(DATA_BUDGET_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|&size| (DEFAULT_DATA_BUDGET..=isize::MAX as u64).contains(&size))
-        .unwrap_or(DEFAULT_DATA_BUDGET)
+/// Optional resource policy for opening and editing a v3 container.
+///
+/// The data section is kept in memory. This limits its stored bytes, not the
+/// total process memory needed for compression, encryption or Error Correction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaultV3Limits {
+    max_data_bytes: Option<u64>,
 }
 
-fn ensure_data_budget(size: u64) -> Result<(), String> {
-    let budget = data_budget();
-    if size > budget {
-        return Err(format!(
-            "Vault data section exceeds the {budget}-byte in-memory open budget"
-        ));
+impl VaultV3Limits {
+    /// Limit the data section at open and on subsequent saves of the handle.
+    /// By default, there is no fixed size limit beyond the address space and
+    /// available memory.
+    pub const fn with_max_data_bytes(mut self, max: u64) -> Self {
+        self.max_data_bytes = Some(max);
+        self
     }
-    Ok(())
-}
 
-fn ensure_write_data_budget(size: u64) -> Result<(), String> {
-    ensure_data_budget(size)?;
-    if size > MAX_GENERATION_EXTENT - DATA_OFFSET {
-        return Err("Vault data exceeds the 4 GiB write generation budget".into());
+    fn from_env() -> Self {
+        // Keep the valid values accepted by 0.6.9 when set explicitly.
+        let max_data_bytes = std::env::var(DATA_BUDGET_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&size| (1024 * 1024 * 1024..=isize::MAX as u64).contains(&size));
+        Self { max_data_bytes }
     }
-    Ok(())
-}
 
-#[cfg(test)]
-thread_local! {
-    static TEST_DATA_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    fn check_data_len(self, size: u64) -> Result<(), String> {
+        if let Some(max) = self.max_data_bytes.filter(|&max| size > max) {
+            return Err(format!(
+                "Vault data section of {size} bytes exceeds the configured {max}-byte data budget"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Error returned by [`VaultV3::open`] for a plaintext container. Kept stable:
@@ -188,9 +185,8 @@ pub struct OpenVaultV3 {
     /// by the last save): the generation baseline. Taken from the bytes on
     /// disk, so a header recovered from the sidecar does not count as a change.
     pub(super) opened_file_len: u64,
-    // Oversized legacy containers can be read through their bounded sections,
-    // without establishing a whole-file baseline that authorizes mutations.
-    opened_hash: Option<[u8; 32]>,
+    opened_hash: [u8; 32],
+    limits: VaultV3Limits,
     pub(super) master_key: [u8; KEY_SIZE],
     pub(super) mac_key: [u8; KEY_SIZE],
     pub(super) manifest: VaultManifestV3,
@@ -372,7 +368,17 @@ impl VaultV3 {
         password: &str,
         out: Option<&Path>,
     ) -> Result<super::ec::ExportParityResult, String> {
-        super::ec::export_parity(vault_path, password, out)
+        Self::export_parity_with_limits(vault_path, password, out, VaultV3Limits::from_env())
+    }
+
+    /// Export a sidecar with an explicit data budget, independent of the environment.
+    pub fn export_parity_with_limits(
+        vault_path: &Path,
+        password: &str,
+        out: Option<&Path>,
+        limits: VaultV3Limits,
+    ) -> Result<super::ec::ExportParityResult, String> {
+        super::ec::export_parity(vault_path, password, out, limits)
     }
 
     /// Drop the embedded Error-Correction extension on the next seal. Refuses
@@ -384,7 +390,17 @@ impl VaultV3 {
         password: &str,
         force: bool,
     ) -> Result<super::ec::StripParityResult, String> {
-        super::ec::strip_parity(vault_path, password, force)
+        Self::strip_parity_with_limits(vault_path, password, force, VaultV3Limits::from_env())
+    }
+
+    /// Strip embedded parity with an explicit data budget, independent of the environment.
+    pub fn strip_parity_with_limits(
+        vault_path: &Path,
+        password: &str,
+        force: bool,
+        limits: VaultV3Limits,
+    ) -> Result<super::ec::StripParityResult, String> {
+        super::ec::strip_parity(vault_path, password, force, limits)
     }
 
     /// Verify every stored content block against its manifest `cipher_hash`,
@@ -452,9 +468,18 @@ impl VaultV3 {
     /// password unlock into an unencrypted archive whose later writes are stored
     /// in the clear. Open those with [`VaultV3::open_plaintext`].
     pub fn open(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
-        // Refused from the header alone, before any payload is read: a hostile
-        // plaintext container can declare a data section as large as the file.
-        let vault = open_vault_with(path, password, true)?;
+        Self::open_with_limits(path, password, VaultV3Limits::from_env())
+    }
+
+    /// Open an encrypted vault using the caller's limits instead of the environment.
+    /// The returned handle retains the same limits for all later mutations.
+    pub fn open_with_limits(
+        path: impl Into<PathBuf>,
+        password: &str,
+        limits: VaultV3Limits,
+    ) -> Result<OpenVaultV3, String> {
+        // Refused from the header alone, before any payload is read.
+        let vault = open_vault_with_guard(path, password, true, None, limits)?;
         if vault.header.flags & FLAG_PLAINTEXT_CONTENT != 0 {
             return Err(PLAINTEXT_NOT_A_VAULT.to_string());
         }
@@ -464,7 +489,15 @@ impl VaultV3 {
     /// Open a plaintext (`.aerovz`) container, which has no password.
     /// Errors if the container is an encrypted `.aerovault`.
     pub fn open_plaintext(path: impl Into<PathBuf>) -> Result<OpenVaultV3, String> {
-        let vault = open_vault(path, "")?;
+        Self::open_plaintext_with_limits(path, VaultV3Limits::from_env())
+    }
+
+    /// Open the plaintext lane with an explicit budget retained by the handle.
+    pub fn open_plaintext_with_limits(
+        path: impl Into<PathBuf>,
+        limits: VaultV3Limits,
+    ) -> Result<OpenVaultV3, String> {
+        let vault = open_vault_with_guard(path, "", false, None, limits)?;
         if vault.header.flags & FLAG_PLAINTEXT_CONTENT == 0 {
             return Err("Not a plaintext .aerovz archive (it is encrypted)".to_string());
         }
@@ -661,7 +694,6 @@ impl VaultV3 {
         if new_password.len() < MIN_PASSWORD_LEN {
             return Err("Password must be at least 8 characters".to_string());
         }
-        vault.writable_generation()?;
         let lock = write_lock(&vault.path)?;
         vault.path = lock.source_path().to_path_buf();
         let sidecar = super::ec::default_sidecar_path(lock.source_path());
@@ -1128,7 +1160,7 @@ fn ingest_chunk(
             .checked_add(8)
             .and_then(|start| start.checked_add(enc))
             .ok_or("Vault data length overflow")?;
-        ensure_write_data_budget(end)?;
+        vault.limits.check_data_len(end)?;
         let additional = encrypted.len() + 8;
         if plaintext {
             crate::secret::reserve_vec(&mut vault.data, additional)
@@ -1327,7 +1359,6 @@ fn write_op<T>(
     vault: &mut OpenVaultV3,
     op: impl FnOnce(&mut OpenVaultV3, &WriteLock, Option<&WriteLock>) -> Result<T, String>,
 ) -> Result<T, String> {
-    vault.writable_generation()?;
     let lock = write_lock(&vault.path)?;
     #[cfg(test)]
     if let Some(hook) = BEFORE_MUTATION_SIDECAR_LOCK.with(|h| h.borrow_mut().take()) {
@@ -2504,41 +2535,35 @@ fn plaintext_lane_header(header_bytes: &[u8]) -> bool {
         .is_some_and(|h| aerovz_mac_key().is_ok_and(|k| h.verify_mac(&k).is_ok()))
 }
 
-pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
-    open_vault_with(path, password, false)
-}
-
-/// `encrypted_only` refuses a plaintext-lane container from its header, read
-/// from the same handle as the payload, before the payload is decoded.
-fn open_vault_with(
-    path: impl Into<PathBuf>,
-    password: &str,
-    encrypted_only: bool,
-) -> Result<OpenVaultV3, String> {
-    open_vault_with_guard(path, password, encrypted_only, None)
-}
-
 pub(super) fn open_vault_under_guard(
     path: impl Into<PathBuf>,
     password: &str,
     lock: &WriteLock,
+    limits: VaultV3Limits,
 ) -> Result<OpenVaultV3, String> {
     let path = path.into();
     let guard = lock.covers_namespace(&path).then_some(lock);
-    open_vault_with_guard(path, password, false, guard)
+    open_vault_with_guard(path, password, false, guard, limits)
 }
 
 fn retry_open_for_recovery(
     path: &Path,
     password: &str,
     encrypted_only: bool,
+    limits: VaultV3Limits,
 ) -> Result<OpenVaultV3, String> {
     // Healthy reads stay lock-free. Before using detached recovery, reopen the
     // source under the same guard that excludes paired rotation and stripping.
     // This also recovers a journal published after the first optimistic check.
     let real = std::fs::canonicalize(path).map_err(|e| format!("Resolve recovery source: {e}"))?;
     let guard = crate::lock::acquire_for_export(&real).map_err(|e| e.to_string())?;
-    open_vault_with_guard(path.to_path_buf(), password, encrypted_only, Some(&guard))
+    open_vault_with_guard(
+        path.to_path_buf(),
+        password,
+        encrypted_only,
+        Some(&guard),
+        limits,
+    )
 }
 
 pub(super) fn recovery_namespace(path: &Path) -> Result<PathBuf, String> {
@@ -2560,6 +2585,7 @@ fn open_vault_with_guard(
     password: &str,
     encrypted_only: bool,
     recovery_guard: Option<&WriteLock>,
+    limits: VaultV3Limits,
 ) -> Result<OpenVaultV3, String> {
     let path = recovery_namespace(&path.into())?;
     if let Some(guard) = recovery_guard {
@@ -2634,7 +2660,7 @@ fn open_vault_with_guard(
                         return Err(orig);
                     }
                     drop(file);
-                    return retry_open_for_recovery(&path, password, encrypted_only);
+                    return retry_open_for_recovery(&path, password, encrypted_only, limits);
                 }
                 match super::ec::recover_header_from_sidecar(&path, &header_bytes, password)? {
                     Some((h, mac, master)) => (h, mac, master, true),
@@ -2647,16 +2673,12 @@ fn open_vault_with_guard(
     // Reject impossible ranges before reading any payload for the baseline.
     validate_ranges(&header, file_len)?;
 
-    // Opening keeps the data section in memory. Bound and reserve it before
-    // the baseline scan, so an oversized data section fails before scanning
-    // and an allocation failure cannot abort the process.
-    ensure_data_budget(header.data_len)?;
+    limits.check_data_len(header.data_len)?;
     let data_size =
         usize::try_from(header.data_len).map_err(|_| "Data section exceeds address space")?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(data_size)
-        .map_err(|e| format!("Cannot allocate vault data section: {e}"))?;
-    data.resize(data_size, 0);
+    if data_size > isize::MAX as usize {
+        return Err("Data section exceeds address space".into());
+    }
 
     // The generation is taken once the header is checked, so a wrong password
     // or a file that is not a vault costs no extra read, and before the
@@ -2670,25 +2692,7 @@ fn open_vault_with_guard(
     if let Some(hook) = BEFORE_OPEN_GENERATION.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let opened_hash = if file_len <= MAX_GENERATION_EXTENT {
-        let (hashed_len, hash) = file_generation_starting_with(&mut file, &header_bytes, file_len)?;
-        if hashed_len != file_len {
-            return Err(format!(
-                "{} changed while it was being opened; open it again",
-                path.display()
-            ));
-        }
-        Some(hash)
-    } else {
-        // The validated data and metadata reads below are bounded separately.
-        // An older container can contain a large, unused tail or a sparse gap.
-        None
-    };
-
-    file.seek(std::io::SeekFrom::Start(header.data_offset))
-        .map_err(|e| format!("Seek data section: {e}"))?;
-    file.read_exact(&mut data)
-        .map_err(|e| format!("Read data section: {e}"))?;
+    let opened_hash = file_generation_starting_with(&mut file, &header_bytes, file_len)?;
     let encrypted_manifest = read_capped(
         &mut file,
         header.manifest_offset,
@@ -2749,14 +2753,12 @@ fn open_vault_with_guard(
                 return Err(orig);
             }
             if recovery_guard.is_none() {
-                // The retry reads another complete data section. Release this
-                // attempt's payload and metadata before acquiring/reopening.
-                drop(data);
+                // Release this attempt's metadata before acquiring/reopening.
                 drop(encrypted_manifest);
                 drop(extension_json);
                 drop(extensions);
                 drop(file);
-                return retry_open_for_recovery(&path, password, encrypted_only);
+                return retry_open_for_recovery(&path, password, encrypted_only, limits);
             }
             let embedded = super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
             let rebuilt = match embedded {
@@ -2788,6 +2790,17 @@ fn open_vault_with_guard(
     #[cfg(test)]
     crate::lock::trace("decode");
 
+    // Validate the protected metadata before allocating the data section.
+    // If the read fails, wipe any plaintext already read from a plaintext vault.
+    let mut data = Zeroizing::new(Vec::new());
+    data.try_reserve_exact(data_size)
+        .map_err(|e| format!("Cannot allocate vault data section: {e}"))?;
+    data.resize(data_size, 0);
+    file.seek(std::io::SeekFrom::Start(header.data_offset))
+        .map_err(|e| format!("Seek data section: {e}"))?;
+    file.read_exact(&mut data)
+        .map_err(|e| format!("Read data section: {e}"))?;
+
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
     // its sole author and recomputes it on every seal from the freshly
     // encrypted manifest. (No-op when no EC extension is present.)
@@ -2804,6 +2817,7 @@ fn open_vault_with_guard(
         path,
         opened_file_len: file_len,
         opened_hash,
+        limits,
         header,
         // Copied into the handle, whose Drop wipes them; the wrapped copies
         // are wiped here.
@@ -2811,7 +2825,7 @@ fn open_vault_with_guard(
         mac_key: *mac_key,
         manifest,
         extensions,
-        data,
+        data: std::mem::take(&mut *data),
         manifest_repaired_on_open,
         header_repaired_on_open,
         telemetry: None,
@@ -2860,20 +2874,11 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
 }
 
 pub(super) fn assert_vault_generation_at(vault: &OpenVaultV3, path: &Path) -> Result<(), String> {
-    let expected = vault.writable_generation()?;
     let mut file = crate::source::open_regular(path).map_err(|e| format!("Open vault: {e}"))?;
-    if file_generation(&mut file)? != (vault.opened_file_len, expected) {
+    if file_generation(&mut file, vault.opened_file_len)? != vault.opened_hash {
         return Err("Vault changed while this write was in progress; retry operation".to_string());
     }
     Ok(())
-}
-
-impl OpenVaultV3 {
-    pub(super) fn writable_generation(&self) -> Result<[u8; 32], String> {
-        self.opened_hash.ok_or_else(|| {
-            "Vault is available for reading and extraction. Its extent exceeds the 4 GiB write generation budget".into()
-        })
-    }
 }
 
 /// A writer that passes bytes through and keeps their count and BLAKE3 hash,
@@ -2919,47 +2924,52 @@ thread_local! {
     pub(super) static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Length and BLAKE3 hash of the whole file behind `file`, read from its start.
-/// The whole file, not the header: a write can leave the header identical
-/// (a rename to a name of the same length changes only the manifest bytes).
-fn file_generation(file: &mut std::fs::File) -> Result<(u64, [u8; 32]), String> {
+/// Hash the original extent and reject a replacement of a different size
+/// before scanning its bytes.
+fn file_generation(file: &mut std::fs::File, expected_len: u64) -> Result<[u8; 32], String> {
     let len = file
         .metadata()
         .map_err(|e| format!("Stat vault: {e}"))?
         .len();
-    if len > MAX_GENERATION_EXTENT {
-        return Err("Vault container exceeds the 4 GiB generation scan budget".into());
+    if len != expected_len {
+        return Err("Vault changed while this write was in progress; retry operation".into());
     }
     file_generation_starting_with(file, &[], len)
 }
 
-/// [`file_generation`] of a file that must start with `prefix`: an error if it
-/// does not, so the hash is known to cover those bytes.
+/// Hash exactly the observed file length, checking the header prefix and EOF.
+/// Hashing streams in a fixed-size buffer regardless of container size.
 fn file_generation_starting_with(
     file: &mut std::fs::File,
     prefix: &[u8],
     len: u64,
-) -> Result<(u64, [u8; 32]), String> {
+) -> Result<[u8; 32], String> {
     #[cfg(test)]
     GENERATION_READS.with(|n| n.set(n.get() + 1));
     #[cfg(test)]
     crate::lock::trace("generation");
+    let changed = || "vault changed while it was being read; open it again".to_string();
+    let expected = len.checked_sub(prefix.len() as u64).ok_or_else(changed)?;
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(|e| format!("Read vault: {e}"))?;
     let mut head = vec![0u8; prefix.len()];
     file.read_exact(&mut head)
         .map_err(|e| format!("Read vault: {e}"))?;
     if head != prefix {
-        return Err("vault changed while it was being read; open it again".to_string());
+        return Err(changed());
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(&head);
-    let rest = std::io::copy(
-        &mut file.take(len.saturating_sub(prefix.len() as u64) + 1),
-        &mut hasher,
-    )
-    .map_err(|e| format!("Read vault: {e}"))?;
-    Ok((prefix.len() as u64 + rest, *hasher.finalize().as_bytes()))
+    let rest = std::io::copy(&mut Read::by_ref(file).take(expected), &mut hasher)
+        .map_err(|e| format!("Read vault: {e}"))?;
+    if rest != expected
+        || std::io::copy(&mut file.take(1), &mut std::io::sink())
+            .map_err(|e| format!("Read vault: {e}"))?
+            != 0
+    {
+        return Err(changed());
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// Persist the in-memory vault back to disk with an atomic single-rename seal.
@@ -2995,7 +3005,7 @@ pub(super) fn save_locked_to(
     lock: &WriteLock,
     target: &Path,
 ) -> Result<(), String> {
-    ensure_write_data_budget(vault.data.len() as u64)?;
+    vault.limits.check_data_len(vault.data.len() as u64)?;
     if !lock.covers_namespace(&vault.path) {
         return Err("source lock namespace changed; retry operation".to_string());
     }
@@ -3088,9 +3098,6 @@ pub(super) fn save_locked_to(
             w.flush().map_err(|e| format!("Flush temp file: {e}"))?;
         }
         let generation = sealed.finish();
-        if generation.0 > MAX_GENERATION_EXTENT {
-            return Err("Vault container exceeds the 4 GiB generation scan budget".into());
-        }
         tmp.as_file_mut()
             .sync_all()
             .map_err(|e| format!("Sync temp file: {e}"))?;
@@ -3124,7 +3131,7 @@ pub(super) fn save_locked_to(
     // Refresh the staleness baseline so a second save in the same session does
     // not trip the generation guard against the bytes we just wrote.
     vault.opened_file_len = file_len;
-    vault.opened_hash = Some(file_hash);
+    vault.opened_hash = file_hash;
     vault.header = header;
     vault.header_repaired_on_open = false;
     vault.manifest_repaired_on_open = false;
@@ -3639,6 +3646,7 @@ mod tests {
                 &super::super::ec::default_sidecar_path(&path),
                 true,
                 &lock,
+                VaultV3Limits::default(),
             )
             .unwrap();
         });
@@ -4122,8 +4130,8 @@ mod tests {
         // The baseline the save kept is the file now on disk.
         let mut file = std::fs::File::open(&vp).unwrap();
         assert_eq!(
-            file_generation(&mut file).unwrap(),
-            (v.opened_file_len, v.opened_hash.unwrap())
+            file_generation(&mut file, v.opened_file_len).unwrap(),
+            v.opened_hash
         );
         drop(file);
         VaultV3::add_files(&mut v, &[(src.join("a.txt"), "b.txt".to_string())]).unwrap();
@@ -5472,7 +5480,8 @@ mod tests {
                 header_mac: [0u8; MAC_SIZE],
             },
             opened_file_len: 0,
-            opened_hash: Some([0u8; 32]),
+            opened_hash: [0u8; 32],
+            limits: VaultV3Limits::default(),
             master_key: [0u8; KEY_SIZE],
             mac_key: [0u8; KEY_SIZE],
             manifest,
@@ -5859,7 +5868,7 @@ mod tests {
         save_open_vault(&mut vault).unwrap();
         let manifest_at = vault.header.manifest_offset;
         drop(vault);
-        super::super::ec::export_parity(&path, "", None).unwrap();
+        VaultV3::export_parity(&path, "", None).unwrap();
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -5885,7 +5894,7 @@ mod tests {
             let path = dir.path().join("reader-race.aerovault");
             VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
                 .unwrap();
-            super::super::ec::export_parity(&path, PW, None).unwrap();
+            VaultV3::export_parity(&path, PW, None).unwrap();
             let mut vault = VaultV3::open(&path, PW).unwrap();
             std::thread::scope(|scope| {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -5940,7 +5949,7 @@ mod tests {
             20,
         )
         .unwrap();
-        ec::export_parity(&path, PW, None).unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
         let at = VaultV3::open(&path, PW).unwrap().header.manifest_offset as usize;
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[at] ^= 0xff;
@@ -6641,43 +6650,35 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn round12_legacy_sparse_tail_allows_extraction_without_a_write_baseline() {
+    fn legacy_sparse_tail_above_four_gib_can_be_resealed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.aerozip");
         let input = dir.path().join("input");
         std::fs::write(&input, b"valid 0.6.8 payload").unwrap();
         VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
-        let mut opened = VaultV3::open_plaintext(&path).unwrap();
-        VaultV3::add_files(&mut opened, &[(input.clone(), "input".into())]).unwrap();
-        drop(opened);
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input.clone(), "input".into())]).unwrap();
+        drop(vault);
+        let original_extent = 4 * 1024 * 1024 * 1024 + 1;
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let original_len = file.metadata().unwrap().len();
-        file.set_len(original_len + 8).unwrap();
-        assert!(VaultV3::open_plaintext(&path)
-            .unwrap()
-            .opened_hash
-            .is_some());
-        file.set_len(MAX_GENERATION_EXTENT + 1).unwrap();
+        file.set_len(original_extent).unwrap();
         drop(file);
-        crate::lock::take_trace();
+
         let mut opened = VaultV3::open_plaintext(&path).unwrap();
-        assert!(opened.opened_hash.is_none());
-        assert!(!crate::lock::take_trace().contains(&"generation"));
+        assert_eq!(opened.opened_file_len, original_extent);
         let output = dir.path().join("output");
         VaultV3::extract_entry(&opened, "input", &output).unwrap();
         assert_eq!(std::fs::read(output).unwrap(), b"valid 0.6.8 payload");
-        let error = VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap_err();
-        assert!(error.contains("write generation budget"), "{error}");
-        assert_eq!(
-            std::fs::metadata(path).unwrap().len(),
-            MAX_GENERATION_EXTENT + 1
-        );
+        VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap();
+        assert_eq!(VaultV3::list(&opened).len(), 2);
+        assert!(opened.opened_file_len < original_extent);
+        assert_vault_generation_current(&opened).unwrap();
     }
 
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     #[test]
-    #[ignore = "requires a 64-bit host and 5 GiB of available memory; set AEROVAULT_V3_DATA_BUDGET_BYTES=4294975488"]
-    fn round13_explicit_budget_reads_a_legacy_data_section_over_four_gib() {
+    #[ignore = "requires a 64-bit host with room for multiple 4 GiB allocations and file extents"]
+    fn legacy_sparse_data_section_over_four_gib_can_be_resealed() {
         use super::super::manifest::serialize_manifest_plaintext;
         use std::io::Write;
 
@@ -6692,7 +6693,7 @@ mod tests {
 
         // Write the ordinary v3 layout accepted by 0.6.8. The data section
         // is sparse, with a live block past 4 GiB and the manifest after it.
-        let block_offset = MAX_GENERATION_EXTENT + 4096;
+        let block_offset = 4 * 1024 * 1024 * 1024 + 4096;
         assert_eq!(vault.manifest.chunks.len(), 1);
         vault
             .manifest
@@ -6721,27 +6722,14 @@ mod tests {
         drop(file);
         drop(vault);
 
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(DEFAULT_DATA_BUDGET)));
-        let default_result = VaultV3::open_plaintext(&path);
-        TEST_DATA_BUDGET.with(|limit| limit.set(None));
-        assert!(default_result
-            .unwrap_err()
-            .contains("in-memory open budget"));
-        assert!(data_budget() >= header.data_len);
-
-        crate::lock::take_trace();
         let mut opened = VaultV3::open_plaintext(&path).unwrap();
         assert_eq!(opened.data.len() as u64, header.data_len);
-        assert!(!crate::lock::take_trace().contains(&"generation"));
         let output = dir.path().join("output");
         VaultV3::extract_entry(&opened, "input", &output).unwrap();
         assert_eq!(std::fs::read(output).unwrap(), payload);
-        let error = VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap_err();
-        assert!(error.contains("write generation budget"), "{error}");
-        assert_eq!(
-            std::fs::metadata(path).unwrap().len(),
-            header.extension_payload_offset
-        );
+        VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap();
+        assert_vault_generation_current(&opened).unwrap();
+        assert_eq!(VaultV3::list(&opened).len(), 2);
     }
 
     #[cfg(target_os = "linux")]
@@ -6793,24 +6781,60 @@ mod tests {
         rng.fill_bytes(&mut random);
         std::fs::write(&input, random).unwrap();
         VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
-        let mut opened = VaultV3::open_plaintext(&path).unwrap();
+        let tight = VaultV3Limits::default().with_max_data_bytes(512);
+        let mut opened = VaultV3::open_plaintext_with_limits(&path, tight).unwrap();
         let before = std::fs::read(&path).unwrap();
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(512)));
         let failed = VaultV3::add_files(&mut opened, &[(input.clone(), "input".into())]);
-        TEST_DATA_BUDGET.with(|limit| limit.set(None));
-        assert!(failed.unwrap_err().contains("in-memory open budget"));
+        assert!(failed
+            .unwrap_err()
+            .contains("configured 512-byte data budget"));
         assert!(opened.data.is_empty());
         assert!(VaultV3::list(&opened).is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        VaultV3::add_files(&mut opened, &[(input, "input".into())]).unwrap();
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(512)));
-        assert!(VaultV3::open_plaintext(&path)
+        let mut unlimited = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut unlimited, &[(input, "input".into())]).unwrap();
+        assert!(VaultV3::open_plaintext_with_limits(&path, tight)
             .unwrap_err()
-            .contains("in-memory open budget"));
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(2048)));
-        let reopened = VaultV3::open_plaintext(&path);
-        TEST_DATA_BUDGET.with(|limit| limit.set(None));
-        assert_eq!(VaultV3::list(&reopened.unwrap()).len(), 1);
+            .contains("configured 512-byte data budget"));
+        let reopened = VaultV3::open_plaintext_with_limits(
+            &path,
+            VaultV3Limits::default().with_max_data_bytes(2048),
+        )
+        .unwrap();
+        assert_eq!(VaultV3::list(&reopened).len(), 1);
+    }
+
+    #[test]
+    fn a_data_budget_refusal_preserves_the_vault_and_its_sidecar() {
+        use super::super::ec::RecoveryPlacement;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerovault");
+        let sidecar = super::super::ec::default_sidecar_path(&path);
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"stored bytes").unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        drop(vault);
+        VaultV3::export_parity(&path, PW, None).unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        let recovery = std::fs::read(&sidecar).unwrap();
+        let limits = VaultV3Limits::default().with_max_data_bytes(0);
+        for error in [
+            VaultV3::open_with_limits(&path, PW, limits).unwrap_err(),
+            VaultV3::export_parity_with_limits(&path, PW, None, limits).unwrap_err(),
+            VaultV3::strip_parity_with_limits(&path, PW, false, limits).unwrap_err(),
+        ] {
+            assert!(error.contains("configured 0-byte data budget"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), recovery);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -6819,10 +6843,13 @@ mod tests {
         const KEY: &str = "AEROVAULT_ROUND8_MEMORY";
         if let Some(path) = std::env::var_os(KEY) {
             crate::source::memory_test::limit();
-            TEST_DATA_BUDGET.with(|budget| budget.set(Some(DEFAULT_DATA_BUDGET)));
+            let limits = VaultV3Limits::default().with_max_data_bytes(1024 * 1024 * 1024);
             crate::lock::take_trace();
-            let err = VaultV3::open_plaintext(PathBuf::from(path)).unwrap_err();
-            assert!(err.contains("in-memory open budget"), "{err}");
+            let err = VaultV3::open_plaintext_with_limits(PathBuf::from(path), limits).unwrap_err();
+            assert!(
+                err.contains("configured 1073741824-byte data budget"),
+                "{err}"
+            );
             assert!(!crate::lock::take_trace().contains(&"generation"));
             crate::source::memory_test::complete();
             return;
