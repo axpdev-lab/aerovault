@@ -17,9 +17,7 @@ pub(super) const VERSION: u8 = 2;
 #[path = "state_linux.rs"]
 mod linux;
 #[cfg(target_os = "linux")]
-pub(in crate::v3) use linux::{
-    forget_location, pending_location, remember_location, select_root, validate_active_root,
-};
+pub(in crate::v3) use linux::{pending_location, select_root, validate_active_root};
 const MAX_RECORD_SIZE: u64 = 4096;
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize)]

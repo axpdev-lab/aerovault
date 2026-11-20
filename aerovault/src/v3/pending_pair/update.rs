@@ -484,7 +484,6 @@ pub(in crate::v3) fn publish(
         )?;
         stage.sync(&destination)?;
         sync_dir(prepared.path())?;
-        state::remember_location(source, root)?;
         publish_index(prepared.path(), &active)
     })();
     if let Err(error) = ready {
@@ -503,8 +502,7 @@ pub(in crate::v3) fn publish(
             "Private pair recovery pending at {}: {error}",
             active.display()
         )
-    })?;
-    state::forget_location(source)
+    })
 }
 
 pub(in crate::v3) fn recover(lock: &WriteLock, active: &Path) -> Result<(), String> {
