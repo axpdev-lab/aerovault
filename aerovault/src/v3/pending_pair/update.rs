@@ -5,7 +5,7 @@
 //! slots. Each rename preserves its displaced inode. A portable envelope
 //! blocks readers between the first and last vault exchanges.
 
-use super::fresh::{checked_fd, ensure_private_root, publish_index, write_input, Destination};
+use super::fresh::{checked_fd, publish_index, write_input, Destination};
 use super::state;
 use crate::lock::WriteLock;
 use crate::v3::ec::default_sidecar_path;
@@ -21,9 +21,9 @@ use std::fs::{self, File, Permissions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-const RECORD: &str = "update.json";
+pub(super) const RECORD: &str = "update.json";
 const VERSION: u8 = 1;
 const LIMIT: u64 = 4096;
 const SLOTS: [&CStr; 3] = [c"marker", c"sidecar", c"vault"];
@@ -382,8 +382,7 @@ fn portable_header(
 
 pub(in crate::v3) fn prepare(source: &Path, prefix: &str) -> Result<PrivateDir, String> {
     Destination::open(output_parent_dir(source))?;
-    let root = state::configured_root()?;
-    ensure_private_root(&root)?;
+    let root = state::select_root()?;
     private_dir(&root, prefix).map_err(|error| format!("Prepare private pair journal: {error}"))
 }
 
@@ -485,6 +484,7 @@ pub(in crate::v3) fn publish(
         )?;
         stage.sync(&destination)?;
         sync_dir(prepared.path())?;
+        state::remember_location(source, root)?;
         publish_index(prepared.path(), &active)
     })();
     if let Err(error) = ready {
@@ -503,14 +503,8 @@ pub(in crate::v3) fn publish(
             "Private pair recovery pending at {}: {error}",
             active.display()
         )
-    })
-}
-
-pub(in crate::v3) fn pending(source: &Path) -> Option<PathBuf> {
-    let root = state::configured_root().ok()?;
-    let path = root.join(state::source_key(source).to_hex().as_str());
-    fs::symlink_metadata(path.join(RECORD)).ok()?;
-    Some(path)
+    })?;
+    state::forget_location(source)
 }
 
 pub(in crate::v3) fn recover(lock: &WriteLock, active: &Path) -> Result<(), String> {
@@ -854,6 +848,7 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::v3::{CreateOptionsV3, RecoveryPlacement, VaultV3};
+    use std::path::PathBuf;
     use std::process::Command;
 
     const ACTION: &str = "AEROVAULT_TEST_PRIVATE_UPDATE";
@@ -905,6 +900,14 @@ mod tests {
                     assert!(error.starts_with("Password changed on disk"), "{error}");
                     VaultV3::create_directory(&mut vault, "after-cleanup-retry").unwrap();
                 }
+                "wrong-xdg" => {
+                    let error = VaultV3::open(&path, OLD).unwrap_err();
+                    assert!(
+                        error.contains("restore its previous value and reopen the vault"),
+                        "{error}"
+                    );
+                    assert!(VaultV3::create(&CreateOptionsV3::new(&path, NEW)).is_err());
+                }
                 "missing" | "conflict" => {
                     let error = VaultV3::open(&path, OLD).unwrap_err();
                     let detail = if action == "missing" {
@@ -954,14 +957,21 @@ mod tests {
             .permissions(Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let home = fixture.path().join("state");
-        let root = home.join("aerovault/journals");
+        let home = fixture.path().join("home");
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        let xdg = fixture.path().join("state");
+        let root = xdg.join("aerovault/journals");
         let run = |target: &Path, action: &str, expected: i32| {
+            let (action, state_home) = match action.strip_suffix("@new-xdg") {
+                Some(action) => (action, fixture.path().join("new-state")),
+                None => (action, xdg.clone()),
+            };
             let child = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
                 .env(PATH, target)
                 .env(ACTION, action)
-                .env("XDG_STATE_HOME", &home)
+                .env("HOME", &home)
+                .env("XDG_STATE_HOME", state_home)
                 .output()
                 .unwrap();
             assert_eq!(
@@ -1081,6 +1091,19 @@ mod tests {
                 cleanup(&target);
             }
         }
+
+        let switched = make("switched-xdg");
+        let original = bytes(&switched);
+        run(&switched, "rotate-2", 77);
+        assert!(journal(&switched).join(RECORD).is_file());
+        let pending = bytes(&switched);
+        run(&switched, "wrong-xdg@new-xdg", 0);
+        assert_eq!(bytes(&switched), pending);
+        assert!(journal(&switched).join(RECORD).is_file());
+        assert!(home.read_dir().unwrap().next().is_none());
+        run(&switched, "open-old", 0);
+        assert_eq!(bytes(&switched), original);
+        cleanup(&switched);
 
         let rotated = make("rotate-cleanup-error");
         run(&rotated, "rotate-cleanup-error", 0);

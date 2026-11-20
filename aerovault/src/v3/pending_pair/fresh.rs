@@ -9,8 +9,8 @@ use super::state;
 use crate::lock::WriteLock;
 use crate::v3::ec::default_sidecar_path;
 use crate::v3::strip_transaction::{
-    generation, hash_generation, private_dir, private_options, sync_dir, validate_journal_ancestry,
-    writable_ancestor, Generation, PrivateDir, TrustedJournal,
+    check_journal_ancestry, generation, hash_generation, private_dir, private_options, sync_dir,
+    writable_ancestor, AncestryError, Generation, PrivateDir, TrustedJournal,
 };
 use crate::v3::vault::output_parent_dir;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const VERSION: u8 = 1;
-const RECORD: &str = "fresh.json";
+pub(super) const RECORD: &str = "fresh.json";
 const MAX_RECORD: u64 = 4096;
 
 #[derive(Serialize, Deserialize)]
@@ -243,32 +243,37 @@ pub(super) fn checked_fd(fd: libc::c_int) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-pub(super) fn ensure_private_root(root: &Path) -> Result<(), String> {
+pub(super) fn ensure_private_root(root: &Path) -> Result<(), AncestryError> {
     let mut missing = Vec::new();
     for ancestor in root.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(_) => {
-                validate_journal_ancestry(ancestor)
-                    .map_err(|error| format!("AeroVault private state rejected. {error}"))?;
+                check_journal_ancestry(ancestor)?;
                 break;
             }
             Err(error) if error.kind() == ErrorKind::NotFound => missing.push(ancestor),
-            Err(error) => return Err(format!("Inspect AeroVault private state: {error}")),
+            Err(error) => {
+                return Err(AncestryError::Other(format!(
+                    "Inspect AeroVault private state: {error}"
+                )))
+            }
         }
     }
     fs::DirBuilder::new()
         .mode(0o700)
         .recursive(true)
         .create(root)
-        .map_err(|error| format!("Create AeroVault private state: {error}"))?;
+        .map_err(|error| {
+            AncestryError::Other(format!("Create AeroVault private state: {error}"))
+        })?;
     TrustedJournal::open(root).map_err(|error| {
-        format!(
-            "AeroVault private state directory {} rejected ({error})",
+        AncestryError::Other(format!(
+            "Private state directory {} rejected ({error})",
             root.display()
-        )
+        ))
     })?;
     for directory in missing {
-        sync_dir(output_parent_dir(directory))?;
+        sync_dir(output_parent_dir(directory)).map_err(AncestryError::Other)?;
     }
     Ok(())
 }
@@ -283,16 +288,15 @@ pub(in crate::v3) struct Plan {
 impl Plan {
     pub(in crate::v3) fn prepare(path: &Path) -> Result<Self, String> {
         let source = crate::lock::anchored(path).map_err(|error| error.to_string())?;
-        if pending(&source).is_some() {
+        if state::pending_location(&source)?.is_some() {
             // Normal recovery under the source lock uses the already prepared
             // generations. Never turn a retry into a new set of vault keys.
             let _lock = crate::lock::acquire(&source).map_err(|error| error.to_string())?;
-            return Err("An earlier fresh pair creation was recovered or completed; open that vault with its original password".into());
+            return Err("An earlier private pair operation was recovered or completed; reopen that vault before creating it".into());
         }
         let destination = Destination::open(output_parent_dir(&source))?;
         require_absent(&source, &default_sidecar_path(&source))?;
-        let root = state::configured_root()?;
-        ensure_private_root(&root)?;
+        let root = state::select_root()?;
         // Detect unsupported destination filesystems before creating locks or
         // committing a journal that cannot be published on this filesystem.
         drop(destination.anonymous_file()?);
@@ -337,6 +341,7 @@ impl Plan {
             &serde_json::to_vec(&record).map_err(|e| e.to_string())?,
         )?;
         sync_dir(prepared.path())?;
+        state::remember_location(&self.source, &self.root)?;
         publish_index(prepared.path(), &active)?;
         sync_dir(&self.root)?;
         #[cfg(test)]
@@ -346,7 +351,8 @@ impl Plan {
                 "Fresh pair recovery pending at {}: {error}",
                 active.display()
             )
-        })
+        })?;
+        state::forget_location(&self.source)
     }
 }
 
@@ -400,13 +406,6 @@ pub(super) fn publish_index(prepared: &Path, active: &Path) -> Result<(), String
         ));
     }
     Ok(())
-}
-
-pub(in crate::v3) fn pending(source: &Path) -> Option<PathBuf> {
-    let root = state::configured_root().ok()?;
-    let path = root.join(state::source_key(source).to_hex().as_str());
-    fs::symlink_metadata(path.join(RECORD)).ok()?;
-    Some(path)
 }
 
 pub(in crate::v3) fn recover(lock: &WriteLock, active: &Path) -> Result<(), String> {
@@ -600,18 +599,45 @@ mod tests {
                 "retry" => {
                     let error = create(RecoveryPlacement::Detached).unwrap_err();
                     assert!(
-                        error.contains("earlier fresh pair creation was recovered"),
+                        error.contains("earlier private pair operation was recovered"),
                         "{error}"
                     );
                 }
-                "group-state" => {
+                "duplicate-roots" => {
+                    let error = VaultV3::open(&path, PASSWORD).unwrap_err();
+                    assert!(
+                        error.contains("Conflicting private pair journals"),
+                        "{error}"
+                    );
+                }
+                "untrusted-locator" => {
+                    let error = VaultV3::open(&path, PASSWORD).unwrap_err();
+                    assert!(error.contains("trusted ownership and access"), "{error}");
+                }
+                "untrusted-pending" => {
+                    let error = VaultV3::open(&path, PASSWORD).unwrap_err();
+                    assert!(error.contains("Run chmod g-w"), "{error}");
+                }
+                "unsafe-home" => {
+                    let error = create(RecoveryPlacement::Detached).unwrap_err();
+                    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+                    assert!(
+                        error.contains(&format!("HOME {} rejected", home.display())),
+                        "{error}"
+                    );
+                    assert!(
+                        error.contains(&format!("Run chmod g-w '{}'", home.display())),
+                        "{error}"
+                    );
+                }
+                "blocked-state" => {
                     let error = create(RecoveryPlacement::Detached).unwrap_err();
                     let home = PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
                     let ancestor = home.parent().unwrap().display();
-                    assert_eq!(
-                        error,
-                        format!("AeroVault private state rejected. Ancestor {ancestor} permits other users to write. Run chmod g-w '{ancestor}'")
-                    );
+                    assert!(error.starts_with(
+                        &format!("AeroVault private state rejected. Ancestor {ancestor} permits other users to write. Run chmod g-w '{ancestor}'")
+                    ), "{error}");
+                    assert!(error.contains("also rejected"), "{error}");
                 }
                 "readonly-state" => {
                     let error = create(RecoveryPlacement::Detached).unwrap_err();
@@ -635,17 +661,32 @@ mod tests {
             .unwrap();
         let state_home = fixture.path().join("state");
         let root = state_home.join("aerovault/journals");
+        let home = fixture.path().join("home");
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        let alternate = home.join(".aerovault-state/journals");
 
         let run = |target: &Path, action: &str, expected: i32| {
+            let (action, variant) = action.split_once('@').unwrap_or((action, ""));
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
                 .args(["--exact", TEST, "--nocapture"])
                 .env(TARGET, target)
-                .env(ACTION, action);
+                .env(ACTION, action)
+                .env("HOME", &home);
             if action == "absent-state" {
-                command.env_remove("HOME").env_remove("XDG_STATE_HOME");
-            } else if action == "group-state" {
+                command
+                    .env_remove("HOME")
+                    .env("XDG_STATE_HOME", &state_home);
+            } else if action == "unsafe-home" {
+                command
+                    .env("HOME", fixture.path().join("group-parent"))
+                    .env("XDG_STATE_HOME", &state_home);
+            } else if action == "blocked-state" || variant == "group" {
                 command.env("XDG_STATE_HOME", fixture.path().join("group-parent/state"));
+            } else if variant == "default" {
+                command.env_remove("XDG_STATE_HOME");
+            } else if variant == "new" {
+                command.env("XDG_STATE_HOME", fixture.path().join("new-xdg"));
             } else if action == "readonly-state" {
                 command.env("XDG_STATE_HOME", fixture.path().join("readonly-state-home"));
             } else {
@@ -747,6 +788,18 @@ mod tests {
         assert_eq!(fs::read(&sidecar).unwrap(), original);
         assert!(journal(&target).exists());
 
+        // Successful pair operations in a custom XDG directory leave HOME untouched.
+        assert!(home.read_dir().unwrap().next().is_none());
+        let target = fresh_target("default-state");
+        run(&target, "sidecar@default", 77);
+        let default_journal = home
+            .join(".local/state/aerovault/journals")
+            .join(state::source_key(&target).to_hex().as_str());
+        assert!(default_journal.join(RECORD).is_file());
+        run(&target, "open@new", 0);
+        assert!(!default_journal.exists());
+        assert!(!alternate.exists());
+
         let group_parent = fixture.path().join("group-parent");
         fs::create_dir(&group_parent).unwrap();
         fs::set_permissions(&group_parent, fs::Permissions::from_mode(0o775)).unwrap();
@@ -755,7 +808,32 @@ mod tests {
             .create(group_parent.join("state"))
             .unwrap();
         let target = fresh_target("group-state");
-        run(&target, "group-state", 0);
+        run(&target, "sidecar@group", 77);
+        let alternate_journal = alternate.join(state::source_key(&target).to_hex().as_str());
+        assert!(alternate_journal.join(RECORD).is_file());
+        let locator = alternate.join(format!(".location-{}", state::source_key(&target).to_hex()));
+        assert!(locator.is_file());
+        for directory in [alternate.parent().unwrap(), alternate.as_path()] {
+            assert_eq!(directory.metadata().unwrap().mode() & 0o777, 0o700);
+        }
+        assert!(!group_parent.join("state/aerovault").exists());
+        // An untrusted locator cannot authorize automatic recovery.
+        fs::set_permissions(&locator, fs::Permissions::from_mode(0o660)).unwrap();
+        let old_sidecar = fs::read(default_sidecar_path(&target)).unwrap();
+        run(&target, "untrusted-locator@new", 0);
+        assert!(!target.exists() && alternate_journal.exists());
+        assert_eq!(
+            fs::read(default_sidecar_path(&target)).unwrap(),
+            old_sidecar
+        );
+        fs::set_permissions(&locator, fs::Permissions::from_mode(0o600)).unwrap();
+        // A different, healthy XDG selection still finds the fallback journal.
+        run(&target, "open@new", 0);
+        assert!(!alternate_journal.exists());
+        assert!(!locator.exists());
+
+        let target = fresh_target("unsafe-home");
+        run(&target, "unsafe-home", 0);
         assert!(target
             .parent()
             .unwrap()
@@ -763,6 +841,65 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+
+        let target = fresh_target("blocked-state");
+        let alternate_base = alternate.parent().unwrap();
+        fs::set_permissions(alternate_base, fs::Permissions::from_mode(0o775)).unwrap();
+        run(&target, "blocked-state", 0);
+        fs::set_permissions(alternate_base, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(target
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
+
+        let target = fresh_target("switch-xdg");
+        run(&target, "sidecar", 77);
+        let old_journal = journal(&target);
+        let key = state::source_key(&target).to_hex();
+        let alias = alternate.join(key.as_str());
+        let locator_name = format!(".location-{key}");
+        // Inject a trusted test hint to a journal outside the fixed roots.
+        write_input(
+            &alternate,
+            &locator_name,
+            old_journal.parent().unwrap().as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&alias).unwrap();
+        for leaf in [RECORD, "new-vault", "new-sidecar"] {
+            fs::copy(old_journal.join(leaf), alias.join(leaf)).unwrap();
+        }
+        let sidecar = fs::read(default_sidecar_path(&target)).unwrap();
+        run(&target, "duplicate-roots@new", 0);
+        assert!(!target.exists());
+        assert_eq!(fs::read(default_sidecar_path(&target)).unwrap(), sidecar);
+        assert!(old_journal.join(RECORD).is_file() && alias.join(RECORD).is_file());
+        fs::remove_dir_all(alias).unwrap();
+
+        fs::set_permissions(&state_home, fs::Permissions::from_mode(0o775)).unwrap();
+        run(&target, "untrusted-pending@new", 0);
+        assert!(!target.exists() && old_journal.join(RECORD).is_file());
+        assert_eq!(fs::read(default_sidecar_path(&target)).unwrap(), sidecar);
+        fs::set_permissions(&state_home, fs::Permissions::from_mode(0o700)).unwrap();
+        run(&target, "open@new", 0);
+        assert!(target.is_file());
+        assert!(!old_journal.exists());
+        assert!(!alternate.join(locator_name).exists());
+
+        let target = fresh_target("stale-locator");
+        let stale = format!(".location-{}", state::source_key(&target).to_hex());
+        write_input(
+            &alternate,
+            &stale,
+            fixture.path().join("absent").as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        run(&target, "detached", 0);
+        assert!(target.is_file());
+        assert!(!alternate.join(stale).exists());
 
         let target = fresh_target("absent-state");
         run(&target, "absent-state", 0);

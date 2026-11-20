@@ -12,6 +12,14 @@ use std::path::{Component, Path, PathBuf};
 
 const FIXED_OFFSET_VERSION: u8 = 1;
 pub(super) const VERSION: u8 = 2;
+
+#[cfg(target_os = "linux")]
+#[path = "state_linux.rs"]
+mod linux;
+#[cfg(target_os = "linux")]
+pub(in crate::v3) use linux::{
+    forget_location, pending_location, remember_location, select_root, validate_active_root,
+};
 const MAX_RECORD_SIZE: u64 = 4096;
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -138,6 +146,20 @@ pub(super) fn source_key(source: &Path) -> blake3::Hash {
 }
 
 pub(super) fn find_record(source: &Path, header: &Header) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let source = std::fs::canonicalize(source)
+            .map_err(|error| format!("Resolve vault identity: {error}"))?;
+        let Some(active) = linux::lookup_location(&source, false)? else {
+            return Ok(false);
+        };
+        find_at(
+            super::super::vault::output_parent_dir(&active),
+            &source,
+            header,
+        )
+    }
+    #[cfg(target_os = "macos")]
     find_at(&configured_root()?, source, header)
 }
 
