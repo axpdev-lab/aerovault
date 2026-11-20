@@ -5,15 +5,18 @@
 //! slots. Each rename preserves its displaced inode. A portable envelope
 //! blocks readers between the first and last vault exchanges.
 
-use super::fresh::{checked_fd, publish_index, write_input, Destination};
+use super::fresh::{checked_fd, link_anonymous, publish_index, write_input, Destination};
 use super::state;
+use crate::error_correction::sidecar::AeroCorrectSidecarReader;
 use crate::lock::WriteLock;
-use crate::v3::ec::default_sidecar_path;
+use crate::v3::constants::HEADER_SIZE;
+use crate::v3::ec::{container_sha256_reader, default_sidecar_path};
+use crate::v3::format::VaultHeaderV3;
 use crate::v3::strip_transaction::{
-    generation, hash_generation, private_dir, sync_dir, Generation, PrivateDir, TrustedJournal,
+    generation, hash_generation, private_dir, sync_dir, Generation, TrustedJournal,
 };
 use crate::v3::unix_security::{capture_fd, copy_extraction_acl};
-use crate::v3::vault::output_parent_dir;
+use crate::v3::vault::{output_parent_dir, validate_ranges};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
@@ -21,14 +24,51 @@ use std::fs::{self, File, Permissions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) const RECORD: &str = "update.json";
+pub(super) const PREPARATION: &str = "preparation.json";
+const STAGE_IDENTITY: &str = "stage-identity.json";
 const VERSION: u8 = 1;
 const LIMIT: u64 = 4096;
 const SLOTS: [&CStr; 3] = [c"marker", c"sidecar", c"vault"];
 const CLEANUP: [(&str, usize); 2] = [("cleanup-original", 0), ("cleanup-replacement", 3)];
 const PREPARED_FILES: [&str; 4] = ["old-vault", "old-sidecar", "new-vault", "new-sidecar"];
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Draft {
+    version: u8,
+    source_key: [u8; 32],
+    transaction: [u8; 16],
+    parent: (u64, u64),
+}
+
+pub(in crate::v3) struct Preparation {
+    directory: PathBuf,
+    draft: Draft,
+    retain: bool,
+}
+
+impl Preparation {
+    pub(in crate::v3) fn path(&self) -> &Path {
+        &self.directory
+    }
+}
+
+impl Drop for Preparation {
+    fn drop(&mut self) {
+        // Normal validation errors before staging still clean up immediately.
+        // Once a stage may exist, recovery owns the registered preparation.
+        if !self.retain {
+            if let Ok(journal) = TrustedJournal::open(&self.directory) {
+                if read_record::<Draft>(&journal, PREPARATION).as_ref() == Ok(&self.draft) {
+                    let _ = journal.retire();
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -321,6 +361,17 @@ impl Stage {
     }
 }
 
+/// Exercise the actual link path on the destination filesystem before the
+/// fresh pair journal is committed. Only a private, verified slot is exposed.
+pub(super) fn probe_anonymous_link(parent: &Destination, file: &File) -> Result<(), String> {
+    let mut transaction = [0; 16];
+    rand::rngs::OsRng.fill_bytes(&mut transaction);
+    let stage = Stage::create(parent, &transaction)?;
+    let result = link_anonymous(file, &stage.directory, SLOTS[0]);
+    stage.remove(parent, &transaction, [result.is_ok(), false, false])?;
+    result
+}
+
 fn portable_header(
     prepared: &Path,
     transaction: [u8; 16],
@@ -380,15 +431,41 @@ fn portable_header(
     Ok((envelope, bytes))
 }
 
-pub(in crate::v3) fn prepare(source: &Path, prefix: &str) -> Result<PrivateDir, String> {
-    Destination::open(output_parent_dir(source))?;
+pub(in crate::v3) fn prepare(source: &Path, prefix: &str) -> Result<Preparation, String> {
+    let destination = Destination::open(output_parent_dir(source))?;
     let root = state::select_root()?;
-    private_dir(&root, prefix).map_err(|error| format!("Prepare private pair journal: {error}"))
+    let prepared = private_dir(&root, prefix)
+        .map_err(|error| format!("Prepare private pair journal: {error}"))?;
+    let key = state::source_key(source);
+    let mut transaction = [0; 16];
+    rand::rngs::OsRng.fill_bytes(&mut transaction);
+    let draft = Draft {
+        version: VERSION,
+        source_key: *key.as_bytes(),
+        transaction,
+        parent: (destination.device, destination.inode),
+    };
+    write_input(
+        prepared.path(),
+        PREPARATION,
+        &serde_json::to_vec(&draft).map_err(|error| error.to_string())?,
+    )?;
+    sync_dir(prepared.path())?;
+    let directory = root.join(key.to_hex().as_str());
+    publish_index(prepared.path(), &directory)?;
+    sync_dir(&root)?;
+    #[cfg(test)]
+    stop_after(7);
+    Ok(Preparation {
+        directory,
+        draft,
+        retain: false,
+    })
 }
 
 pub(in crate::v3) fn publish(
     source: &Path,
-    prepared: PrivateDir,
+    mut prepared: Preparation,
     lock: &WriteLock,
     sidecar_lock: &WriteLock,
 ) -> Result<(), String> {
@@ -401,7 +478,12 @@ pub(in crate::v3) fn publish(
     TrustedJournal::open(root)?;
     let input = TrustedJournal::open(prepared.path())?;
     let key = state::source_key(source);
-    let active = root.join(key.to_hex().as_str());
+    let active = prepared.directory.as_path();
+    if prepared.draft.source_key != *key.as_bytes()
+        || prepared.draft.parent != (destination.device, destination.inode)
+    {
+        return Err("Private preparation does not match the pinned vault destination".into());
+    }
 
     let original_vault = generation(&prepared.path().join("old-vault"))?;
     let original_sidecar = generation(&prepared.path().join("old-sidecar"))?;
@@ -419,12 +501,19 @@ pub(in crate::v3) fn publish(
         );
     }
 
-    let mut transaction = [0; 16];
-    rand::rngs::OsRng.fill_bytes(&mut transaction);
-    let (envelope, pending_header) = portable_header(prepared.path(), transaction, original_vault)?;
+    let transaction = prepared.draft.transaction;
+    let (envelope, pending_header) = portable_header(active, transaction, original_vault)?;
+    prepared.retain = true;
     let stage = Stage::create(&destination, &transaction)?;
     let mut created = [false; 3];
     let ready = (|| {
+        // The draft names the destination stage before it exists. Record its
+        // identity before there can be any partial or vault-sized slot.
+        #[cfg(test)]
+        stop_after(9);
+        stage.sync(&destination)?;
+        write_record(active, STAGE_IDENTITY, &stage.identity)?;
+        sync_dir(active)?;
         let pending = stage.write_slot(
             0,
             input.open_input("old-vault")?,
@@ -433,6 +522,8 @@ pub(in crate::v3) fn publish(
             None,
             &mut created,
         )?;
+        #[cfg(test)]
+        stop_after(8);
         let new_sidecar = stage.write_slot(
             1,
             input.open_input("new-sidecar")?,
@@ -477,27 +568,25 @@ pub(in crate::v3) fn publish(
             "pair.json",
             &serde_json::to_vec(&portable).map_err(|e| e.to_string())?,
         )?;
-        write_input(
-            prepared.path(),
-            RECORD,
-            &serde_json::to_vec(&record).map_err(|e| e.to_string())?,
-        )?;
         stage.sync(&destination)?;
-        sync_dir(prepared.path())?;
-        publish_index(prepared.path(), &active)
+        sync_dir(active)?;
+        write_record(active, RECORD, &record)
     })();
     if let Err(error) = ready {
         return match stage.remove(&destination, &transaction, created) {
-            Ok(()) => Err(error),
+            Ok(()) => {
+                prepared.retain = false;
+                Err(error)
+            }
             Err(cleanup) => Err(format!(
                 "{error}; protected pair staging retained ({cleanup})"
             )),
         };
     }
-    sync_dir(root)?;
+    sync_dir(active)?;
     #[cfg(test)]
     stop_after(0);
-    finish(source, &destination, &active, lock, sidecar_lock, true).map_err(|error| {
+    finish(source, &destination, active, lock, sidecar_lock, true).map_err(|error| {
         format!(
             "Private pair recovery pending at {}: {error}",
             active.display()
@@ -506,17 +595,23 @@ pub(in crate::v3) fn publish(
 }
 
 pub(in crate::v3) fn recover(lock: &WriteLock, active: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(active.join(RECORD)) {
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+    let published = match fs::symlink_metadata(active.join(RECORD)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
         Err(error) => return Err(format!("Inspect private pair journal: {error}")),
-    }
+    };
     let source = lock.source_path();
     let sidecar = default_sidecar_path(source);
     let sidecar_lock =
         crate::lock::acquire_without_recovery(&sidecar).map_err(|e| e.to_string())?;
     let destination = Destination::open(output_parent_dir(source))?;
-    finish(source, &destination, active, lock, &sidecar_lock, false).map_err(|error| {
+    let result = if published {
+        finish(source, &destination, active, lock, &sidecar_lock, false)
+    } else {
+        check_locks(source, &sidecar, lock, &sidecar_lock)?;
+        discard_preparation(source, &destination, active)
+    };
+    result.map_err(|error| {
         format!(
             "Private pair conflict; preserve the vault and recovery state at {}: {error}",
             active.display()
@@ -536,17 +631,83 @@ fn check_locks(
     Ok(())
 }
 
-fn load(journal: &TrustedJournal<'_>) -> Result<Record, String> {
+fn write_record(directory: &Path, name: &str, value: &impl Serialize) -> Result<(), String> {
+    let temporary = format!(".{name}.writing");
+    write_input(
+        directory,
+        &temporary,
+        &serde_json::to_vec(value).map_err(|error| error.to_string())?,
+    )?;
+    publish_index(&directory.join(temporary), &directory.join(name))
+}
+
+fn read_record<T: serde::de::DeserializeOwned>(
+    journal: &TrustedJournal<'_>,
+    name: &str,
+) -> Result<T, String> {
     let mut metadata = Vec::new();
     let n = journal
-        .open_input(RECORD)?
+        .open_input(name)?
         .take(LIMIT + 1)
         .read_to_end(&mut metadata)
         .map_err(|error| error.to_string())?;
     if n as u64 > LIMIT {
         return Err("Private pair record exceeds its size limit".into());
     }
-    serde_json::from_slice(&metadata).map_err(|e| format!("Decode private pair record: {e}"))
+    serde_json::from_slice(&metadata).map_err(|e| format!("Decode private pair record {name}: {e}"))
+}
+
+fn load(journal: &TrustedJournal<'_>) -> Result<Record, String> {
+    read_record(journal, RECORD)
+}
+
+fn discard_preparation(
+    source: &Path,
+    destination: &Destination,
+    active: &Path,
+) -> Result<(), String> {
+    let journal = TrustedJournal::open(active)?;
+    let draft: Draft = read_record(&journal, PREPARATION)?;
+    if draft.version != VERSION
+        || draft.source_key != *state::source_key(source).as_bytes()
+        || draft.parent != (destination.device, destination.inode)
+    {
+        return Err("Private preparation does not match the pinned vault destination".into());
+    }
+
+    if let Some(stage) = Stage::find(destination, &draft.transaction)? {
+        let mut present = [false; 3];
+        match fs::symlink_metadata(active.join(STAGE_IDENTITY)) {
+            Ok(_) => {
+                let recorded: (u64, u64) = read_record(&journal, STAGE_IDENTITY)?;
+                if recorded != stage.identity {
+                    return Err("Private preparation does not match the protected stage".into());
+                }
+                for (slot, present) in SLOTS.into_iter().zip(&mut present) {
+                    match open_member(&stage.directory, slot, libc::O_RDONLY) {
+                        Ok(file)
+                            if file
+                                .metadata()
+                                .map_err(|error| error.to_string())?
+                                .is_file() =>
+                        {
+                            *present = true;
+                        }
+                        Ok(_) => return Err("Unpublished stage slot is not a regular file".into()),
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!("Inspect unpublished stage slot: {error}"))
+                        }
+                    }
+                }
+            }
+            // No slot can have been written; remove only an empty directory.
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Inspect unpublished stage identity: {error}")),
+        }
+        stage.remove(destination, &draft.transaction, present)?;
+    }
+    journal.retire()
 }
 
 fn phase(
@@ -648,19 +809,57 @@ fn cleanup_phase(active: &Path) -> Result<Option<usize>, String> {
     Ok(outcome)
 }
 
+fn verify_current_pair(destination: &Destination, leaves: [&CStr; 2]) -> Result<(), String> {
+    let open = |leaf| {
+        let file = open_member(&destination.directory, leaf, libc::O_RDONLY)
+            .map_err(|error| format!("Open current pair: {error}"))?;
+        if !file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err("Current pair member is not a regular file".into());
+        }
+        Ok::<_, String>(file)
+    };
+    let mut vault = open(leaves[0])?;
+    let mut raw = [0; HEADER_SIZE];
+    vault
+        .read_exact(&mut raw)
+        .map_err(|error| error.to_string())?;
+    let header = VaultHeaderV3::from_bytes(&raw)?;
+    let (hash, length) = container_sha256_reader(&mut vault)?;
+    validate_ranges(&header, length)?;
+    let sidecar = AeroCorrectSidecarReader::open_automatic_destination(open(leaves[1])?)?;
+    if sidecar.total_len != length {
+        return Err("Current sidecar does not cover the current vault length".into());
+    }
+    sidecar.verify_binding(&hash)?;
+    destination.recheck()
+}
+
 fn cleanup_pair(
     destination: &Destination,
     active: &Path,
     journal: TrustedJournal<'_>,
     record: &Record,
-    phase: &[Snapshot; 5],
+    outcome: usize,
     leaves: [&CStr; 2],
 ) -> Result<(), String> {
     destination.recheck()?;
-    for (leaf, expected) in leaves.into_iter().zip(phase[..2].iter()) {
-        if read_snapshot(&destination.directory, leaf, &[expected.bytes.len])? != *expected {
-            return Err("Visible pair changed before cleanup".into());
+    let phase = record.phases()[outcome];
+    let exact_pair = leaves.into_iter().zip(&phase[..2]).all(|(leaf, expected)| {
+        read_snapshot(&destination.directory, leaf, &[expected.bytes.len]).as_ref() == Ok(expected)
+    });
+    if !exact_pair {
+        if outcome != 3 {
+            return Err("Visible pair changed before rollback cleanup".into());
         }
+        // A completed journal can become visible after a different XDG root
+        // was used to publish a newer pair. Reclaim only the old transaction,
+        // and only if the current sidecar identifies the current ordinary vault.
+        verify_current_pair(destination, leaves)
+            .map_err(|error| format!("Visible pair changed before cleanup: {error}"))?;
     }
     if let Some(stage) = Stage::find(destination, &record.transaction)? {
         if stage.identity != record.stage {
@@ -728,14 +927,7 @@ fn finish(
     let phases = record.phases();
     if let Some(outcome) = cleanup_phase(active)? {
         sync_dir(active)?;
-        return cleanup_pair(
-            destination,
-            active,
-            journal,
-            &record,
-            &phases[outcome],
-            leaves,
-        );
+        return cleanup_pair(destination, active, journal, &record, outcome, leaves);
     }
     let stage = Stage::open(destination, &record.transaction)?;
     if stage.identity != record.stage {
@@ -746,7 +938,27 @@ fn finish(
         stage.recheck(destination, &record.transaction)
     };
     check()?;
-    let current = phase(destination, &stage, &vault_leaf, &sidecar_leaf, &phases)?;
+    let current = match phase(destination, &stage, &vault_leaf, &sidecar_leaf, &phases) {
+        Ok(current) => current,
+        Err(_)
+            if !publish
+                && SLOTS
+                    .into_iter()
+                    .zip(&phases[3][2..])
+                    .all(|(slot, expected)| {
+                        read_snapshot(&stage.directory, slot, &[expected.bytes.len]).as_ref()
+                            == Ok(expected)
+                    }) =>
+        {
+            // Only the final exchange can leave this tuple of verified
+            // displaced files. Record completion before any cleanup.
+            check()?;
+            stage.sync(destination)?;
+            record_cleanup(active, 3)?;
+            return cleanup_pair(destination, active, journal, &record, 3, leaves);
+        }
+        Err(error) => return Err(error),
+    };
     let step = |slot: usize, phase: usize| {
         check()?;
         let (target, target_index) = if slot == 1 {
@@ -795,7 +1007,12 @@ fn finish(
         return Err("Private pair changed before journal retirement".into());
     }
     stage.sync(destination)?;
-    let name = if expected == 0 {
+    record_cleanup(active, expected)?;
+    cleanup_pair(destination, active, journal, &record, expected, leaves)
+}
+
+fn record_cleanup(active: &Path, outcome: usize) -> Result<(), String> {
+    let name = if outcome == 0 {
         CLEANUP[0].0
     } else {
         CLEANUP[1].0
@@ -814,14 +1031,7 @@ fn finish(
             return Err("Injected private pair cleanup error".into());
         }
     }
-    cleanup_pair(
-        destination,
-        active,
-        journal,
-        &record,
-        &phases[expected],
-        leaves,
-    )
+    Ok(())
 }
 
 #[cfg(test)]
@@ -846,7 +1056,6 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::v3::{CreateOptionsV3, RecoveryPlacement, VaultV3};
-    use std::path::PathBuf;
     use std::process::Command;
 
     const ACTION: &str = "AEROVAULT_TEST_PRIVATE_UPDATE";
@@ -854,6 +1063,7 @@ mod tests {
     const TEST: &str = "v3::pending_pair::update::tests::update_recovers_each_durable_boundary_and_preserves_conflicts";
     const OLD: &str = "isolated-prior-vault-password";
     const NEW: &str = "isolated-next-vault-password";
+    const LATER: &str = "isolated-later-vault-password";
 
     #[test]
     fn update_recovers_each_durable_boundary_and_preserves_conflicts() {
@@ -887,6 +1097,21 @@ mod tests {
                         fs::read(output).unwrap(),
                         b"isolated bytes that must survive all checkpoints"
                     );
+                }
+                "rotate-later" => {
+                    let mut vault = VaultV3::open(&path, NEW).unwrap();
+                    VaultV3::change_password(&mut vault, LATER).unwrap();
+                }
+                "open-later" => {
+                    let vault = VaultV3::open(&path, LATER).unwrap();
+                    let output = path.with_file_name("restored");
+                    VaultV3::extract_entry(&vault, "payload", &output).unwrap();
+                    assert_eq!(
+                        fs::read(output).unwrap(),
+                        b"isolated bytes that must survive all checkpoints"
+                    );
+                    assert!(VaultV3::open(&path, NEW).is_err());
+                    assert!(VaultV3::open(&path, OLD).is_err());
                 }
                 "reject-old" => {
                     assert!(VaultV3::open(&path, OLD).is_err());
@@ -1121,6 +1346,75 @@ mod tests {
         run(&switched, "open-old", 0);
         assert_eq!(bytes(&switched), original);
         cleanup(&switched);
+
+        for boundary in 7..=9 {
+            let target = make(&format!("unpublished-{boundary}"));
+            let original = bytes(&target);
+            run(&target, &format!("rotate-{boundary}"), 77);
+            let active = journal(&target);
+            assert!(active.join(PREPARATION).is_file());
+            assert!(!active.join(RECORD).exists());
+            let draft: Draft =
+                read_record(&TrustedJournal::open(&active).unwrap(), PREPARATION).unwrap();
+            let stage = target
+                .parent()
+                .unwrap()
+                .join(Stage::name(&draft.transaction).to_str().unwrap());
+            assert_eq!(stage.is_dir(), boundary != 7);
+            assert_eq!(stage.join("marker").is_file(), boundary == 8);
+            assert_eq!(bytes(&target), original);
+            run(&target, "open-old", 0);
+            assert_eq!(bytes(&target), original);
+            cleanup(&target);
+        }
+
+        let unpublished = make("unpublished-stage-replaced");
+        let original = bytes(&unpublished);
+        run(&unpublished, "rotate-8", 77);
+        let active = journal(&unpublished);
+        let draft: Draft =
+            read_record(&TrustedJournal::open(&active).unwrap(), PREPARATION).unwrap();
+        let stage = unpublished
+            .parent()
+            .unwrap()
+            .join(Stage::name(&draft.transaction).to_str().unwrap());
+        let moved = stage.with_file_name("saved-stage");
+        fs::rename(&stage, &moved).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
+        fs::write(stage.join("marker"), b"unrelated replacement").unwrap();
+        run(&unpublished, "conflict", 0);
+        assert_eq!(
+            fs::read(stage.join("marker")).unwrap(),
+            b"unrelated replacement"
+        );
+        assert_eq!(bytes(&unpublished), original);
+        assert!(active.is_dir() && moved.join("marker").is_file());
+
+        let unbound = make("unbound-current-sidecar");
+        run(&unbound, "rotate-3", 77);
+        let prior_sidecar = fs::read(default_sidecar_path(&unbound)).unwrap();
+        run(&unbound, "rotate-later@new-xdg", 0);
+        let latest = bytes(&unbound);
+        fs::write(default_sidecar_path(&unbound), prior_sidecar).unwrap();
+        let mixed = bytes(&unbound);
+        run(&unbound, "conflict", 0);
+        assert!(journal(&unbound).join(RECORD).is_file());
+        assert_eq!(bytes(&unbound), mixed);
+        fs::write(default_sidecar_path(&unbound), &latest[1]).unwrap();
+        run(&unbound, "open-later", 0);
+        assert_eq!(bytes(&unbound), latest);
+        cleanup(&unbound);
+
+        for boundary in 3..=6 {
+            let target = make(&format!("superseded-{boundary}"));
+            run(&target, &format!("rotate-{boundary}"), 77);
+            assert!(journal(&target).join(RECORD).is_file());
+            run(&target, "rotate-later@new-xdg", 0);
+            let latest = bytes(&target);
+            run(&target, "open-later", 0);
+            assert_eq!(bytes(&target), latest);
+            assert!(!journal(&target).exists());
+        }
 
         let rotated = make("rotate-cleanup-error");
         run(&rotated, "rotate-cleanup-error", 0);

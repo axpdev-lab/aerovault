@@ -14,7 +14,7 @@ use crate::v3::strip_transaction::{
 };
 use crate::v3::vault::output_parent_dir;
 use serde::{Deserialize, Serialize};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -183,56 +183,65 @@ impl Destination {
     fn link(&self, stage: &File, path: &Path) -> Result<(), String> {
         self.recheck()?;
         let leaf = self.leaf(path)?;
-        // SAFETY: both fds and the destination leaf remain live. linkat only
-        // publishes a missing name; it cannot replace an unexpected file.
-        let code = unsafe {
-            libc::linkat(
-                stage.as_raw_fd(),
-                c"".as_ptr(),
-                self.directory.as_raw_fd(),
-                leaf.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if code != 0 {
-            let error = io::Error::last_os_error();
-            if !matches!(
-                error.raw_os_error(),
-                Some(libc::EPERM | libc::EACCES | libc::ENOENT | libc::EINVAL)
-            ) {
-                return Err(format!("Publish fresh pair file: {error}"));
-            }
-            // Unprivileged Linux callers may need the procfs name for an
-            // O_TMPFILE inode instead of linkat with AT_EMPTY_PATH.
-            let proc = CString::new(format!("/proc/self/fd/{}", stage.as_raw_fd()))
-                .expect("numeric file descriptor has no NUL");
-            let meta = fs::metadata(std::ffi::OsStr::from_bytes(proc.as_bytes()))
-                .map_err(|error| format!("Resolve unnamed pair stage: {error}"))?;
-            let expected = stage.metadata().map_err(|error| error.to_string())?;
-            if (meta.dev(), meta.ino()) != (expected.dev(), expected.ino()) {
-                return Err("Unnamed pair stage identity changed".into());
-            }
-            // SAFETY: the procfs name selects the verified, live fd.
-            if unsafe {
-                libc::linkat(
-                    libc::AT_FDCWD,
-                    proc.as_ptr(),
-                    self.directory.as_raw_fd(),
-                    leaf.as_ptr(),
-                    libc::AT_SYMLINK_FOLLOW,
-                )
-            } != 0
-            {
-                return Err(format!(
-                    "Publish fresh pair file: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-        }
+        link_anonymous(stage, &self.directory, &leaf)?;
         self.directory
             .sync_all()
             .map_err(|error| format!("Sync pair destination: {error}"))
     }
+}
+
+pub(super) fn link_anonymous(stage: &File, directory: &File, leaf: &CStr) -> Result<(), String> {
+    #[cfg(test)]
+    if ANONYMOUS_LINK_UNAVAILABLE.with(std::cell::Cell::get) {
+        return Err("Publish fresh pair file: no anonymous link method is available".into());
+    }
+    // SAFETY: both fds and the destination leaf remain live. linkat only
+    // publishes a missing name; it cannot replace an unexpected file.
+    let code = unsafe {
+        libc::linkat(
+            stage.as_raw_fd(),
+            c"".as_ptr(),
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if code != 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EPERM | libc::EACCES | libc::ENOENT | libc::EINVAL)
+        ) {
+            return Err(format!("Publish fresh pair file: {error}"));
+        }
+        // Unprivileged Linux callers may need the procfs name for an
+        // O_TMPFILE inode instead of linkat with AT_EMPTY_PATH.
+        let proc = CString::new(format!("/proc/self/fd/{}", stage.as_raw_fd()))
+            .expect("numeric file descriptor has no NUL");
+        let meta = fs::metadata(std::ffi::OsStr::from_bytes(proc.as_bytes()))
+            .map_err(|error| format!("Resolve unnamed pair stage: {error}"))?;
+        let expected = stage.metadata().map_err(|error| error.to_string())?;
+        if (meta.dev(), meta.ino()) != (expected.dev(), expected.ino()) {
+            return Err("Unnamed pair stage identity changed".into());
+        }
+        // SAFETY: the procfs name selects the verified, live fd.
+        if unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                proc.as_ptr(),
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "Publish fresh pair file: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn checked_fd(fd: libc::c_int) -> io::Result<File> {
@@ -299,7 +308,8 @@ impl Plan {
         let root = state::select_root()?;
         // Detect unsupported destination filesystems before creating locks or
         // committing a journal that cannot be published on this filesystem.
-        drop(destination.anonymous_file()?);
+        let probe = destination.anonymous_file()?;
+        super::update::probe_anonymous_link(&destination, &probe)?;
         let prepared = private_dir(&root, ".pair-prepare-")
             .map_err(|error| format!("Cannot prepare a private fresh pair journal: {error}"))?;
         Ok(Self {
@@ -520,6 +530,7 @@ fn stop_after(phase: &str) {
 
 #[cfg(test)]
 thread_local! {
+    static ANONYMOUS_LINK_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FRESH_STOP: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
@@ -633,6 +644,14 @@ mod tests {
                     ), "{error}");
                     assert!(error.contains("also rejected"), "{error}");
                 }
+                "link-unavailable" => {
+                    ANONYMOUS_LINK_UNAVAILABLE.with(|unavailable| unavailable.set(true));
+                    let error = create(RecoveryPlacement::Detached).unwrap_err();
+                    assert!(
+                        error.contains("no anonymous link method is available"),
+                        "{error}"
+                    );
+                }
                 "readonly-state" => {
                     let error = create(RecoveryPlacement::Detached).unwrap_err();
                     assert!(error.contains("private fresh pair journal"), "{error}");
@@ -729,6 +748,17 @@ mod tests {
             );
             run(&target, "open", 0);
         }
+        let target = fresh_target("unavailable-link");
+        run(&target, "link-unavailable", 0);
+        assert!(target
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(root.read_dir().unwrap().next().is_none());
+
         let plaintext = fresh_target("plaintext").with_extension("aerozip");
         run(&plaintext, "plain-both", 0);
         run(&plaintext, "open-plaintext", 0);

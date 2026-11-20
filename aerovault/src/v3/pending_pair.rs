@@ -88,7 +88,10 @@ pub(super) fn recover_private(lock: &crate::lock::WriteLock, active: &Path) -> R
             active.display()
         )),
     };
-    match (exists(fresh::RECORD)?, exists(update::RECORD)?) {
+    match (
+        exists(fresh::RECORD)?,
+        exists(update::RECORD)? || exists(update::PREPARATION)?,
+    ) {
         (true, false) => fresh::recover(lock, active),
         (false, true) => update::recover(lock, active),
         _ => Err(format!(

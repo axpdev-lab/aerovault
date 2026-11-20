@@ -1200,7 +1200,7 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
 pub(super) enum PreparedUpdate {
     Adjacent(PrivateDir),
     #[cfg(target_os = "linux")]
-    Private(PrivateDir),
+    Private(super::pending_pair::update::Preparation),
 }
 
 impl PreparedUpdate {
