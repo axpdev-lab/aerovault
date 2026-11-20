@@ -2359,16 +2359,13 @@ fn create_empty_vault(
     if writes_sidecar {
         // A refusal must happen before either stable lock exists. Linux can
         // publish a genuinely new pair using its owner-private state instead.
-        if let Err(error) = super::strip_transaction::validate_publication_parent(path) {
+        if let Err(_error) = super::strip_transaction::validate_publication_parent(path) {
             #[cfg(target_os = "linux")]
             {
-                fresh = Some(
-                    super::pending_pair::fresh::Plan::prepare(path)
-                        .map_err(|reason| format!("{error}; {reason}"))?,
-                );
+                fresh = Some(super::pending_pair::fresh::Plan::prepare(path)?);
             }
             #[cfg(not(target_os = "linux"))]
-            return Err(error);
+            return Err(_error);
         }
     }
     let _lock = write_lock(path)?;

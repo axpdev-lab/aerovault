@@ -10,7 +10,7 @@ use crate::lock::WriteLock;
 use crate::v3::ec::default_sidecar_path;
 use crate::v3::strip_transaction::{
     generation, hash_generation, private_dir, private_options, sync_dir, validate_journal_ancestry,
-    Generation, PrivateDir, TrustedJournal,
+    writable_ancestor, Generation, PrivateDir, TrustedJournal,
 };
 use crate::v3::vault::output_parent_dir;
 use serde::{Deserialize, Serialize};
@@ -50,15 +50,23 @@ impl Destination {
         // foreign-owned or non-sticky, other-writable ancestry.
         let user = unsafe { libc::geteuid() };
         for component in path.ancestors() {
-            let meta = fs::symlink_metadata(component)
-                .map_err(|error| format!("Inspect vault ancestry: {error}"))?;
-            if !meta.is_dir()
-                || (meta.uid() != user && meta.uid() != 0)
-                || (meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0)
-            {
-                return Err(
-                    "Fresh vault destination ancestry is not suitable for publication".into(),
-                );
+            let meta = fs::symlink_metadata(component).map_err(|error| {
+                format!(
+                    "Vault directory ancestor {} cannot be inspected ({error})",
+                    component.display()
+                )
+            })?;
+            if !meta.is_dir() || (meta.uid() != user && meta.uid() != 0) {
+                return Err(format!(
+                    "Vault directory rejected. Ancestor {} must be a directory owned by this user or root",
+                    component.display()
+                ));
+            }
+            if meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0 {
+                return Err(format!(
+                    "Vault directory rejected. {}",
+                    writable_ancestor(component, meta.mode() & 0o002)
+                ));
             }
         }
         let directory = OpenOptions::new()
@@ -240,7 +248,8 @@ pub(super) fn ensure_private_root(root: &Path) -> Result<(), String> {
     for ancestor in root.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(_) => {
-                validate_journal_ancestry(ancestor)?;
+                validate_journal_ancestry(ancestor)
+                    .map_err(|error| format!("AeroVault private state rejected. {error}"))?;
                 break;
             }
             Err(error) if error.kind() == ErrorKind::NotFound => missing.push(ancestor),
@@ -252,7 +261,12 @@ pub(super) fn ensure_private_root(root: &Path) -> Result<(), String> {
         .recursive(true)
         .create(root)
         .map_err(|error| format!("Create AeroVault private state: {error}"))?;
-    TrustedJournal::open(root)?;
+    TrustedJournal::open(root).map_err(|error| {
+        format!(
+            "AeroVault private state directory {} rejected ({error})",
+            root.display()
+        )
+    })?;
     for directory in missing {
         sync_dir(output_parent_dir(directory))?;
     }
@@ -590,6 +604,15 @@ mod tests {
                         "{error}"
                     );
                 }
+                "group-state" => {
+                    let error = create(RecoveryPlacement::Detached).unwrap_err();
+                    let home = PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                    let ancestor = home.parent().unwrap().display();
+                    assert_eq!(
+                        error,
+                        format!("AeroVault private state rejected. Ancestor {ancestor} permits other users to write. Run chmod g-w '{ancestor}'")
+                    );
+                }
                 "readonly-state" => {
                     let error = create(RecoveryPlacement::Detached).unwrap_err();
                     assert!(error.contains("private fresh pair journal"), "{error}");
@@ -621,6 +644,8 @@ mod tests {
                 .env(ACTION, action);
             if action == "absent-state" {
                 command.env_remove("HOME").env_remove("XDG_STATE_HOME");
+            } else if action == "group-state" {
+                command.env("XDG_STATE_HOME", fixture.path().join("group-parent/state"));
             } else if action == "readonly-state" {
                 command.env("XDG_STATE_HOME", fixture.path().join("readonly-state-home"));
             } else {
@@ -721,6 +746,23 @@ mod tests {
         assert!(!target.exists() && !default_sidecar_path(&target).exists());
         assert_eq!(fs::read(&sidecar).unwrap(), original);
         assert!(journal(&target).exists());
+
+        let group_parent = fixture.path().join("group-parent");
+        fs::create_dir(&group_parent).unwrap();
+        fs::set_permissions(&group_parent, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(group_parent.join("state"))
+            .unwrap();
+        let target = fresh_target("group-state");
+        run(&target, "group-state", 0);
+        assert!(target
+            .parent()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none());
 
         let target = fresh_target("absent-state");
         run(&target, "absent-state", 0);

@@ -689,29 +689,55 @@ pub(super) fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
     let user = unsafe { libc::geteuid() };
     // An untrusted parent must not be able to replace the checked journal entry.
     for ancestor in parent.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
-        if !metadata.is_dir()
-            || (metadata.uid() != user && metadata.uid() != 0)
-            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-        {
-            return Err("strip journal ancestry permits replacement by another principal".into());
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|e| format!("Cannot inspect ancestor {} ({e})", ancestor.display()))?;
+        if !metadata.is_dir() || (metadata.uid() != user && metadata.uid() != 0) {
+            return Err(format!(
+                "Ancestor {} must be a directory owned by this user or root",
+                ancestor.display()
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+            return Err(writable_ancestor(ancestor, metadata.mode()));
         }
         #[cfg(target_os = "macos")]
         if super::unix_security::capture(ancestor)?
             .split(|&b| b == b'\n')
             .any(mac_acl_may_mutate)
         {
-            return Err("strip journal ancestry grants additional access through an ACL".into());
+            return Err(format!(
+                "Ancestor {} grants additional write access through an ACL",
+                ancestor.display()
+            ));
         }
     }
     Ok(())
 }
 
 #[cfg(unix)]
+pub(super) fn writable_ancestor(path: &Path, mode: u32) -> String {
+    let who = match mode & 0o022 {
+        0o020 => "g",
+        0o002 => "o",
+        _ => "go",
+    };
+    let quoted = path.display().to_string().replace('\'', "'\\''");
+    format!(
+        "Ancestor {} permits other users to write. Run chmod {who}-w '{quoted}'",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
 pub(super) fn validate_publication_parent(source: &Path) -> Result<PathBuf, String> {
-    let parent = fs::canonicalize(output_parent_dir(source)).map_err(|e| e.to_string())?;
-    validate_journal_ancestry(&parent)
-        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
+    let directory = output_parent_dir(source);
+    let parent = fs::canonicalize(directory).map_err(|e| {
+        format!(
+            "Vault directory {} cannot be resolved ({e})",
+            directory.display()
+        )
+    })?;
+    validate_journal_ancestry(&parent).map_err(|e| format!("Vault directory rejected. {e}"))?;
     Ok(parent)
 }
 
@@ -1173,10 +1199,8 @@ impl PreparedUpdate {
 
 pub(super) fn prepare_update(source: &Path, prefix: &str) -> Result<PreparedUpdate, String> {
     #[cfg(target_os = "linux")]
-    if let Err(error) = validate_publication_parent(source) {
-        return super::pending_pair::update::prepare(source, prefix)
-            .map(PreparedUpdate::Private)
-            .map_err(|reason| format!("{error}; {reason}"));
+    if validate_publication_parent(source).is_err() {
+        return super::pending_pair::update::prepare(source, prefix).map(PreparedUpdate::Private);
     }
     private_dir(output_parent_dir(source), prefix).map(PreparedUpdate::Adjacent)
 }
@@ -1262,7 +1286,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
     }
     #[cfg(unix)]
     validate_journal_ancestry(&trusted_parent)
-        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
+        .map_err(|e| format!("Vault directory rejected. {e}"))?;
     fs::rename(prepared.path(), &path).map_err(|e| format!("publish strip journal: {e}"))?;
     sync_dir(output_parent_dir(source))?;
     #[cfg(test)]
@@ -1524,10 +1548,7 @@ mod tests {
 
         let mut opened = VaultV3::open(&source, password).unwrap();
         let error = VaultV3::change_password(&mut opened, "different-password-123").unwrap_err();
-        assert!(
-            error.contains("Cannot publish a recoverable vault/sidecar pair"),
-            "{error}"
-        );
+        assert!(error.contains("Vault directory rejected"), "{error}");
         drop(opened);
         assert!(!journal_path(&source).exists());
         assert_eq!(fs::read(&source).unwrap(), old_vault);
@@ -1589,7 +1610,13 @@ mod tests {
                 20,
             )
             .unwrap_err();
-            assert!(error.contains("ancestry permits replacement"), "{error}");
+            assert!(error.contains("Vault directory rejected"), "{error}");
+            let rejected = dir.path().canonicalize().unwrap();
+            assert!(
+                error.contains(&format!("Ancestor {}", rejected.display())),
+                "{error}"
+            );
+            assert!(error.contains("Run chmod "), "{error}");
             assert!(dir.path().read_dir().unwrap().next().is_none());
         }
     }
