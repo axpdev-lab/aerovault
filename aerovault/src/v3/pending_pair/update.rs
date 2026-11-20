@@ -973,13 +973,14 @@ mod tests {
             .permissions(Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let home = fixture.path().join("home");
+        let base = fixture.path().canonicalize().unwrap();
+        let home = base.join("home");
         fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
-        let xdg = fixture.path().join("state");
+        let xdg = base.join("state");
         let root = xdg.join("aerovault/journals");
         let run = |target: &Path, action: &str, expected: i32| {
             let (action, state_home) = match action.strip_suffix("@new-xdg") {
-                Some(action) => (action, fixture.path().join("new-state")),
+                Some(action) => (action, base.join("new-state")),
                 None => (action, xdg.clone()),
             };
             let child = Command::new(std::env::current_exe().unwrap())
@@ -999,7 +1000,7 @@ mod tests {
             );
         };
         let make = |label: &str| {
-            let directory = fixture.path().join(label);
+            let directory = base.join(label);
             fs::create_dir(&directory).unwrap();
             fs::set_permissions(&directory, Permissions::from_mode(0o775)).unwrap();
             let target = directory.join("vault.aerovault");
@@ -1179,8 +1180,9 @@ mod tests {
             .permissions(Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let home = fixture.path().join("home");
-        let alternate_xdg = fixture.path().join("xdg");
+        let base = fixture.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let alternate_xdg = base.join("xdg");
         fs::create_dir(&home).unwrap();
         fs::set_permissions(&home, Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(&alternate_xdg).unwrap();
@@ -1189,7 +1191,7 @@ mod tests {
         let journals = hidden_ancestor.join("state/aerovault/journals");
 
         for boundary in 1..=3 {
-            let directory = fixture.path().join(boundary.to_string());
+            let directory = base.join(boundary.to_string());
             fs::create_dir(&directory).unwrap();
             fs::set_permissions(&directory, Permissions::from_mode(0o775)).unwrap();
             let target = directory.join("fixture.aerovault");

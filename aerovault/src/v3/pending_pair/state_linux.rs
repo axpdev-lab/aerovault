@@ -89,10 +89,10 @@ fn present(path: &Path, known: bool) -> Result<bool, String> {
         // has to pass all trust checks before recovery.
         Err(error)
             if !known
-                && matches!(
+                && (matches!(
                     error.kind(),
                     ErrorKind::PermissionDenied | ErrorKind::NotADirectory
-                ) =>
+                ) || error.raw_os_error() == Some(libc::ELOOP)) =>
         {
             Ok(false)
         }

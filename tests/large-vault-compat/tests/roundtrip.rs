@@ -10,7 +10,7 @@
 
 #![cfg(target_pointer_width = "64")]
 
-use aerovault::v3::{OpenVaultV3, VaultV3};
+use aerovault::v3::{block, constants, manifest, OpenVaultV3, VaultHeaderV3, VaultV3};
 use aerovault_068::v3::{CreateOptionsV3 as LegacyOptions, VaultV3 as LegacyVault};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
@@ -169,4 +169,50 @@ fn encrypted_legacy_add_crosses_four_gib() {
 #[ignore = "requires a 64-bit host with room for a 4 GiB vault and source copies"]
 fn plaintext_legacy_add_crosses_four_gib() {
     check_legacy(true, true);
+}
+
+#[test]
+#[ignore = "requires a 64-bit host with room for a 4 GiB vault and source copies"]
+fn plaintext_legacy_reads_live_block_beyond_four_gib() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = root.join("legacy.aerozip");
+    let input = root.join("base.bin");
+    let expected = random_file(&input, 4098, 74);
+
+    LegacyVault::create(&LegacyOptions::new_plaintext(&path)).unwrap();
+    let mut legacy = LegacyVault::open_plaintext(&path).unwrap();
+    LegacyVault::add_files(&mut legacy, &[(input, "base.bin".into())]).unwrap();
+    drop(legacy);
+
+    // Verify the offset in the original 0.6.8 bytes, before opening with 0.7.0.
+    let mut stored = File::open(&path).unwrap();
+    let mut raw_header = [0; constants::HEADER_SIZE];
+    stored.read_exact(&mut raw_header).unwrap();
+    let header = VaultHeaderV3::from_bytes(&raw_header).unwrap();
+    let index = block::read_section(
+        &mut stored,
+        header.manifest_offset,
+        header.manifest_len,
+        constants::MAX_MANIFEST_SIZE,
+        "legacy manifest",
+    )
+    .unwrap();
+    let index = manifest::parse_manifest_plaintext(&index).unwrap();
+    let entry = index.entries.iter().find(|e| e.path == "base.bin").unwrap();
+    let last_start = entry
+        .chunks
+        .iter()
+        .map(|id| header.data_offset + index.chunks[id].data_offset)
+        .max()
+        .unwrap();
+    assert!(
+        last_start > 4 * GIB,
+        "last live block starts at {last_start}"
+    );
+    eprintln!("0.6.8 last live block starts at byte {last_start}");
+    drop(stored);
+
+    let vault = VaultV3::open_plaintext(&path).unwrap();
+    verify_files(&vault, &root.join("extracted"), &[("base.bin", expected)]);
 }

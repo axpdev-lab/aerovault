@@ -259,11 +259,11 @@ mod tests {
         assert!(Header::decode(&bytes, HEADER_SIZE as u64).is_none());
         bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(Header::decode(&bytes, u64::MAX).is_none());
+        bytes[32..40].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         bytes[MAGIC.len()] += 1;
         assert!(Header::decode(&bytes, (2 * HEADER_SIZE) as u64).is_none());
 
         bytes[MAGIC.len()] = FIXED_OFFSET_VERSION;
-        bytes[32..40].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         bytes[72..80].fill(0);
         assert_eq!(
             Header::decode(&bytes, (2 * HEADER_SIZE) as u64)

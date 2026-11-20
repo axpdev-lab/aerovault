@@ -6207,9 +6207,16 @@ mod tests {
     #[test]
     fn review_password_rotation_recovers_after_first_pair_replacement() {
         const KEY: &str = "AEROVAULT_PASSWORD_RESTART_DIR";
+        #[cfg(unix)]
+        const RECOVER: &str = "AEROVAULT_PASSWORD_RESTART_RECOVER";
         const NEW_PW: &str = "new-password-restart-123";
         if let Some(root) = std::env::var_os(KEY) {
             let path = PathBuf::from(root).join("restart.aerovault");
+            #[cfg(unix)]
+            if std::env::var_os(RECOVER).is_some() {
+                VaultV3::open(&path, PW).unwrap();
+                return;
+            }
             super::super::strip_transaction::AFTER_STRIP_VAULT
                 .with(|h| *h.borrow_mut() = Some(Box::new(|| std::process::exit(77))));
             let mut vault = VaultV3::open(&path, PW).unwrap();
@@ -6228,7 +6235,17 @@ mod tests {
             super::super::ec::RecoveryPlacement::Both,
         ] {
             let dir = super::super::strip_transaction::adjacent_test_dir();
-            let path = dir.path().join("restart.aerovault");
+            #[cfg(unix)]
+            let namespace = {
+                let link = dir.path().join("home-link");
+                std::os::unix::fs::symlink(dir.path().canonicalize().unwrap(), &link).unwrap();
+                link
+            };
+            #[cfg(not(unix))]
+            let namespace = dir.path().to_path_buf();
+            let path = namespace.join("restart.aerovault");
+            let physical = dir.path().join("restart.aerovault");
+            let journal = super::super::strip_transaction::journal_path(&physical);
             VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
                 .unwrap();
             let payload = dir.path().join("payload");
@@ -6240,9 +6257,16 @@ mod tests {
             let sidecar = super::super::ec::default_sidecar_path(&path);
             let old_vault = std::fs::read(&path).unwrap();
             let old_sidecar = std::fs::read(&sidecar).unwrap();
-            let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "v3::vault::tests::review_password_rotation_recovers_after_first_pair_replacement", "--nocapture"])
-                .env(KEY, dir.path()).spawn().unwrap());
+            let restart_command = || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "v3::vault::tests::review_password_rotation_recovers_after_first_pair_replacement", "--nocapture"])
+                    .env(KEY, &namespace);
+                #[cfg(unix)]
+                command.env("HOME", &namespace);
+                command
+            };
+            let mut child = Child(restart_command().spawn().unwrap());
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
             let status = loop {
                 if let Some(status) = child.0.try_wait().unwrap() {
@@ -6255,12 +6279,21 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             };
             assert_eq!(status.code(), Some(77));
-            assert!(super::super::strip_transaction::journal_path(&path).exists());
+            assert!(journal.exists());
             assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+            // On Unix the recovering process uses the same aliased HOME and
+            // vault parent as the interrupted writer.
+            #[cfg(unix)]
+            assert!(restart_command()
+                .env(RECOVER, "1")
+                .status()
+                .unwrap()
+                .success());
             // An interrupted rotation rolls back before any password is tried.
             let mut recovered = VaultV3::open(&path, PW).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), old_vault);
-            assert!(!super::super::strip_transaction::journal_path(&path).exists());
+            assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+            assert!(!journal.exists());
             assert!(VaultV3::open(&path, NEW_PW).is_err());
             VaultV3::change_password(&mut recovered, NEW_PW).unwrap();
             drop(recovered);

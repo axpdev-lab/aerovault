@@ -653,9 +653,10 @@ mod tests {
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let state_home = fixture.path().join("state");
+        let base = fixture.path().canonicalize().unwrap();
+        let state_home = base.join("state");
         let root = state_home.join("aerovault/journals");
-        let home = fixture.path().join("home");
+        let home = base.join("home");
         fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
         let alternate = home.join(".aerovault-state/journals");
 
@@ -671,13 +672,13 @@ mod tests {
                 command.env_remove("HOME").env(
                     "XDG_STATE_HOME",
                     if action == "absent-state" {
-                        fixture.path().join("group-parent/state")
+                        base.join("group-parent/state")
                     } else {
                         state_home.clone()
                     },
                 );
             } else if action == "unsafe-home" || variant == "unsafe-home" {
-                let group = fixture.path().join("group-parent");
+                let group = base.join("group-parent");
                 command.env("HOME", &group).env(
                     "XDG_STATE_HOME",
                     if action == "unsafe-home" {
@@ -687,13 +688,17 @@ mod tests {
                     },
                 );
             } else if action == "blocked-state" || variant == "group" {
-                command.env("XDG_STATE_HOME", fixture.path().join("group-parent/state"));
+                command.env("XDG_STATE_HOME", base.join("group-parent/state"));
             } else if variant == "default" {
                 command.env_remove("XDG_STATE_HOME");
             } else if variant == "new" {
-                command.env("XDG_STATE_HOME", fixture.path().join("new-xdg"));
+                command.env("XDG_STATE_HOME", base.join("new-xdg"));
+            } else if variant == "looped-home" {
+                command
+                    .env("HOME", base.join("looped-home"))
+                    .env("XDG_STATE_HOME", &state_home);
             } else if action == "readonly-state" {
-                command.env("XDG_STATE_HOME", fixture.path().join("readonly-state-home"));
+                command.env("XDG_STATE_HOME", base.join("readonly-state-home"));
             } else {
                 command.env("XDG_STATE_HOME", &state_home);
             }
@@ -706,7 +711,7 @@ mod tests {
             );
         };
         let fresh_target = |name: &str| {
-            let directory = fixture.path().join(name);
+            let directory = base.join(name);
             fs::create_dir(&directory).unwrap();
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o775)).unwrap();
             directory.join("test.aerovault")
@@ -783,7 +788,7 @@ mod tests {
         let target = fresh_target("relocated-parent");
         run(&target, "sidecar", 77);
         let parent = target.parent().unwrap();
-        let moved = fixture.path().join("parent-moved");
+        let moved = base.join("parent-moved");
         fs::rename(parent, &moved).unwrap();
         let sidecar = default_sidecar_path(&moved.join(target.file_name().unwrap()));
         let original = fs::read(&sidecar).unwrap();
@@ -805,7 +810,7 @@ mod tests {
         assert!(!default_journal.exists());
         assert!(!alternate.exists());
 
-        let group_parent = fixture.path().join("group-parent");
+        let group_parent = base.join("group-parent");
         fs::create_dir(&group_parent).unwrap();
         fs::set_permissions(&group_parent, fs::Permissions::from_mode(0o775)).unwrap();
         fs::DirBuilder::new()
@@ -856,6 +861,18 @@ mod tests {
             )
             .unwrap();
         }
+
+        let looped_home = base.join("looped-home");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&looped_home)
+            .unwrap();
+        std::os::unix::fs::symlink(".aerovault-state", looped_home.join(".aerovault-state"))
+            .unwrap();
+        let target = fresh_target("unused-fallback-symlink-loop");
+        run(&target, "detached@looped-home", 0);
+        assert!(target.is_file());
+        assert!(!journal(&target).exists());
 
         let target = fresh_target("unsafe-home");
         run(&target, "unsafe-home", 0);

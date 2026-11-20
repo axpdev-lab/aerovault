@@ -8,7 +8,7 @@ All notable changes to the `aerovault` crate are documented here.
 
 - Restored open, extraction and writes for large v3 vaults and plaintext archives created by 0.6.8. Version 0.6.9 imposed a default 1 GiB data-section ceiling and a separate 4 GiB generation ceiling. Normal v3 operations now stream the generation hash over the actual file extent and retain the locked generation check before publication. Opening checks the file generation before loading vault data into memory. Where the filesystem can prove that bytes beyond the container are a sparse suffix, generation checks verify the suffix without reading it. Plaintext archives validate chunk ranges before loading data and omit unclaimed trailing data padding from memory. The on-disk format is unchanged.
 
-- When the destination ancestry cannot support a recoverable vault and detached parity pair, creation reports the refusal before acquiring either persistent lock. Unix creation uses private permissions for missing destination directories.
+- When the destination ancestry cannot support a recoverable vault and detached parity pair, creation reports the refusal before acquiring either persistent lock. On Unix, creation that writes a detached sidecar makes missing destination directories private.
 
 - On Linux, new vaults with detached parity can be created in group-writable directories when both destination names are free and the filesystem supports unnamed temporary files. A journal in the user's private state allows a restarted process to finish an interrupted creation. Existing files are preserved if either name is already occupied.
 
