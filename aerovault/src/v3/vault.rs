@@ -2353,20 +2353,18 @@ fn create_empty_vault(
     parent_builder
         .create(output_parent_dir(path))
         .map_err(|e| format!("Create parent dir: {e}"))?;
+    // Validate publication before acquiring either stable lock. Linux can
+    // publish a genuinely new pair using its owner-private state.
     #[cfg(target_os = "linux")]
-    let mut fresh = None;
-    #[cfg(unix)]
+    let fresh =
+        if writes_sidecar && super::strip_transaction::validate_publication_parent(path).is_err() {
+            Some(super::pending_pair::fresh::Plan::prepare(path)?)
+        } else {
+            None
+        };
+    #[cfg(all(unix, not(target_os = "linux")))]
     if writes_sidecar {
-        // A refusal must happen before either stable lock exists. Linux can
-        // publish a genuinely new pair using its owner-private state instead.
-        if let Err(_error) = super::strip_transaction::validate_publication_parent(path) {
-            #[cfg(target_os = "linux")]
-            {
-                fresh = Some(super::pending_pair::fresh::Plan::prepare(path)?);
-            }
-            #[cfg(not(target_os = "linux"))]
-            return Err(_error);
-        }
+        super::strip_transaction::validate_publication_parent(path)?;
     }
     let _lock = write_lock(path)?;
     let path = _lock.source_path();
