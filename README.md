@@ -210,7 +210,7 @@ The current version is **v4 = v3 container + Error Correction**. See [docs/AEROV
 
 ## Error Correction (`.aerocorrect`)
 
-On Linux, paired vault and sidecar writes that require a private journal use `$XDG_STATE_HOME/aerovault/journals`, with `~/.local/state` as the default base. If a writable ancestor makes that location unsafe, AeroVault creates `~/.aerovault-state` with mode 0700 and stores the journal in its `journals` subdirectory. This directory appears only when the fallback is needed. These writes require a trusted home with an absolute `HOME`. If you changed a custom `XDG_STATE_HOME` after an interrupted update and AeroVault cannot find the journal, restore its previous value and reopen the vault.
+On Linux, paired vault and sidecar writes that require a private journal use `$XDG_STATE_HOME/aerovault/journals`, with `~/.local/state` as the default base. If a writable ancestor makes that location unsafe, AeroVault creates `~/.aerovault-state` with mode 0700 and stores the journal in its `journals` subdirectory. This directory appears only when the fallback is needed. The fallback requires a trusted home with an absolute `HOME`. A usable XDG state directory works independently of `HOME`. If you changed a custom `XDG_STATE_HOME` after an interrupted update and AeroVault cannot find the journal, restore its previous value and reopen the vault.
 
 `.aerocorrect` is a detached, par2-style Reed-Solomon recovery sidecar for **any** byte stream. It protects the bytes of the target without embedding anything into it, so the same format repairs `.aerovault` containers, synced files, or ordinary standalone files. The sidecar binds to the **SHA-256 of the protected content**, not to a path, salt, account, or provider identity.
 
