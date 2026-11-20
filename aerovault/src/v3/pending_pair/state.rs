@@ -279,8 +279,10 @@ mod tests {
             .permissions(Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let state = dir.path().join("state");
-        let destination = dir.path().join("destination");
+        // macOS TMPDIR normally traverses the /var symlink.
+        let fixture = dir.path().canonicalize().unwrap();
+        let state = fixture.join("state");
+        let destination = fixture.join("destination");
         fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
         fs::DirBuilder::new()
             .mode(0o775)
@@ -388,8 +390,9 @@ mod tests {
             .permissions(Permissions::from_mode(0o700))
             .tempdir()
             .unwrap();
-        let home = dir.path().join("home");
-        let xdg = dir.path().join("xdg");
+        let fixture = dir.path().canonicalize().unwrap();
+        let home = fixture.join("home");
+        let xdg = fixture.join("xdg");
         let root = state_root(Some(xdg.as_os_str()), Some(home.as_os_str())).unwrap();
         fs::DirBuilder::new()
             .mode(0o700)
@@ -397,8 +400,8 @@ mod tests {
             .create(&root)
             .unwrap();
 
-        let target = dir.path().join("original.aerovault");
-        let moved = dir.path().join("moved.aerovault");
+        let target = fixture.join("original.aerovault");
+        let moved = fixture.join("moved.aerovault");
         let body = [0x3b; HEADER_SIZE];
         let header = Header {
             transaction: [9; 16],
