@@ -2348,11 +2348,23 @@ fn create_empty_vault(
     parent_builder
         .create(output_parent_dir(path))
         .map_err(|e| format!("Create parent dir: {e}"))?;
+    #[cfg(target_os = "linux")]
+    let mut fresh = None;
     #[cfg(unix)]
     if writes_sidecar {
-        // An ancestry refusal must happen before either stable lock exists.
-        // Publication checks the ancestry again while both locks are held.
-        super::strip_transaction::validate_publication_parent(path)?;
+        // A refusal must happen before either stable lock exists. Linux can
+        // publish a genuinely new pair using its owner-private state instead.
+        if let Err(error) = super::strip_transaction::validate_publication_parent(path) {
+            #[cfg(target_os = "linux")]
+            {
+                fresh = Some(
+                    super::pending_pair::fresh::Plan::prepare(path)
+                        .map_err(|reason| format!("{error}; {reason}"))?,
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(error);
+        }
     }
     let _lock = write_lock(path)?;
     let path = _lock.source_path();
@@ -2460,6 +2472,16 @@ fn create_empty_vault(
     } else {
         None
     };
+    #[cfg(target_os = "linux")]
+    if let Some(plan) = fresh {
+        let seed = super::ec::empty_sidecar_bytes(&bytes);
+        return plan.publish(
+            &_lock,
+            sidecar_lock.as_ref().unwrap_or(&_lock),
+            &bytes,
+            &seed,
+        );
+    }
     if writes_sidecar {
         let sidecar = super::ec::default_sidecar_path(path);
         let prepared =

@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Generation {
-    len: u64,
-    hash: [u8; 32],
+    pub(super) len: u64,
+    pub(super) hash: [u8; 32],
 }
 
 pub(super) fn generation(path: &Path) -> Result<Generation, String> {
@@ -28,7 +28,7 @@ pub(super) fn generation(path: &Path) -> Result<Generation, String> {
     hash_generation(file, expected)
 }
 
-fn hash_generation(mut file: fs::File, expected: u64) -> Result<Generation, String> {
+pub(super) fn hash_generation(mut file: fs::File, expected: u64) -> Result<Generation, String> {
     let mut reader = Read::by_ref(&mut file).take(expected);
     let mut hash = blake3::Hasher::new();
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
@@ -329,7 +329,7 @@ pub(crate) fn private_dir(parent: &Path, prefix: &str) -> Result<PrivateDir, Str
     Ok(dir)
 }
 
-fn private_options() -> fs::OpenOptions {
+pub(super) fn private_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -340,7 +340,7 @@ fn private_options() -> fs::OpenOptions {
     options
 }
 
-fn sync_dir(path: &Path) -> Result<(), String> {
+pub(super) fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     fs::File::open(path)
         .and_then(|f| f.sync_all())
@@ -645,7 +645,7 @@ impl<'a> TrustedJournal<'a> {
         Ok(Some(file))
     }
 
-    fn retire(self) -> Result<(), String> {
+    pub(super) fn retire(self) -> Result<(), String> {
         self.recheck()?;
         let path = self.path;
         #[cfg(windows)]
@@ -684,7 +684,7 @@ fn validate_private_journal_directory(path: &Path, opened: &fs::File) -> Result<
 }
 
 #[cfg(unix)]
-fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
+pub(super) fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let user = unsafe { libc::geteuid() };
     // An untrusted parent must not be able to replace the checked journal entry.
@@ -1074,7 +1074,15 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
     };
     let path = journal_path(&source);
     match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(target_os = "linux")]
+            if super::pending_pair::fresh::pending(&source).is_some() {
+                let lock =
+                    crate::lock::acquire_without_recovery(&source).map_err(|e| e.to_string())?;
+                return recover_under_guard(&lock);
+            }
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
         Ok(_) => {}
     }
@@ -1105,10 +1113,24 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
 pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
     let source = lock.source_path();
     let path = journal_path(source);
+    #[cfg(target_os = "linux")]
+    let fresh = super::pending_pair::fresh::pending(source);
     match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(target_os = "linux")]
+            if let Some(fresh) = fresh {
+                return super::pending_pair::fresh::recover(lock, &fresh);
+            }
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
         Ok(_) => {}
+    }
+    #[cfg(target_os = "linux")]
+    if fresh.is_some() {
+        return Err(
+            "Both an adjacent and a private pair journal exist; preserve both for recovery".into(),
+        );
     }
     if !lock.covers_namespace(source) {
         return Err("pending strip recovery requires a real source lock".to_string());
@@ -1480,7 +1502,11 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt;
 
-        for mode in [0o775, 0o777] {
+        #[cfg(target_os = "linux")]
+        let modes = [0o777];
+        #[cfg(not(target_os = "linux"))]
+        let modes = [0o775, 0o777];
+        for mode in modes {
             let dir = tempfile::tempdir().unwrap();
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
             let source = dir.path().join("shared.aerovault");

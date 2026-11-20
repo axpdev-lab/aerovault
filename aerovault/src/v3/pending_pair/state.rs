@@ -96,20 +96,24 @@ fn state_root(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, Stri
     Ok(base.join("aerovault/journals"))
 }
 
-pub(super) fn find_record(source: &Path, header: &Header) -> Result<bool, String> {
+pub(super) fn configured_root() -> Result<PathBuf, String> {
     let xdg = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
-    find_at(
-        &state_root(xdg.as_deref(), home.as_deref())?,
-        source,
-        header,
-    )
+    state_root(xdg.as_deref(), home.as_deref())
+}
+
+pub(super) fn source_key(source: &Path) -> blake3::Hash {
+    blake3::hash(source.as_os_str().as_encoded_bytes())
+}
+
+pub(super) fn find_record(source: &Path, header: &Header) -> Result<bool, String> {
+    find_at(&configured_root()?, source, header)
 }
 
 fn find_at(root: &Path, source: &Path, header: &Header) -> Result<bool, String> {
     let source = std::fs::canonicalize(source)
         .map_err(|error| format!("Resolve vault identity: {error}"))?;
-    let key = blake3::hash(source.as_os_str().as_encoded_bytes());
+    let key = source_key(&source);
     let path = root.join(key.to_hex().as_str());
     match std::fs::symlink_metadata(&path) {
         Ok(_) => {}

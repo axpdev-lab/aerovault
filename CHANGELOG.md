@@ -10,6 +10,8 @@ All notable changes to the `aerovault` crate are documented here.
 
 - When the destination ancestry cannot support a recoverable vault and detached parity pair, creation reports the refusal before acquiring either persistent lock. Unix creation uses private permissions for missing destination directories.
 
+- On Linux, new vaults with detached parity can be created in group-writable directories when both destination names are free and the filesystem supports unnamed temporary files. A journal in the user's private state allows a restarted process to finish an interrupted creation. Existing files are preserved if either name is already occupied.
+
 ### Added
 
 - Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The existing opt-in `AEROVAULT_V3_DATA_BUDGET_BYTES` setting still applies to callers that use the original entry points.

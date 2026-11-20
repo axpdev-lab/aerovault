@@ -14,6 +14,8 @@ pub(super) const MAGIC: &[u8; 15] = b"AVPAIR-PENDING\0";
 const PENDING: &str =
     "AeroVault vault/sidecar publication is pending; preserve the vault and sidecar and recover the pair before opening or replacing it";
 
+#[cfg(target_os = "linux")]
+pub(super) mod fresh;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod state;
 
