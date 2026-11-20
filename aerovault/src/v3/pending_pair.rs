@@ -18,6 +18,8 @@ const PENDING: &str =
 pub(super) mod fresh;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod state;
+#[cfg(target_os = "linux")]
+pub(super) mod update;
 
 pub(super) fn require_ordinary(bytes: &[u8]) -> Result<(), String> {
     if bytes.starts_with(MAGIC) {

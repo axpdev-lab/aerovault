@@ -12,6 +12,8 @@ All notable changes to the `aerovault` crate are documented here.
 
 - On Linux, new vaults with detached parity can be created in group-writable directories when both destination names are free and the filesystem supports unnamed temporary files. A journal in the user's private state allows a restarted process to finish an interrupted creation. Existing files are preserved if either name is already occupied.
 
+- On Linux, stripping embedded recovery or changing the password with a detached sidecar can also use private recovery state in group-writable directories. On supported filesystems, atomic exchanges retain the displaced files while the vault and sidecar are published. An interrupted update temporarily blocks normal reads until recovery can verify both generations. Existing adjacent recovery journals remain supported.
+
 ### Added
 
 - Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The existing opt-in `AEROVAULT_V3_DATA_BUDGET_BYTES` setting still applies to callers that use the original entry points.

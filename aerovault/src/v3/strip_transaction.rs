@@ -1076,7 +1076,9 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(target_os = "linux")]
-            if super::pending_pair::fresh::pending(&source).is_some() {
+            if super::pending_pair::fresh::pending(&source).is_some()
+                || super::pending_pair::update::pending(&source).is_some()
+            {
                 let lock =
                     crate::lock::acquire_without_recovery(&source).map_err(|e| e.to_string())?;
                 return recover_under_guard(&lock);
@@ -1114,12 +1116,25 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
     let source = lock.source_path();
     let path = journal_path(source);
     #[cfg(target_os = "linux")]
-    let fresh = super::pending_pair::fresh::pending(source);
+    let (fresh, update) = (
+        super::pending_pair::fresh::pending(source),
+        super::pending_pair::update::pending(source),
+    );
+    #[cfg(target_os = "linux")]
+    if fresh.is_some() && update.is_some() {
+        return Err(
+            "Both a fresh and a replacement journal exist; preserve both for recovery".into(),
+        );
+    }
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(target_os = "linux")]
             if let Some(fresh) = fresh {
                 return super::pending_pair::fresh::recover(lock, &fresh);
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(update) = update {
+                return super::pending_pair::update::recover(lock, &update);
             }
             return Ok(());
         }
@@ -1127,7 +1142,7 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
         Ok(_) => {}
     }
     #[cfg(target_os = "linux")]
-    if fresh.is_some() {
+    if fresh.is_some() || update.is_some() {
         return Err(
             "Both an adjacent and a private pair journal exist; preserve both for recovery".into(),
         );
@@ -1138,6 +1153,50 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
     let sidecar = super::ec::default_sidecar_path(source);
     let _sidecar = crate::lock::acquire(&sidecar).map_err(|e| e.to_string())?;
     recover_locked(source, &path, lock).map(|_| ())
+}
+
+pub(super) enum PreparedUpdate {
+    Adjacent(PrivateDir),
+    #[cfg(target_os = "linux")]
+    Private(PrivateDir),
+}
+
+impl PreparedUpdate {
+    pub(super) fn path(&self) -> &Path {
+        match self {
+            Self::Adjacent(dir) => dir.path(),
+            #[cfg(target_os = "linux")]
+            Self::Private(dir) => dir.path(),
+        }
+    }
+}
+
+pub(super) fn prepare_update(source: &Path, prefix: &str) -> Result<PreparedUpdate, String> {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = validate_publication_parent(source) {
+        return super::pending_pair::update::prepare(source, prefix)
+            .map(PreparedUpdate::Private)
+            .map_err(|reason| format!("{error}; {reason}"));
+    }
+    private_dir(output_parent_dir(source), prefix).map(PreparedUpdate::Adjacent)
+}
+
+pub(super) fn publish_update(
+    source: &Path,
+    prepared: PreparedUpdate,
+    lock: &WriteLock,
+    _sidecar_lock: Option<&WriteLock>,
+) -> Result<(), String> {
+    match prepared {
+        PreparedUpdate::Adjacent(dir) => publish(source, dir, lock),
+        #[cfg(target_os = "linux")]
+        PreparedUpdate::Private(dir) => super::pending_pair::update::publish(
+            source,
+            dir,
+            lock,
+            _sidecar_lock.ok_or("Private pair needs a sidecar lock")?,
+        ),
+    }
 }
 
 /// The caller has prepared old/new vault and sidecar files in a private temp
@@ -1290,6 +1349,19 @@ thread_local! {
     pub(super) static AFTER_STRIP_SIDECAR: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+// These fixtures exercise the adjacent journal and its specific fault hooks,
+// even when the test runner has a group-writable default umask.
+#[cfg(test)]
+pub(super) fn adjacent_test_dir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder.prefix("aerovault-adjacent-").tempdir().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,7 +1440,7 @@ mod tests {
         for (edit_before_vault, matches_stage) in
             [(true, false), (false, false), (true, true), (false, true)]
         {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = adjacent_test_dir();
             let source = dir.path().join("source.aerozip");
             let sidecar = super::super::ec::default_sidecar_path(&source);
             fs::write(&source, b"vault old").unwrap();
@@ -1426,16 +1498,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn group_writable_ancestry_refuses_pair_before_publication_and_reopens_original() {
+    fn other_writable_ancestry_refuses_pair_before_publication_and_reopens_original() {
         use super::super::{
             ec::RecoveryPlacement,
             vault::{CreateOptionsV3, VaultV3},
         };
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = adjacent_test_dir();
         let shared = dir.path().join("shared");
         fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
         let source = shared.join("source.aerovault");
         let sidecar = super::super::ec::default_sidecar_path(&source);
         let password = "existing-password-123";
@@ -1447,7 +1520,7 @@ mod tests {
         .unwrap();
         let old_vault = fs::read(&source).unwrap();
         let old_sidecar = fs::read(&sidecar).unwrap();
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
 
         let mut opened = VaultV3::open(&source, password).unwrap();
         let error = VaultV3::change_password(&mut opened, "different-password-123").unwrap_err();

@@ -705,10 +705,7 @@ pub(super) fn strip_parity(
         );
     }
     let prepared = if !force {
-        let prepared = super::strip_transaction::private_dir(
-            super::vault::output_parent_dir(vault_path),
-            ".aerostrip-prepare-",
-        )?;
+        let prepared = super::strip_transaction::prepare_update(vault_path, ".aerostrip-prepare-")?;
         let sidecar_limit = crate::source::open_regular_no_follow(&sidecar)
             .and_then(|f| f.metadata())
             .map_err(|e| e.to_string())?
@@ -780,7 +777,12 @@ pub(super) fn strip_parity(
             &_sidecar_lock,
             limits,
         )?;
-        super::strip_transaction::publish(vault_path, prepared, &lock)?;
+        super::strip_transaction::publish_update(
+            vault_path,
+            prepared,
+            &lock,
+            _sidecar_lock.as_ref(),
+        )?;
     }
     Ok(StripParityResult {
         sidecar_present: has_sidecar,
@@ -1031,6 +1033,36 @@ pub(super) fn repair_vault(
         ));
     }
     Ok((repaired_count, source))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn legacy_extension_bound(
+    vault: &Path,
+    sidecar: &Path,
+    pending_header: &[u8],
+) -> Result<u64, String> {
+    let header_parity =
+        read_vault_segment(vault, sidecar, VAULT_SIDECAR_SEG_HEADER, HEADER_SIZE as u64)?;
+    if header_parity.is_empty() {
+        return Ok(0);
+    }
+    let mut header = [pending_header.to_vec()];
+    if reconstruct_from_error_correction(&mut header, &header_parity).is_err() {
+        return Ok(0);
+    }
+    let Ok(header) = VaultHeaderV3::from_bytes(&header[0]) else {
+        return Ok(0);
+    };
+    if header.extension_dir_len == 0 {
+        return Ok(0); // Legacy JSON decoding also rejects an empty directory.
+    }
+    if header.extension_dir_offset < HEADER_SIZE as u64 {
+        return Err("Cannot isolate the legacy extension directory from the pending header".into());
+    }
+    header
+        .extension_dir_offset
+        .checked_add(1)
+        .ok_or("Legacy extension directory offset overflow".into())
 }
 
 /// HEADER parity: rebuild a corrupted 1024-byte header from the detached
@@ -1409,7 +1441,7 @@ mod tests {
 
     #[test]
     fn review_strip_refresh_failure_restores_embedded_recovery() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("rollback.aerovault");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new(&path, PW),
@@ -2440,7 +2472,7 @@ mod tests {
         use super::super::strip_transaction as tx;
         use std::os::unix::fs::PermissionsExt;
         for narrow_sidecar in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = super::super::strip_transaction::adjacent_test_dir();
             let path = dir.path().join("plain.aerozip");
             let sidecar = default_sidecar_path(&path);
             VaultV3::create_with_error_correction(
@@ -2781,7 +2813,7 @@ mod tests {
             }
         }
         for phase in ["journal", "vault", "sidecar"] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = super::super::strip_transaction::adjacent_test_dir();
             let path = dir.path().join("restart.aerovault");
             VaultV3::create_with_error_correction(
                 &CreateOptionsV3::new(&path, PW),
@@ -2970,7 +3002,7 @@ mod tests {
     }
     #[test]
     fn review_strip_rollback_does_not_overwrite_a_newer_vault() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("conflict.aerovault");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new(&path, PW),
@@ -3154,7 +3186,7 @@ mod tests {
 
     #[test]
     fn review_strip_sync_error_reports_completed_publication() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("sync.aerozip");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new_plaintext(&path),
@@ -3194,7 +3226,7 @@ mod tests {
             ("vault", "create"),
             ("journal", "export"),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = super::super::strip_transaction::adjacent_test_dir();
             let path = dir.path().join("restart.aerovault");
             VaultV3::create_with_error_correction(
                 &CreateOptionsV3::new(&path, PW),
@@ -3743,7 +3775,7 @@ mod tests {
     #[test]
     fn round7_retirement_sync_failure_preserves_actual_backup_directory() {
         use super::super::strip_transaction as tx;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("retirement.aerovault");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new(&path, PW),
@@ -3798,7 +3830,7 @@ mod tests {
             VaultV3::strip_parity(&path, PW, false).unwrap();
             panic!("journal interruption seam not reached");
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let first = dir.path().join("Vault.aerovault");
         let second = dir.path().join("vault.aerovault");
         VaultV3::create_with_error_correction(
@@ -3849,7 +3881,7 @@ mod tests {
             VaultV3::strip_parity(&path, PW, false).unwrap();
             panic!("retirement interruption seam not reached");
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("retired-before-read.aerovault");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new(&path, PW),
@@ -3916,7 +3948,7 @@ mod tests {
             VaultV3::strip_parity(&path, PW, false).unwrap();
             panic!("Unix security-marker interruption seam not reached");
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("unix-security-restart.aerovault");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new(&path, PW),
@@ -3966,7 +3998,7 @@ mod tests {
             VaultV3::strip_parity(&path, "", false).unwrap();
             panic!("first replacement interruption was not reached");
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("rollback.aerozip");
         VaultV3::create_with_error_correction(
             &CreateOptionsV3::new_plaintext(&path),
@@ -4398,7 +4430,7 @@ mod tests {
             }
             panic!("rollback seam not reached");
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         #[cfg(windows)]
         use super::super::windows_security as acl;
         #[cfg(windows)]

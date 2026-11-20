@@ -10,18 +10,36 @@ use std::ffi::OsStr;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
-const VERSION: u8 = 1;
+pub(super) const VERSION: u8 = 1;
 const MAX_RECORD_SIZE: u64 = 4096;
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Header {
-    transaction: [u8; 16],
-    payload_len: u64,
-    payload_hash: [u8; 32],
+    pub(super) transaction: [u8; 16],
+    pub(super) payload_len: u64,
+    pub(super) payload_offset: u64,
+    pub(super) payload_hash: [u8; 32],
 }
 
 impl Header {
+    #[cfg(target_os = "linux")]
+    pub(super) fn encode(&self) -> [u8; HEADER_SIZE] {
+        use rand::RngCore;
+
+        // The complete header region differs from a normal vault so a
+        // legacy reader cannot mistake it for ordinary header bit rot.
+        let mut bytes = [0; HEADER_SIZE];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+        bytes[MAGIC.len()] = VERSION;
+        bytes[16..32].copy_from_slice(&self.transaction);
+        bytes[32..40].copy_from_slice(&self.payload_len.to_le_bytes());
+        bytes[40..72].copy_from_slice(&self.payload_hash);
+        bytes[72..80].copy_from_slice(&self.payload_offset.to_le_bytes());
+        bytes
+    }
+
     pub(super) fn decode(bytes: &[u8], file_len: u64) -> Option<Self> {
         if !bytes.starts_with(MAGIC) || bytes.get(MAGIC.len()) != Some(&VERSION) {
             return None;
@@ -29,14 +47,17 @@ impl Header {
         let transaction = bytes.get(16..32)?.try_into().ok()?;
         let payload_len = u64::from_le_bytes(bytes.get(32..40)?.try_into().ok()?);
         let payload_hash = bytes.get(40..72)?.try_into().ok()?;
+        let payload_offset = u64::from_le_bytes(bytes.get(72..80)?.try_into().ok()?);
         if payload_len < HEADER_SIZE as u64
-            || (HEADER_SIZE as u64).checked_add(payload_len) != Some(file_len)
+            || payload_offset < HEADER_SIZE as u64
+            || payload_offset.checked_add(payload_len) != Some(file_len)
         {
             return None;
         }
         Some(Self {
             transaction,
             payload_len,
+            payload_offset,
             payload_hash,
         })
     }
@@ -44,7 +65,7 @@ impl Header {
     /// Verify from the same open handle that provided the marker, without
     /// reserving memory proportional to the payload.
     pub(super) fn verify_payload(&self, file: &mut (impl Read + Seek)) -> Result<(), String> {
-        file.seek(SeekFrom::Start(HEADER_SIZE as u64))
+        file.seek(SeekFrom::Start(self.payload_offset))
             .map_err(|error| format!("Seek pending payload: {error}"))?;
         let mut hash = blake3::Hasher::new();
         let read = io::copy(&mut file.by_ref().take(self.payload_len), &mut hash)
@@ -61,12 +82,12 @@ impl Header {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Record {
-    version: u8,
-    source_key: [u8; 32],
-    envelope: Header,
-    old_sidecar: Option<Generation>,
-    new_sidecar: Generation,
+pub(super) struct Record {
+    pub(super) version: u8,
+    pub(super) source_key: [u8; 32],
+    pub(super) envelope: Header,
+    pub(super) old_sidecar: Option<Generation>,
+    pub(super) new_sidecar: Generation,
 }
 
 fn absolute_directory(value: &OsStr) -> Option<&Path> {
@@ -96,7 +117,7 @@ fn state_root(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, Stri
     Ok(base.join("aerovault/journals"))
 }
 
-pub(super) fn configured_root() -> Result<PathBuf, String> {
+pub(in crate::v3) fn configured_root() -> Result<PathBuf, String> {
     let xdg = std::env::var_os("XDG_STATE_HOME");
     let home = std::env::var_os("HOME");
     state_root(xdg.as_deref(), home.as_deref())
@@ -195,11 +216,13 @@ mod tests {
         bytes[16..32].copy_from_slice(&[2; 16]);
         bytes[32..40].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         bytes[40..72].copy_from_slice(&[3; 32]);
+        bytes[72..80].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
         assert_eq!(
             Header::decode(&bytes, (2 * HEADER_SIZE) as u64),
             Some(Header {
                 transaction: [2; 16],
                 payload_len: HEADER_SIZE as u64,
+                payload_offset: HEADER_SIZE as u64,
                 payload_hash: [3; 32]
             }),
         );
@@ -230,6 +253,7 @@ mod tests {
         let envelope = || Header {
             transaction: [1; 16],
             payload_len: HEADER_SIZE as u64,
+            payload_offset: HEADER_SIZE as u64,
             payload_hash: [2; 32],
         };
         assert!(!find_at(&state, &file, &envelope()).unwrap());
@@ -272,6 +296,7 @@ mod tests {
         let expected = Header {
             transaction: [1; 16],
             payload_len: payload.len() as u64,
+            payload_offset: HEADER_SIZE as u64,
             payload_hash: *blake3::hash(&payload).as_bytes(),
         };
         let mut envelope = vec![0u8; HEADER_SIZE];
@@ -328,6 +353,7 @@ mod tests {
         let header = Header {
             transaction: [9; 16],
             payload_len: body.len() as u64,
+            payload_offset: HEADER_SIZE as u64,
             payload_hash: *blake3::hash(&body).as_bytes(),
         };
         let mut bytes = vec![0; HEADER_SIZE];
@@ -336,6 +362,7 @@ mod tests {
         bytes[16..32].copy_from_slice(&header.transaction);
         bytes[32..40].copy_from_slice(&header.payload_len.to_le_bytes());
         bytes[40..72].copy_from_slice(&header.payload_hash);
+        bytes[72..80].copy_from_slice(&header.payload_offset.to_le_bytes());
         bytes.extend_from_slice(&body);
         fs::write(&target, &bytes).unwrap();
         fs::copy(&target, &moved).unwrap();

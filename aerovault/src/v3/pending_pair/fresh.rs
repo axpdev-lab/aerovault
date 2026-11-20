@@ -37,15 +37,15 @@ struct Record {
     sidecar: Generation,
 }
 
-struct Destination {
-    path: PathBuf,
-    directory: File,
-    device: u64,
-    inode: u64,
+pub(super) struct Destination {
+    pub(super) path: PathBuf,
+    pub(super) directory: File,
+    pub(super) device: u64,
+    pub(super) inode: u64,
 }
 
 impl Destination {
-    fn open(path: &Path) -> Result<Self, String> {
+    pub(super) fn open(path: &Path) -> Result<Self, String> {
         // Do not follow a retargeted parent or grant new writes under a
         // foreign-owned or non-sticky, other-writable ancestry.
         let user = unsafe { libc::geteuid() };
@@ -77,7 +77,7 @@ impl Destination {
         Ok(destination)
     }
 
-    fn recheck(&self) -> Result<(), String> {
+    pub(super) fn recheck(&self) -> Result<(), String> {
         let meta = fs::symlink_metadata(&self.path)
             .map_err(|error| format!("Recheck vault destination: {error}"))?;
         if !meta.is_dir() || (meta.dev(), meta.ino()) != (self.device, self.inode) {
@@ -86,7 +86,7 @@ impl Destination {
         Ok(())
     }
 
-    fn leaf(&self, path: &Path) -> Result<CString, String> {
+    pub(super) fn leaf(&self, path: &Path) -> Result<CString, String> {
         if output_parent_dir(path) != self.path {
             return Err("Publication target is outside its pinned directory".into());
         }
@@ -227,7 +227,7 @@ impl Destination {
     }
 }
 
-fn checked_fd(fd: libc::c_int) -> io::Result<File> {
+pub(super) fn checked_fd(fd: libc::c_int) -> io::Result<File> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -235,7 +235,7 @@ fn checked_fd(fd: libc::c_int) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn ensure_private_root(root: &Path) -> Result<(), String> {
+pub(super) fn ensure_private_root(root: &Path) -> Result<(), String> {
     let mut missing = Vec::new();
     for ancestor in root.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -351,7 +351,7 @@ fn require_absent(source: &Path, sidecar: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_input(parent: &Path, leaf: &str, bytes: &[u8]) -> Result<Generation, String> {
+pub(super) fn write_input(parent: &Path, leaf: &str, bytes: &[u8]) -> Result<Generation, String> {
     let path = parent.join(leaf);
     let mut file = private_options()
         .open(&path)
@@ -362,7 +362,7 @@ fn write_input(parent: &Path, leaf: &str, bytes: &[u8]) -> Result<Generation, St
     generation(&path)
 }
 
-fn publish_index(prepared: &Path, active: &Path) -> Result<(), String> {
+pub(super) fn publish_index(prepared: &Path, active: &Path) -> Result<(), String> {
     let path_name =
         |value: &Path| CString::new(value.as_os_str().as_bytes()).map_err(|e| e.to_string());
     let source = path_name(prepared)?;

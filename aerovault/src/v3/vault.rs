@@ -743,8 +743,8 @@ impl VaultV3 {
             // leave old-header recovery beside a newly rotated container.
             // Use the same bounded, restart-recoverable pair transaction as
             // non-forced stripping, under the already held source/sidecar locks.
-            let prepared = super::strip_transaction::private_dir(
-                output_parent_dir(lock.source_path()),
+            let prepared = super::strip_transaction::prepare_update(
+                lock.source_path(),
                 ".aeropassword-prepare-",
             )?;
             super::strip_transaction::copy_file(
@@ -760,7 +760,12 @@ impl VaultV3 {
                 &target,
                 &prepared.path().join("new-sidecar"),
             )?;
-            super::strip_transaction::publish(lock.source_path(), prepared, &lock)
+            super::strip_transaction::publish_update(
+                lock.source_path(),
+                prepared,
+                &lock,
+                sidecar_lock.as_ref(),
+            )
         })();
         if let Err(error) = result {
             if staged && assert_vault_generation_current(vault).is_ok() {
@@ -3946,7 +3951,7 @@ mod tests {
     fn review_seed_and_password_refresh_obey_destination_lock() {
         use super::super::ec::{default_sidecar_path, RecoveryPlacement};
         crate::lock::set_short_wait_for_this_thread();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("source.aerovault");
         let sidecar = default_sidecar_path(&path);
         VaultV3::create(&CreateOptionsV3::new_plaintext(&sidecar)).unwrap();
@@ -6039,7 +6044,7 @@ mod tests {
     fn review_reader_past_journal_check_cannot_recover_old_password_mid_rotation() {
         use super::super::ec::RecoveryPlacement;
         for placement in [RecoveryPlacement::Detached, RecoveryPlacement::Both] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = super::super::strip_transaction::adjacent_test_dir();
             let path = dir.path().join("reader-race.aerovault");
             VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
                 .unwrap();
@@ -6089,7 +6094,7 @@ mod tests {
     #[test]
     fn round7d_alias_manifest_failure_checks_late_physical_journal() {
         use super::super::{ec, strip_transaction as tx};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("physical.aerovault");
         let alias = dir.path().join("alias.aerovault");
         VaultV3::create_with_error_correction(
@@ -6227,7 +6232,7 @@ mod tests {
             super::super::ec::RecoveryPlacement::Detached,
             super::super::ec::RecoveryPlacement::Both,
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = super::super::strip_transaction::adjacent_test_dir();
             let path = dir.path().join("restart.aerovault");
             VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
                 .unwrap();
@@ -6353,7 +6358,7 @@ mod tests {
         for placement in [RecoveryPlacement::Detached, RecoveryPlacement::Both] {
             for existing in [false, true] {
                 for had_sidecar in [false, true] {
-                    let dir = tempfile::tempdir().unwrap();
+                    let dir = super::super::strip_transaction::adjacent_test_dir();
                     let path = dir.path().join("create.aerovault");
                     let sidecar = default_sidecar_path(&path);
                     if existing {

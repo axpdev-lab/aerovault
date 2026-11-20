@@ -38,16 +38,26 @@ fn capture_linux(read: impl FnOnce(*mut libc::c_void, usize) -> isize) -> Result
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn capture_fd(file: &std::fs::File) -> Result<Vec<u8>, String> {
+    use std::os::fd::AsRawFd;
+    capture_linux(|data, len| unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"system.posix_acl_access".as_ptr(),
+            data,
+            len,
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn copy_extraction_acl(
     source: &std::fs::File,
     target: &std::fs::File,
 ) -> std::io::Result<()> {
     use std::{io, os::fd::AsRawFd};
     let name = c"system.posix_acl_access";
-    let data = capture_linux(|data, len| unsafe {
-        libc::fgetxattr(source.as_raw_fd(), name.as_ptr(), data, len)
-    })
-    .map_err(io::Error::other)?;
+    let data = capture_fd(source).map_err(io::Error::other)?;
     let fd = target.as_raw_fd();
     if data == [0] {
         if unsafe { libc::fremovexattr(fd, name.as_ptr()) } != 0 {
