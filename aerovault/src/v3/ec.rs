@@ -1728,6 +1728,108 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_archives_with_padding_can_export_and_repair_live_blocks() {
+        const PADDING: u64 = 64 * 1024;
+        for (placement, source) in [
+            (RecoveryPlacement::Embedded, ParitySource::Embedded),
+            (RecoveryPlacement::Detached, ParitySource::Detached),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("padded.aerozip");
+            let input = dir.path().join("input");
+            let output = dir.path().join("output");
+            let sidecar = if placement == RecoveryPlacement::Detached {
+                default_sidecar_path(&path)
+            } else {
+                dir.path().join("export.aerocorrect")
+            };
+            let payload = b"plaintext block protected by Reed-Solomon".repeat(100);
+            std::fs::write(&input, &payload).unwrap();
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new_plaintext(&path),
+                placement,
+                20,
+            )
+            .unwrap();
+            let mut opened = VaultV3::open_plaintext(&path).unwrap();
+            VaultV3::add_files(&mut opened, &[(input.clone(), "input".into())]).unwrap();
+
+            // Move the metadata and embedded parity as a unit. Padding is
+            // part of the on-disk data window but never enters the parity grid.
+            let mut header = opened.header.clone();
+            let live_len = header.data_len;
+            let corrupt_at = header.data_offset as usize + 8;
+            let mut bytes = std::fs::read(&path).unwrap();
+            let metadata_at = header.manifest_offset as usize;
+            let metadata = bytes.split_off(metadata_at);
+            bytes.resize(metadata_at + PADDING as usize, 0);
+            bytes.extend_from_slice(&metadata);
+            header.data_len += PADDING;
+            header.manifest_offset += PADDING;
+            header.extension_dir_offset += PADDING;
+            header.extension_payload_offset += PADDING;
+            header.header_mac = header.compute_mac(&opened.mac_key).unwrap();
+            bytes[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            drop(opened);
+
+            let assert_contents = |vault: &OpenVaultV3| {
+                assert!(VaultV3::scrub(vault).is_empty());
+                assert!(VaultV3::list(vault)
+                    .iter()
+                    .any(|entry| entry.path == "input"));
+                VaultV3::extract_entry(vault, "input", &output).unwrap();
+                assert_eq!(std::fs::read(&output).unwrap(), payload);
+                std::fs::remove_file(&output).unwrap();
+            };
+            let opened = VaultV3::open_plaintext(&path).unwrap();
+            assert_eq!(opened.data.len() as u64, live_len);
+            assert_contents(&opened);
+            drop(opened);
+
+            VaultV3::export_parity(&path, "", Some(&sidecar)).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            let parity = std::fs::read(&sidecar).unwrap();
+            let export = AeroCorrectSidecar::from_bytes(&parity).unwrap();
+            assert_eq!(export.total_len, bytes.len() as u64);
+            assert_eq!(
+                export.segments[VAULT_SIDECAR_SEG_DATA].window_len,
+                live_len + PADDING
+            );
+            assert_eq!(
+                export.content_sha256,
+                container_sha256_file(&path).unwrap().0
+            );
+
+            bytes[corrupt_at] ^= 0x5a;
+            std::fs::write(&path, &bytes).unwrap();
+            let mut damaged = VaultV3::open_plaintext(&path).unwrap();
+            assert_eq!(VaultV3::scrub(&damaged).len(), 1);
+            assert_eq!(
+                VaultV3::repair(&mut damaged, true, None).unwrap(),
+                (1, source)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), parity);
+            assert_eq!(
+                VaultV3::repair(&mut damaged, false, None).unwrap(),
+                (1, source)
+            );
+            assert_eq!(std::fs::read(&sidecar).unwrap(), parity);
+            drop(damaged);
+
+            let mut repaired = VaultV3::open_plaintext(&path).unwrap();
+            assert_eq!(repaired.header.data_len, live_len);
+            assert_contents(&repaired);
+            VaultV3::add_files(&mut repaired, &[(input, "copy".into())]).unwrap();
+            drop(repaired);
+            let final_vault = VaultV3::open_plaintext(&path).unwrap();
+            assert_contents(&final_vault);
+            assert_eq!(VaultV3::list(&final_vault).len(), 2);
+        }
+    }
+
+    #[test]
     fn beyond_budget_corruption_fails_closed_vault_untouched() {
         let vp = tmp("budget.aerovault");
         let src = tmp("budget-src");
@@ -2842,6 +2944,7 @@ mod tests {
             VaultV3::strip_parity(&path, "", false).unwrap();
             let current = VaultV3::open_plaintext(&path).unwrap();
             assert_eq!(current.data.len(), 512 * 1024 * 1024);
+            assert!(VaultV3::scrub(&current).is_empty());
             assert!(!VaultV3::has_error_correction(&path).unwrap());
             assert!(!super::super::strip_transaction::journal_path(&path).exists());
             crate::source::memory_test::complete();
@@ -2856,8 +2959,7 @@ mod tests {
         )
         .unwrap();
         let mut vault = VaultV3::open_plaintext(&path).unwrap();
-        vault.data.resize(512 * 1024 * 1024, 0);
-        save_open_vault(&mut vault).unwrap();
+        super::super::vault::seed_live_test_extent(&mut vault, 512 * 1024 * 1024);
         drop(vault);
         VaultV3::export_parity(&path, "", None).unwrap();
         crate::source::memory_test::run(

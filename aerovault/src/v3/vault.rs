@@ -2791,7 +2791,8 @@ fn open_vault_with_guard(
     crate::lock::trace("decode");
 
     // Plaintext metadata can be supplied without a secret. Check its chunk
-    // ranges and exclude unclaimed trailing padding from the allocation.
+    // ranges and exclude unclaimed trailing padding from the allocation. Keep
+    // the original header for sidecar geometry and header recovery.
     let data_len = if plaintext_header {
         plaintext_chunk_extent(&manifest, header.data_len)?
     } else {
@@ -3478,6 +3479,25 @@ fn add_directory_into(
 
     save_locked(vault, lock)?;
     Ok((total_files, added_dirs))
+}
+
+/// Keep a large data extent live for memory regressions with plaintext padding.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn seed_live_test_extent(vault: &mut OpenVaultV3, data_len: usize) {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(input.path(), b"memory regression fixture").unwrap();
+    VaultV3::add_files(vault, &[(input.path().to_owned(), "fixture".into())]).unwrap();
+
+    let original_len = vault.data.len();
+    let offset = data_len - original_len;
+    assert!(offset >= original_len);
+    vault.data.resize(data_len, 0);
+    vault.data.copy_within(..original_len, offset);
+    vault.data[..original_len].fill(0);
+    for chunk in vault.manifest.chunks.values_mut() {
+        chunk.data_offset += offset as u64;
+    }
+    save_open_vault(vault).unwrap();
 }
 
 #[cfg(test)]
@@ -5939,7 +5959,7 @@ mod tests {
             assert!(opened.manifest_repaired_on_open);
             assert_eq!(opened.data.len(), DATA_LEN);
             assert_eq!(opened.data[0], 0);
-            assert_eq!(opened.data[DATA_LEN - 1], 0);
+            assert!(VaultV3::scrub(&opened).is_empty());
             crate::source::memory_test::complete();
             return;
         }
@@ -5952,8 +5972,7 @@ mod tests {
         )
         .unwrap();
         let mut vault = VaultV3::open_plaintext(&path).unwrap();
-        vault.data.resize(DATA_LEN, 0);
-        save_open_vault(&mut vault).unwrap();
+        seed_live_test_extent(&mut vault, DATA_LEN);
         let manifest_at = vault.header.manifest_offset;
         drop(vault);
         VaultV3::export_parity(&path, "", None).unwrap();
