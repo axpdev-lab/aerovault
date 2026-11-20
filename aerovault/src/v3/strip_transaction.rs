@@ -684,31 +684,59 @@ fn validate_private_journal_directory(path: &Path, opened: &fs::File) -> Result<
 }
 
 #[cfg(unix)]
+pub(super) enum AncestryError {
+    Writable(String),
+    Other(String),
+}
+
+#[cfg(unix)]
+impl AncestryError {
+    pub(super) fn into_message(self) -> String {
+        match self {
+            Self::Writable(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+#[cfg(unix)]
 pub(super) fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
+    check_journal_ancestry(parent).map_err(AncestryError::into_message)
+}
+
+#[cfg(unix)]
+pub(super) fn check_journal_ancestry(parent: &Path) -> Result<(), AncestryError> {
     use std::os::unix::fs::MetadataExt;
     let user = unsafe { libc::geteuid() };
     // An untrusted parent must not be able to replace the checked journal entry.
     for ancestor in parent.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)
-            .map_err(|e| format!("Cannot inspect ancestor {} ({e})", ancestor.display()))?;
+        let metadata = fs::symlink_metadata(ancestor).map_err(|e| {
+            AncestryError::Other(format!(
+                "Cannot inspect ancestor {} ({e})",
+                ancestor.display()
+            ))
+        })?;
         if !metadata.is_dir() || (metadata.uid() != user && metadata.uid() != 0) {
-            return Err(format!(
+            return Err(AncestryError::Other(format!(
                 "Ancestor {} must be a directory owned by this user or root",
                 ancestor.display()
-            ));
+            )));
         }
         if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-            return Err(writable_ancestor(ancestor, metadata.mode()));
+            return Err(AncestryError::Writable(writable_ancestor(
+                ancestor,
+                metadata.mode(),
+            )));
         }
         #[cfg(target_os = "macos")]
-        if super::unix_security::capture(ancestor)?
+        if super::unix_security::capture(ancestor)
+            .map_err(AncestryError::Other)?
             .split(|&b| b == b'\n')
             .any(mac_acl_may_mutate)
         {
-            return Err(format!(
+            return Err(AncestryError::Other(format!(
                 "Ancestor {} grants additional write access through an ACL",
                 ancestor.display()
-            ));
+            )));
         }
     }
     Ok(())
@@ -1102,9 +1130,10 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(target_os = "linux")]
-            if super::pending_pair::fresh::pending(&source).is_some()
-                || super::pending_pair::update::pending(&source).is_some()
-            {
+            if !matches!(
+                super::pending_pair::state::pending_location(&source),
+                Ok(None)
+            ) {
                 let lock =
                     crate::lock::acquire_without_recovery(&source).map_err(|e| e.to_string())?;
                 return recover_under_guard(&lock);
@@ -1142,25 +1171,12 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
     let source = lock.source_path();
     let path = journal_path(source);
     #[cfg(target_os = "linux")]
-    let (fresh, update) = (
-        super::pending_pair::fresh::pending(source),
-        super::pending_pair::update::pending(source),
-    );
-    #[cfg(target_os = "linux")]
-    if fresh.is_some() && update.is_some() {
-        return Err(
-            "Both a fresh and a replacement journal exist; preserve both for recovery".into(),
-        );
-    }
+    let private = super::pending_pair::state::pending_location(source)?;
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             #[cfg(target_os = "linux")]
-            if let Some(fresh) = fresh {
-                return super::pending_pair::fresh::recover(lock, &fresh);
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(update) = update {
-                return super::pending_pair::update::recover(lock, &update);
+            if let Some(private) = private {
+                return super::pending_pair::recover_private(lock, &private);
             }
             return Ok(());
         }
@@ -1168,7 +1184,7 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
         Ok(_) => {}
     }
     #[cfg(target_os = "linux")]
-    if fresh.is_some() || update.is_some() {
+    if private.is_some() {
         return Err(
             "Both an adjacent and a private pair journal exist; preserve both for recovery".into(),
         );

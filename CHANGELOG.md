@@ -16,6 +16,8 @@ All notable changes to the `aerovault` crate are documented here.
 
 - If a stale detached sidecar leaves damaged blocks unrepaired, `vault repair` now exits with an explicit error. Version 0.6.8 could exit successfully with the damaged blocks still present.
 
+- On Linux, paired publication can use `~/.aerovault-state/journals` when a writable ancestor rules out the normal XDG state directory. AeroVault creates `~/.aerovault-state` with mode 0700 only when that fallback is needed. Opening checks the current XDG directory, the default state directory, and the fallback. If an interrupted update used a different custom XDG directory, restore the prior `XDG_STATE_HOME` before reopening. Recovery reports a conflict when more than one journal is found for the same vault.
+
 ### Added
 
 - Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The existing opt-in `AEROVAULT_V3_DATA_BUDGET_BYTES` setting still applies to callers that use the original entry points.

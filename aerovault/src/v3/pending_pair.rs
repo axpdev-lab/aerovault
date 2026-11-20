@@ -17,7 +17,7 @@ const PENDING: &str =
 #[cfg(target_os = "linux")]
 pub(super) mod fresh;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-mod state;
+pub(super) mod state;
 #[cfg(target_os = "linux")]
 pub(super) mod update;
 
@@ -45,9 +45,10 @@ pub(super) fn require_ordinary_at_open(
                 Ok(()) => PENDING.into(),
                 Err(error) => format!("{PENDING}; {error}"),
             },
-            Ok(false) => {
-                format!("{PENDING}; the originating recovery record is missing at this location")
-            }
+            #[cfg(target_os = "linux")]
+            Ok(false) => format!("{PENDING}; the originating recovery record is missing from the known state directories. If the interrupted operation used a different XDG_STATE_HOME, restore its previous value and reopen the vault"),
+            #[cfg(target_os = "macos")]
+            Ok(false) => format!("{PENDING}; the originating recovery record is missing at this location"),
             Err(error) => format!("{PENDING}; cannot validate local recovery state: {error}"),
         });
     }
@@ -72,4 +73,30 @@ pub(super) fn require_replaceable(path: &Path) -> Result<(), String> {
             "Read existing vault prefix before creation: {error}"
         )),
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recover_private(lock: &crate::lock::WriteLock, active: &Path) -> Result<(), String> {
+    use super::strip_transaction::TrustedJournal;
+    state::validate_active_root(super::vault::output_parent_dir(active))?;
+    TrustedJournal::open(active)?;
+    let exists = |name: &str| match std::fs::symlink_metadata(active.join(name)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Inspect private journal {} ({error})",
+            active.display()
+        )),
+    };
+    match (exists(fresh::RECORD)?, exists(update::RECORD)?) {
+        (true, false) => fresh::recover(lock, active)?,
+        (false, true) => update::recover(lock, active)?,
+        _ => {
+            return Err(format!(
+                "Private pair journal at {} has missing or conflicting records",
+                active.display()
+            ))
+        }
+    }
+    state::forget_location(lock.source_path())
 }
