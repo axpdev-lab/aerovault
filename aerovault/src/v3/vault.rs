@@ -2836,7 +2836,7 @@ fn open_vault_with_guard(
     // ranges and exclude unclaimed trailing padding from the allocation. Keep
     // the original header for sidecar geometry and header recovery.
     let data_len = if plaintext_header {
-        plaintext_chunk_extent(&manifest, header.data_len)?
+        plaintext_chunk_extent(&mut file, &header, &manifest, limits)?
     } else {
         header.data_len
     };
@@ -2886,23 +2886,78 @@ fn open_vault_with_guard(
     })
 }
 
-fn plaintext_chunk_extent(manifest: &VaultManifestV3, data_len: u64) -> Result<u64, String> {
+fn plaintext_chunk_extent(
+    file: &mut (impl Read + Seek),
+    header: &VaultHeaderV3,
+    manifest: &VaultManifestV3,
+    limits: VaultV3Limits,
+) -> Result<u64, String> {
     let mut extent = 0;
+    let mut framed_extent = 0;
+    let mut furthest = None;
+    let check_frames = limits.max_data_bytes.is_none() && header.data_len > MAX_BLOCK_SIZE;
     for record in manifest.chunks.values() {
         let end = record
             .data_offset
             .checked_add(8)
             .and_then(|start| start.checked_add(record.block_len));
-        let Some(end) = end.filter(|&end| record.block_len <= MAX_BLOCK_SIZE && end <= data_len)
+        let Some(end) =
+            end.filter(|&end| record.block_len <= MAX_BLOCK_SIZE && end <= header.data_len)
         else {
             return Err("AeroVault v3 chunk record exceeds the block limit or data section".into());
         };
-        extent = extent.max(end);
+        if end > extent {
+            extent = end;
+            furthest = Some(record);
+        }
+        if check_frames {
+            let offset = header
+                .data_offset
+                .checked_add(record.data_offset)
+                .ok_or("Plaintext block offset overflow")?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .map_err(|error| format!("Seek plaintext block length: {error}"))?;
+            let mut prefix = [0; 8];
+            file.read_exact(&mut prefix)
+                .map_err(|error| format!("Read plaintext block length: {error}"))?;
+            if u64::from_le_bytes(prefix) == record.block_len {
+                framed_extent = framed_extent.max(end);
+            }
+        }
+    }
+    // Repair can still see a damaged prefix within a verified extent, or one
+    // maximum-sized block beyond it. A damaged length prefix must not, by
+    // itself, authorize allocation across an arbitrarily large gap.
+    if check_frames && extent.saturating_sub(framed_extent) > MAX_BLOCK_SIZE {
+        let last = furthest.expect("a nonempty extent has a chunk record");
+        let body = header
+            .data_offset
+            .checked_add(last.data_offset)
+            .and_then(|offset| offset.checked_add(8))
+            .ok_or("Plaintext block offset overflow")?;
+        file.seek(std::io::SeekFrom::Start(body))
+            .map_err(|error| format!("Seek plaintext block content: {error}"))?;
+        let mut remaining = last.block_len;
+        let mut hash = blake3::Hasher::new();
+        let mut buffer = Zeroizing::new([0; 64 * 1024]);
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..count])
+                .map_err(|error| format!("Read plaintext block content: {error}"))?;
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        if hash.finalize().to_hex().as_str() != last.cipher_hash {
+            return Err(format!(
+                "Invalid plaintext block framing at byte {body}. If the archive is known and you are attempting repair, set an explicit {DATA_BUDGET_ENV} large enough for its {}-byte data section",
+                header.data_len
+            ));
+        }
     }
     Ok(extent)
 }
 
-fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<u64, String> {
+pub(super) fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<u64, String> {
     if header.data_offset != DATA_OFFSET {
         return Err("Invalid AeroVault v3 data offset".to_string());
     }
@@ -7155,6 +7210,59 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), original);
             assert_eq!(std::fs::read(&sidecar).unwrap(), recovery);
         }
+    }
+
+    #[test]
+    fn plaintext_framing_must_support_a_large_allocation() {
+        use std::io::{SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("normal.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"block framing and payload are separate checks").unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+
+        // Test the pre-allocation check with a raw data reader, without writing
+        // a vault with these large offsets or allocating an extent-sized buffer.
+        let mut bytes = tempfile::tempfile().unwrap();
+        let block_offset = MAX_BLOCK_SIZE + 4096;
+        let mut header = vault.header.clone();
+        header.data_len = block_offset + vault.data.len() as u64;
+        vault
+            .manifest
+            .chunks
+            .values_mut()
+            .next()
+            .unwrap()
+            .data_offset = block_offset;
+        bytes.set_len(header.data_offset + header.data_len).unwrap();
+        let check = |bytes: &mut std::fs::File, limits| {
+            plaintext_chunk_extent(bytes, &header, &vault.manifest, limits)
+        };
+        let error = check(&mut bytes, VaultV3Limits::default()).unwrap_err();
+        assert!(error.contains("Invalid plaintext block framing"), "{error}");
+        let limits = VaultV3Limits::default().with_max_data_bytes(header.data_len);
+        assert_eq!(check(&mut bytes, limits).unwrap(), header.data_len);
+
+        // A damaged prefix alone is repairable when the body confirms the
+        // chunk. A valid frame also establishes the extent even if the body
+        // is damaged and will need Error Correction later.
+        let position = header.data_offset + block_offset;
+        bytes.seek(SeekFrom::Start(position + 8)).unwrap();
+        bytes.write_all(&vault.data[8..]).unwrap();
+        assert_eq!(
+            check(&mut bytes, VaultV3Limits::default()).unwrap(),
+            header.data_len
+        );
+        bytes.seek(SeekFrom::Start(position)).unwrap();
+        bytes.write_all(&vault.data[..8]).unwrap();
+        bytes.write_all(&[vault.data[8] ^ 1]).unwrap();
+        assert_eq!(
+            check(&mut bytes, VaultV3Limits::default()).unwrap(),
+            header.data_len
+        );
     }
 
     #[cfg(target_os = "linux")]

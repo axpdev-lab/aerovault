@@ -133,6 +133,10 @@ pub(super) fn lookup_location(
                     &candidate.join(crate::v3::pending_pair::update::RECORD),
                     true,
                 )?
+                && !present(
+                    &candidate.join(crate::v3::pending_pair::update::PREPARATION),
+                    true,
+                )?
             {
                 continue;
             }
