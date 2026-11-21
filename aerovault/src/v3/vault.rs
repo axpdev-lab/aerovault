@@ -48,6 +48,7 @@ use crate::aerocrypt::{
 };
 
 const DATA_BUDGET_ENV: &str = "AEROVAULT_V3_DATA_BUDGET_BYTES";
+const MIN_ENV_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
 
 /// Optional resource policy for opening and editing a v3 container.
 ///
@@ -72,7 +73,7 @@ impl VaultV3Limits {
         let max_data_bytes = std::env::var(DATA_BUDGET_ENV)
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
-            .filter(|&size| (1024 * 1024 * 1024..=isize::MAX as u64).contains(&size));
+            .filter(|&size| (MIN_ENV_DATA_BUDGET..=isize::MAX as u64).contains(&size));
         Self { max_data_bytes }
     }
 
@@ -2948,9 +2949,10 @@ fn plaintext_chunk_extent(
             remaining -= count as u64;
         }
         if hash.finalize().to_hex().as_str() != last.cipher_hash {
+            let data_bytes = header.data_len;
+            let env_bytes = data_bytes.max(MIN_ENV_DATA_BUDGET);
             return Err(format!(
-                "Invalid plaintext block framing at byte {body}. If the archive is known and you are attempting repair, set an explicit {DATA_BUDGET_ENV} large enough for its {}-byte data section",
-                header.data_len
+                "Invalid plaintext block framing at byte {body}. For repair of a trusted archive with a {data_bytes}-byte data section, set {DATA_BUDGET_ENV}={env_bytes} (bytes) or use VaultV3Limits::with_max_data_bytes({data_bytes})"
             ));
         }
     }
@@ -7000,25 +7002,10 @@ mod tests {
         assert_vault_generation_current(&opened).unwrap();
     }
 
-    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-    #[test]
-    #[ignore = "requires a 64-bit host with room for multiple 4 GiB allocations and file extents"]
-    fn legacy_sparse_data_section_over_four_gib_can_be_resealed() {
+    fn put_plaintext_test_block_at(vault: &mut OpenVaultV3, block_offset: u64) -> VaultHeaderV3 {
         use super::super::manifest::serialize_manifest_plaintext;
         use std::io::Write;
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.aerozip");
-        let input = dir.path().join("input");
-        let payload = b"referenced block beyond 4 GiB";
-        std::fs::write(&input, payload).unwrap();
-        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
-        let mut vault = VaultV3::open_plaintext(&path).unwrap();
-        VaultV3::add_files(&mut vault, &[(input.clone(), "input".into())]).unwrap();
-
-        // Write the ordinary v3 layout accepted by 0.6.8. The data section
-        // is sparse, with a live block past 4 GiB and the manifest after it.
-        let block_offset = 4 * 1024 * 1024 * 1024 + 4096;
         assert_eq!(vault.manifest.chunks.len(), 1);
         vault
             .manifest
@@ -7037,14 +7024,33 @@ mod tests {
         header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
         header.extension_payload_len = 0;
         header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
-        let mut file = std::fs::File::create(&path).unwrap();
+        let mut file = std::fs::File::create(&vault.path).unwrap();
         file.write_all(&header.to_bytes()).unwrap();
         file.seek(std::io::SeekFrom::Start(header.data_offset + block_offset))
             .unwrap();
         file.write_all(&vault.data).unwrap();
         file.write_all(&manifest).unwrap();
         file.write_all(b"[]").unwrap();
-        drop(file);
+        header
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires a 64-bit host with room for multiple 4 GiB allocations and file extents"]
+    fn legacy_sparse_data_section_over_four_gib_can_be_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerozip");
+        let input = dir.path().join("input");
+        let payload = b"referenced block beyond 4 GiB";
+        std::fs::write(&input, payload).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input.clone(), "input".into())]).unwrap();
+
+        // Write the ordinary v3 layout accepted by 0.6.8. The data section
+        // is sparse, with a live block past 4 GiB and the manifest after it.
+        let block_offset = 4 * 1024 * 1024 * 1024 + 4096;
+        let header = put_plaintext_test_block_at(&mut vault, block_offset);
         drop(vault);
 
         let mut opened = VaultV3::open_plaintext(&path).unwrap();
@@ -7213,56 +7219,77 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_framing_must_support_a_large_allocation() {
+    fn plaintext_framing_requires_a_budget_to_repair_an_unverified_tail() {
         use std::io::{SeekFrom, Write};
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("normal.aerozip");
+        let path = dir.path().join("recovery.aerozip");
         let input = dir.path().join("input");
-        std::fs::write(&input, b"block framing and payload are separate checks").unwrap();
+        let payload = b"block framing and payload are separate checks".repeat(512);
+        std::fs::write(&input, &payload).unwrap();
         VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
-        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        let mut vault =
+            VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
         VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
 
-        // Test the pre-allocation check with a raw data reader, without writing
-        // a vault with these large offsets or allocating an extent-sized buffer.
-        let mut bytes = tempfile::tempfile().unwrap();
         let block_offset = MAX_BLOCK_SIZE + 4096;
-        let mut header = vault.header.clone();
-        header.data_len = block_offset + vault.data.len() as u64;
-        vault
-            .manifest
-            .chunks
-            .values_mut()
-            .next()
-            .unwrap()
-            .data_offset = block_offset;
-        bytes.set_len(header.data_offset + header.data_len).unwrap();
-        let check = |bytes: &mut std::fs::File, limits| {
-            plaintext_chunk_extent(bytes, &header, &vault.manifest, limits)
+        let header = put_plaintext_test_block_at(&mut vault, block_offset);
+        let intact_frame = std::mem::take(&mut vault.data);
+        drop(vault);
+        VaultV3::export_parity_with_limits(&path, "", None, VaultV3Limits::default()).unwrap();
+        let rewrite = |relative, bytes: &[u8]| {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(
+                header.data_offset + block_offset + relative,
+            ))
+            .unwrap();
+            file.write_all(bytes).unwrap();
         };
-        let error = check(&mut bytes, VaultV3Limits::default()).unwrap_err();
-        assert!(error.contains("Invalid plaintext block framing"), "{error}");
-        let limits = VaultV3Limits::default().with_max_data_bytes(header.data_len);
-        assert_eq!(check(&mut bytes, limits).unwrap(), header.data_len);
 
-        // A damaged prefix alone is repairable when the body confirms the
-        // chunk. A valid frame also establishes the extent even if the body
-        // is damaged and will need Error Correction later.
-        let position = header.data_offset + block_offset;
-        bytes.seek(SeekFrom::Start(position + 8)).unwrap();
-        bytes.write_all(&vault.data[8..]).unwrap();
-        assert_eq!(
-            check(&mut bytes, VaultV3Limits::default()).unwrap(),
-            header.data_len
+        // A damaged prefix alone can be repaired when the body confirms
+        // the frame. A valid prefix also permits ordinary body repair.
+        rewrite(0, &[0; 8]);
+        let damaged = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
+        assert_eq!(VaultV3::scrub(&damaged).len(), 1);
+        drop(damaged);
+        rewrite(0, &intact_frame[..8]);
+        rewrite(8, &[intact_frame[8] ^ 1]);
+        let damaged = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
+        assert_eq!(VaultV3::scrub(&damaged).len(), 1);
+        drop(damaged);
+
+        rewrite(0, &[0; 8]);
+        let before = super::super::strip_transaction::generation(&path).unwrap();
+        let error =
+            VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap_err();
+        assert!(error.contains("Invalid plaintext block framing"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "{DATA_BUDGET_ENV}={} (bytes)",
+                MIN_ENV_DATA_BUDGET
+            )),
+            "{error}"
         );
-        bytes.seek(SeekFrom::Start(position)).unwrap();
-        bytes.write_all(&vault.data[..8]).unwrap();
-        bytes.write_all(&[vault.data[8] ^ 1]).unwrap();
-        assert_eq!(
-            check(&mut bytes, VaultV3Limits::default()).unwrap(),
-            header.data_len
+        assert!(
+            error.contains(&format!(
+                "VaultV3Limits::with_max_data_bytes({})",
+                header.data_len
+            )),
+            "{error}"
         );
+        assert_eq!(
+            super::super::strip_transaction::generation(&path).unwrap(),
+            before
+        );
+
+        let limits = VaultV3Limits::default().with_max_data_bytes(header.data_len);
+        let mut recoverable = VaultV3::open_plaintext_with_limits(&path, limits).unwrap();
+        assert_eq!(VaultV3::repair(&mut recoverable, false, None).unwrap().0, 1);
+        assert!(VaultV3::scrub(&recoverable).is_empty());
+        let output = dir.path().join("restored");
+        VaultV3::extract_entry(&recoverable, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), payload);
+        assert_eq!(recoverable.data, intact_frame);
     }
 
     #[cfg(target_os = "linux")]
