@@ -2,7 +2,7 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
-## [0.7.0] - Unreleased
+## [0.7.0] - 2026-11-21
 
 ### Fixed
 
@@ -20,7 +20,7 @@ All notable changes to the `aerovault` crate are documented here.
 
 - On Linux, a reader can open the visible vault during a private publication while the file is in ordinary vault format. A file marked as pending requires pair recovery. An abandoned journal still recovers when the reader can acquire the lock.
 
-- Default opens check reported memory headroom before allocation. On Linux this includes reclaimable file cache and swap permitted by the cgroup hierarchy. Error Correction uses the same default memory policy and reports an error when its reconstruction buffers cannot fit.
+- Default opens check reported memory headroom before allocation. On Linux this includes reclaimable file cache and swap permitted by the cgroup hierarchy. On macOS it uses the system memory level and free swap, and on Windows the available commit charge and virtual address space. Error Correction uses the same default memory policy and reports an error when its reconstruction buffers cannot fit.
 
 - Saving a vault with embedded Error Correction can now report insufficient memory before regenerating parity. An explicit data budget bypasses the headroom estimate, and allocation failures still return errors.
 
@@ -33,6 +33,10 @@ All notable changes to the `aerovault` crate are documented here.
 ### Added
 
 - Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The original entry points honor `AEROVAULT_V3_DATA_BUDGET_BYTES` and report an error when a configured value falls outside the supported range.
+
+### Changed
+
+- The minimum `rand` requirement is now 0.8.7 and the minimum `tempfile` requirement 3.20. A project that pins an older release of either needs to update it.
 
 ## [0.6.9] - 2026-11-19
 
