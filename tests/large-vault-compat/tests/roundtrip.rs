@@ -14,7 +14,6 @@ use aerovault::v3::{
     block, constants, manifest, OpenVaultV3, VaultHeaderV3, VaultV3, VaultV3Limits,
 };
 use aerovault_068::v3::{CreateOptionsV3 as LegacyOptions, VaultV3 as LegacyVault};
-use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,13 +25,19 @@ const GIB: u64 = 1024 * MIB;
 const PASSWORD: &str = "large-fixture-original-password";
 const NEW_PASSWORD: &str = "large-fixture-rotated-password";
 
-fn random_file(path: &Path, size_mib: u64, seed: u64) -> [u8; 32] {
-    let mut rng = StdRng::seed_from_u64(seed);
+fn fixture_file(path: &Path, size_mib: u64, seed: u64) -> [u8; 32] {
+    let mut counter = seed;
     let mut file = File::create(path).unwrap();
     let mut digest = Sha256::new();
     let mut buf = vec![0; MIB as usize];
     for _ in 0..size_mib {
-        rng.fill_bytes(&mut buf);
+        // SplitMix64 keeps the fixture reproducible without compressible counter runs.
+        for word in buf.chunks_exact_mut(8) {
+            counter = counter.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mixed = (counter ^ (counter >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            word.copy_from_slice(&(mixed ^ (mixed >> 31)).to_le_bytes());
+        }
         file.write_all(&buf).unwrap();
         digest.update(&buf);
     }
@@ -81,8 +86,8 @@ fn check_legacy(plain: bool, near_four: bool) {
     let input_mib = if near_four { 4094 } else { 1024 };
     let extra_mib = if near_four { 4 } else { 1 };
     let hashes = [
-        ("base.bin", random_file(&original, input_mib, 12)),
-        ("extra.bin", random_file(&extra, extra_mib, 29)),
+        ("base.bin", fixture_file(&original, input_mib, 12)),
+        ("extra.bin", fixture_file(&extra, extra_mib, 29)),
     ];
 
     let seed_started = Instant::now();
@@ -180,7 +185,7 @@ fn plaintext_legacy_reads_live_block_beyond_four_gib() {
     let root = dir.path();
     let path = root.join("legacy.aerozip");
     let input = root.join("base.bin");
-    let expected = random_file(&input, 4098, 74);
+    let expected = fixture_file(&input, 4098, 74);
 
     LegacyVault::create(&LegacyOptions::new_plaintext(&path)).unwrap();
     let mut legacy = LegacyVault::open_plaintext(&path).unwrap();
