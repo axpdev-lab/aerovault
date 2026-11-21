@@ -7,10 +7,9 @@
 
 use super::fresh::{checked_fd, link_anonymous, publish_index, write_input, Destination};
 use super::state;
-use crate::error_correction::sidecar::AeroCorrectSidecarReader;
 use crate::lock::WriteLock;
 use crate::v3::constants::HEADER_SIZE;
-use crate::v3::ec::{container_sha256_reader, default_sidecar_path};
+use crate::v3::ec::default_sidecar_path;
 use crate::v3::format::VaultHeaderV3;
 use crate::v3::strip_transaction::{
     generation, hash_generation, private_dir, sync_dir, Generation, TrustedJournal,
@@ -434,9 +433,18 @@ fn portable_header(
 pub(in crate::v3) fn prepare(source: &Path, prefix: &str) -> Result<Preparation, String> {
     let destination = Destination::open(output_parent_dir(source))?;
     let root = state::select_root()?;
+    let key = state::source_key(source);
+    let directory = root.join(key.to_hex().as_str());
+    let retained = retained_path(&directory, key.as_bytes());
+    if directory.exists() && retained.exists() {
+        return Err(format!(
+            "Earlier completed pair journals at {} and {} block another paired write. Follow the completed-journal procedure in AEROVAULT-V3-SPEC.md",
+            directory.display(),
+            retained.display()
+        ));
+    }
     let prepared = private_dir(&root, prefix)
         .map_err(|error| format!("Prepare private pair journal: {error}"))?;
-    let key = state::source_key(source);
     let mut transaction = [0; 16];
     rand::rngs::OsRng.fill_bytes(&mut transaction);
     let draft = Draft {
@@ -451,7 +459,6 @@ pub(in crate::v3) fn prepare(source: &Path, prefix: &str) -> Result<Preparation,
         &serde_json::to_vec(&draft).map_err(|error| error.to_string())?,
     )?;
     sync_dir(prepared.path())?;
-    let directory = root.join(key.to_hex().as_str());
     publish_index(prepared.path(), &directory)?;
     sync_dir(&root)?;
     #[cfg(test)]
@@ -808,46 +815,53 @@ fn cleanup_phase(active: &Path) -> Result<Option<usize>, String> {
     Ok(outcome)
 }
 
-fn verify_current_pair(destination: &Destination, leaves: [&CStr; 2]) -> Result<(), String> {
-    let open = |leaf| {
-        let file = open_member(&destination.directory, leaf, libc::O_RDONLY)
-            .map_err(|error| format!("Open current pair: {error}"))?;
-        if !file
-            .metadata()
-            .map_err(|error| error.to_string())?
-            .is_file()
-        {
-            return Err("Current pair member is not a regular file".into());
-        }
-        Ok::<_, String>(file)
-    };
-    let mut vault = open(leaves[0])?;
+fn retained_path(active: &Path, source_key: &[u8; 32]) -> PathBuf {
+    output_parent_dir(active).join(format!(".aerostrip-completed-{}", hex::encode(source_key)))
+}
+
+fn retain_completed_journal(
+    destination: &Destination,
+    vault: &CStr,
+    active: &Path,
+    journal: TrustedJournal<'_>,
+    record: &Record,
+) -> Result<(), String> {
+    let mut current = open_member(&destination.directory, vault, libc::O_RDONLY)
+        .map_err(|error| format!("Open current vault: {error}"))?;
+    let metadata = current.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("Current vault is not a regular file".into());
+    }
     let mut raw = [0; HEADER_SIZE];
-    vault
+    current
         .read_exact(&mut raw)
         .map_err(|error| error.to_string())?;
     let header = VaultHeaderV3::from_bytes(&raw)?;
-    let (hash, length) = container_sha256_reader(&mut vault)?;
-    validate_ranges(&header, length)?;
-    let sidecar = AeroCorrectSidecarReader::open_automatic_destination(open(leaves[1])?)?;
-    if sidecar.total_len != length {
-        return Err("Current sidecar does not cover the current vault length".into());
+    validate_ranges(&header, metadata.len())?;
+    destination.recheck()?;
+    journal.recheck()?;
+
+    // The trusted record proves the earlier exchange finished or rolled
+    // back. The current header only classifies the file as ordinary; the
+    // caller must still authenticate it. Keep the old record and every
+    // recovery input because this path cannot verify the current MAC.
+    let retained = retained_path(active, &record.source_key);
+    match fs::symlink_metadata(&retained) {
+        Ok(_) => {
+            // One retained journal per vault and state root. Keep the second
+            // completed journal discoverable while allowing ordinary opens.
+            let previous = load(&TrustedJournal::open(&retained)?)?;
+            if previous.version != VERSION || previous.source_key != record.source_key {
+                return Err("Retained journal does not match the current vault".into());
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            publish_index(active, &retained)?;
+            sync_dir(output_parent_dir(active))
+        }
+        Err(error) => Err(format!("Inspect retained pair journal: {error}")),
     }
-    let expected_windows = [
-        (0, HEADER_SIZE as u64),
-        (header.manifest_offset, header.manifest_len),
-        (header.data_offset, header.data_len),
-    ];
-    if !sidecar
-        .segments()
-        .iter()
-        .map(|segment| (segment.window_offset, segment.window_len))
-        .eq(expected_windows)
-    {
-        return Err("Current sidecar does not cover the current vault regions".into());
-    }
-    sidecar.verify_binding(&hash)?;
-    destination.recheck()
 }
 
 fn cleanup_pair(
@@ -857,6 +871,7 @@ fn cleanup_pair(
     record: &Record,
     outcome: usize,
     leaves: [&CStr; 2],
+    allow_retaining: bool,
 ) -> Result<(), String> {
     destination.recheck()?;
     let phase = record.phases()[outcome];
@@ -864,14 +879,10 @@ fn cleanup_pair(
         read_snapshot(&destination.directory, leaf, &[expected.bytes.len]).as_ref() == Ok(expected)
     });
     if !exact_pair {
-        if outcome != 3 {
-            return Err("Visible pair changed before rollback cleanup".into());
+        if !allow_retaining {
+            return Err("Visible pair changed before cleanup".into());
         }
-        // A completed journal can become visible after a different XDG root
-        // was used to publish a newer pair. Reclaim only the old transaction,
-        // and only if the current sidecar identifies the current ordinary vault.
-        verify_current_pair(destination, leaves)
-            .map_err(|error| format!("Visible pair changed before cleanup: {error}"))?;
+        return retain_completed_journal(destination, leaves[0], active, journal, record);
     }
     if let Some(stage) = Stage::find(destination, &record.transaction)? {
         if stage.identity != record.stage {
@@ -939,7 +950,15 @@ fn finish(
     let phases = record.phases();
     if let Some(outcome) = cleanup_phase(active)? {
         sync_dir(active)?;
-        return cleanup_pair(destination, active, journal, &record, outcome, leaves);
+        return cleanup_pair(
+            destination,
+            active,
+            journal,
+            &record,
+            outcome,
+            leaves,
+            !publish,
+        );
     }
     let stage = Stage::open(destination, &record.transaction)?;
     if stage.identity != record.stage {
@@ -967,7 +986,7 @@ fn finish(
             check()?;
             stage.sync(destination)?;
             record_cleanup(active, 3)?;
-            return cleanup_pair(destination, active, journal, &record, 3, leaves);
+            return cleanup_pair(destination, active, journal, &record, 3, leaves, true);
         }
         Err(error) => return Err(error),
     };
@@ -1020,7 +1039,15 @@ fn finish(
     }
     stage.sync(destination)?;
     record_cleanup(active, expected)?;
-    cleanup_pair(destination, active, journal, &record, expected, leaves)
+    cleanup_pair(
+        destination,
+        active,
+        journal,
+        &record,
+        expected,
+        leaves,
+        !publish,
+    )
 }
 
 fn record_cleanup(active: &Path, outcome: usize) -> Result<(), String> {
@@ -1110,9 +1137,23 @@ mod tests {
                         b"isolated bytes that must survive all checkpoints"
                     );
                 }
-                "rotate-later" => {
+                "edit-new" | "edit-later" => {
+                    let password = if action == "edit-new" { NEW } else { LATER };
+                    let mut vault = VaultV3::open(&path, password).unwrap();
+                    VaultV3::create_directory(&mut vault, &action).unwrap();
+                }
+                "rotate-later" | "rotate-later-at-final" => {
                     let mut vault = VaultV3::open(&path, NEW).unwrap();
+                    if action == "rotate-later-at-final" {
+                        STOP_AFTER.with(|stop| stop.set(Some(3)));
+                    }
                     VaultV3::change_password(&mut vault, LATER).unwrap();
+                }
+                "reject-more-pairs" => {
+                    let mut vault = VaultV3::open(&path, LATER).unwrap();
+                    let error = VaultV3::change_password(&mut vault, NEW).unwrap_err();
+                    assert!(error.contains("block another paired write"), "{error}");
+                    assert!(error.contains(".aerostrip-completed-"), "{error}");
                 }
                 "open-later" => {
                     let vault = VaultV3::open(&path, LATER).unwrap();
@@ -1402,30 +1443,98 @@ mod tests {
         assert_eq!(bytes(&unpublished), original);
         assert!(active.is_dir() && moved.join("marker").is_file());
 
-        let unbound = make("unbound-current-sidecar");
-        run(&unbound, "rotate-3", 77);
-        let prior_sidecar = fs::read(default_sidecar_path(&unbound)).unwrap();
-        run(&unbound, "rotate-later@new-xdg", 0);
-        let latest = bytes(&unbound);
-        fs::write(default_sidecar_path(&unbound), prior_sidecar).unwrap();
-        let mixed = bytes(&unbound);
-        run(&unbound, "conflict", 0);
-        assert!(journal(&unbound).join(RECORD).is_file());
-        assert_eq!(bytes(&unbound), mixed);
-        fs::write(default_sidecar_path(&unbound), &latest[1]).unwrap();
-        run(&unbound, "open-later", 0);
-        assert_eq!(bytes(&unbound), latest);
-        cleanup(&unbound);
+        let original_record = |target: &Path| {
+            let active = journal(target);
+            load(&TrustedJournal::open(&active).unwrap()).unwrap()
+        };
+        let assert_retained = |target: &Path, record: &Record| {
+            let active = journal(target);
+            let retained = retained_path(&active, &record.source_key);
+            assert!(!active.exists());
+            assert!(retained.join(RECORD).is_file());
+            assert_eq!(
+                generation(&retained.join("old-vault")).unwrap(),
+                record.old_vault.bytes
+            );
+            assert_eq!(
+                generation(&retained.join("old-sidecar")).unwrap(),
+                record.old_sidecar.bytes
+            );
+        };
+
+        let edited = make("normal-save-with-stale-sidecar");
+        run(&edited, "rotate-3", 77);
+        let record = original_record(&edited);
+        let before = bytes(&edited);
+        run(&edited, "edit-new@new-xdg", 0);
+        let latest = bytes(&edited);
+        assert_ne!(latest[0], before[0]);
+        assert_eq!(latest[1], before[1]);
+        run(&edited, "open-new", 0);
+        assert_eq!(bytes(&edited), latest);
+        assert_retained(&edited, &record);
+
+        // A second supersession for this vault leaves one retained journal and
+        // one discoverable, completed journal, while the current vault opens.
+        run(&edited, "rotate-later-at-final", 77);
+        let second = original_record(&edited);
+        run(&edited, "edit-later@new-xdg", 0);
+        let latest = bytes(&edited);
+        run(&edited, "open-later", 0);
+        run(&edited, "reject-more-pairs", 0);
+        assert_eq!(bytes(&edited), latest);
+        let active = journal(&edited);
+        let retained = retained_path(&active, &record.source_key);
+        let retained_record = load(&TrustedJournal::open(&retained).unwrap()).unwrap();
+        assert_eq!(retained_record.transaction, record.transaction);
+        assert_eq!(original_record(&edited).transaction, second.transaction);
+        assert_ne!(second.transaction, record.transaction);
+        assert_eq!(
+            generation(&active.join("old-vault")).unwrap(),
+            second.old_vault.bytes
+        );
+        assert_eq!(
+            generation(&retained.join("old-vault")).unwrap(),
+            record.old_vault.bytes
+        );
+
+        // After moving the first completed journal to a private backup,
+        // normal recovery can retain the second one in the same slot.
+        let backup = base.join("completed-backup");
+        fs::rename(&retained, &backup).unwrap();
+        run(&edited, "open-later", 0);
+        assert_retained(&edited, &second);
+        assert_eq!(bytes(&edited), latest);
+        assert_eq!(
+            generation(&backup.join("old-vault")).unwrap(),
+            record.old_vault.bytes
+        );
+
+        let rolled_back = make("superseded-rollback");
+        let original = bytes(&rolled_back);
+        run(&rolled_back, "rotate-2", 77);
+        run(&rolled_back, "recover-4", 77);
+        assert_eq!(bytes(&rolled_back), original);
+        assert!(journal(&rolled_back).join("cleanup-original").is_dir());
+        let record = original_record(&rolled_back);
+        run(&rolled_back, "rotate-complete@new-xdg", 0);
+        let latest = bytes(&rolled_back);
+        run(&rolled_back, "open-new", 0);
+        assert_eq!(bytes(&rolled_back), latest);
+        assert_retained(&rolled_back, &record);
 
         for boundary in 3..=6 {
             let target = make(&format!("superseded-{boundary}"));
             run(&target, &format!("rotate-{boundary}"), 77);
-            assert!(journal(&target).join(RECORD).is_file());
+            let record = original_record(&target);
             run(&target, "rotate-later@new-xdg", 0);
             let latest = bytes(&target);
+            // A coherent sidecar and failure to authenticate the newer vault
+            // must leave the older recovery copies available.
+            run(&target, "reject-old", 0);
+            assert_retained(&target, &record);
             run(&target, "open-later", 0);
             assert_eq!(bytes(&target), latest);
-            assert!(!journal(&target).exists());
         }
 
         let rotated = make("rotate-cleanup-error");
@@ -1473,6 +1582,58 @@ mod tests {
         assert_eq!(bytes(&target), visible);
         assert_eq!(fs::read(&candidate).unwrap(), foreign);
         assert!(active.join(RECORD).is_file());
+    }
+
+    #[test]
+    fn explicit_xdg_and_aliased_home_recover_one_prepared_journal() {
+        let fixture = tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let alias = base.join("home-alias");
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let state_home = home.join(".local/state");
+        let shared = base.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o775)).unwrap();
+        let target = shared.join("vault.aerovault");
+        let run = |action, expected| {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(PATH, &target)
+                .env(ACTION, action)
+                .env("XDG_STATE_HOME", &state_home)
+                .env("HOME", &alias)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{action}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run("create", 0);
+        let before = generation(&target).unwrap();
+        run("rotate-7", 77);
+        let key = state::source_key(&target).to_hex();
+        let journal = state_home.join("aerovault/journals").join(key.as_str());
+        assert!(journal.join(PREPARATION).is_file());
+        let alias_journal = alias
+            .join(".local/state/aerovault/journals")
+            .join(key.as_str());
+        assert_eq!(
+            fs::metadata(&journal).unwrap().ino(),
+            fs::metadata(&alias_journal).unwrap().ino()
+        );
+
+        run("open-old", 0);
+        assert_eq!(generation(&target).unwrap(), before);
+        assert!(!journal.exists());
     }
 
     #[test]

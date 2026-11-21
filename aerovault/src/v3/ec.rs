@@ -205,15 +205,10 @@ fn container_sha256(data: &[u8]) -> [u8; 32] {
 }
 
 fn container_sha256_file(path: &Path) -> Result<([u8; 32], u64), String> {
-    let mut file = crate::source::open_regular(path).map_err(|e| e.to_string())?;
-    container_sha256_reader(&mut file)
-}
-
-pub(super) fn container_sha256_reader(file: &mut File) -> Result<([u8; 32], u64), String> {
     use sha2::{Digest, Sha256};
-    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut file = crate::source::open_regular(path).map_err(|e| e.to_string())?;
     let expected_len = file.metadata().map_err(|e| e.to_string())?.len();
-    let mut reader = Read::by_ref(file).take(expected_len);
+    let mut reader = Read::by_ref(&mut file).take(expected_len);
     let mut hash = Sha256::new();
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
     let mut len = 0u64;
@@ -814,8 +809,9 @@ pub(super) fn scrub_vault(vault: &OpenVaultV3) -> Vec<DamagedChunk> {
     let mut chunks: Vec<_> = vault.manifest.chunks.values().cloned().collect();
     chunks.sort_by_key(|c| c.data_offset);
 
-    for rec in chunks {
+    for mut rec in chunks {
         let start = rec.data_offset as usize;
+        rec.data_offset = vault.file_data_offset(&rec);
         // A corrupted length prefix can make `data_offset` (or the stored block
         // length below) point near usize::MAX; every offset add is checked so a
         // hostile manifest is reported as damaged instead of panicking on

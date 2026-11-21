@@ -575,7 +575,7 @@ impl<'a> TrustedJournal<'a> {
         Ok(journal)
     }
 
-    fn recheck(&self) -> Result<(), String> {
+    pub(super) fn recheck(&self) -> Result<(), String> {
         let current = super::extraction_stage::directory_identity(self.path)
             .map_err(|e| format!("strip journal directory unavailable: {e}"))?;
         if current != self.directory {

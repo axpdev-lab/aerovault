@@ -221,6 +221,7 @@ fn plaintext_legacy_reads_live_block_beyond_four_gib() {
     drop(stored);
 
     let limits = VaultV3Limits::default();
+    let original_container = file_hash(&path);
     VaultV3::export_parity_with_limits(&path, "", None, limits).unwrap();
     // Keep the legacy length prefix intact and damage only its stored body.
     let mut data = OpenOptions::new()
@@ -239,6 +240,9 @@ fn plaintext_legacy_reads_live_block_beyond_four_gib() {
     let mut vault = VaultV3::open_plaintext_with_limits(&path, limits).unwrap();
     assert_eq!(VaultV3::scrub(&vault).len(), 1);
     assert_eq!(VaultV3::repair(&mut vault, false, None).unwrap().0, 1);
+    drop(vault);
+    assert_eq!(file_hash(&path), original_container);
+    let vault = VaultV3::open_plaintext_with_limits(&path, limits).unwrap();
     assert!(VaultV3::scrub(&vault).is_empty());
     verify_files(&vault, &root.join("extracted"), &[("base.bin", expected)]);
 }
