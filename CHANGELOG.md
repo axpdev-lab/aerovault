@@ -14,6 +14,10 @@ All notable changes to the `aerovault` crate are documented here.
 
 - On Linux, stripping embedded recovery or changing the password with a detached sidecar can also use private recovery state in group-writable directories. On supported filesystems, atomic exchanges retain the displaced files while the vault and sidecar are published. An interrupted update temporarily blocks normal reads until recovery can verify both generations. Existing adjacent recovery journals remain supported.
 
+- On Linux, recovery cleans up interrupted pair preparation before a retry. It also completes cleanup of an earlier rotation after a later rotation in a different XDG state directory, once the latest vault and its sidecar are verified as a pair.
+
+- Plaintext opening checks block framing before allocating a large data section. If damage prevents the archive from confirming a large extent, AeroVault reports the explicit byte budget needed to attempt repair. Intact large archives retain the default open and repair behavior.
+
 - If a stale detached sidecar leaves damaged blocks unrepaired, `vault repair` now exits with an explicit error. Version 0.6.8 could exit successfully with the damaged blocks still present.
 
 - On Linux, paired publication can use `~/.aerovault-state/journals` when a writable ancestor rules out the normal XDG state directory. AeroVault creates `~/.aerovault-state` with mode 0700 only when that fallback is needed. Opening checks the current XDG directory, the default state directory, and the fallback. If an interrupted update used a different custom XDG directory, restore the prior `XDG_STATE_HOME` before reopening. Recovery reports a conflict when more than one journal is found for the same vault.
