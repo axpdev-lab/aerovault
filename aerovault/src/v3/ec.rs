@@ -303,29 +303,25 @@ pub(super) fn empty_sidecar_bytes(container_bytes: &[u8]) -> Vec<u8> {
 /// Collect the live on-disk blocks in data-section order ([u64 len][ciphertext]),
 /// the exact stream the Error Correction parity is computed over. A block whose
 /// recorded range falls outside the data section contributes an empty slice.
-fn collect_live_block_refs(vault: &OpenVaultV3) -> Vec<&[u8]> {
-    let mut ranges: Vec<(usize, usize)> = vault
-        .manifest
-        .chunks
-        .values()
-        .map(|rec| (rec.data_offset as usize, rec.block_len as usize))
-        .collect();
-    ranges.sort_by_key(|(off, _)| *off);
-    ranges
+pub(super) fn collect_live_block_refs(vault: &OpenVaultV3) -> Vec<&[u8]> {
+    vault
+        .frames_in_storage_order()
         .into_iter()
-        .map(|(start, block_len)| {
+        .map(|record| -> &[u8] {
             // Every add is checked: a corrupted manifest can drive data_offset or
             // block_len near usize::MAX. An out-of-range block contributes an empty
             // slice instead of panicking (matches scrub_vault's hardening). Repair
             // re-verifies each block, so a dropped range can only make repair fail,
             // never corrupt good data (CLAUDE-AV-ECC unchecked-add hardening).
-            let end = block_len
-                .checked_add(8)
-                .and_then(|full| start.checked_add(full));
-            match end {
-                Some(end) if end <= vault.data.len() => &vault.data[start..end],
-                _ => &[] as &[u8],
-            }
+            let (Ok(start), Ok(len)) = (
+                usize::try_from(record.data_offset),
+                usize::try_from(record.block_len),
+            ) else {
+                return &[];
+            };
+            let end = len.checked_add(8).and_then(|full| start.checked_add(full));
+            end.and_then(|end| vault.data.get(start..end))
+                .unwrap_or(&[])
         })
         .collect()
 }
@@ -913,17 +909,11 @@ pub(super) fn repair_vault(
     let mut repaired_count = 0;
 
     if let Some(error_correction_b) = error_correction_bytes {
-        let mut ordered: Vec<(String, ChunkRecordV3)> = vault
-            .manifest
-            .chunks
-            .iter()
-            .map(|(id, r)| (id.clone(), r.clone()))
-            .collect();
-        ordered.sort_by_key(|(_, r)| r.data_offset);
+        let ordered = vault.frames_in_storage_order();
         // On the plaintext lane block_len comes from an unauthenticated manifest
         // and sizes the buffers below: bound each block like every other reader,
         // and the total by the data section, since live blocks never overlap.
-        let total = ordered.iter().try_fold(0u64, |acc, (_, r)| {
+        let total = ordered.iter().try_fold(0u64, |acc, r| {
             (r.block_len <= MAX_BLOCK_SIZE)
                 .then(|| acc.checked_add(8 + r.block_len))
                 .flatten()
@@ -937,7 +927,7 @@ pub(super) fn repair_vault(
         let mut blocks = zeroize::Zeroizing::new(
             ordered
                 .iter()
-                .map(|(_, rec)| {
+                .map(|rec| {
                     let start = rec.data_offset as usize;
                     let full = 8 + rec.block_len as usize;
                     // Always a fixed-length (8 + block_len) buffer so the
@@ -957,7 +947,7 @@ pub(super) fn repair_vault(
 
         let bad_indices: Vec<usize> = damaged
             .iter()
-            .filter_map(|d| ordered.iter().position(|(id, _)| id == &d.record.id))
+            .filter_map(|d| ordered.iter().position(|rec| rec.id == d.record.id))
             .collect();
 
         let _ = reconstruct_from_error_correction(&mut blocks, &error_correction_b)?;
@@ -986,8 +976,8 @@ pub(super) fn repair_vault(
                 return false;
             };
             blk.len() == full_len
-                && body_u64 == ordered[i].1.block_len
-                && blake3::hash(&blk[8..8 + body]).to_hex().to_string() == ordered[i].1.cipher_hash
+                && body_u64 == ordered[i].block_len
+                && blake3::hash(&blk[8..8 + body]).to_hex().to_string() == ordered[i].cipher_hash
         };
         let all_verified = blocks.iter().enumerate().all(|(i, _)| block_verified(i));
 
@@ -996,7 +986,8 @@ pub(super) fn repair_vault(
             if !dry_run {
                 let mut new_data = zeroize::Zeroizing::new(Vec::new());
                 let mut new_chunks = BTreeMap::new();
-                for (i, (id, mut rec)) in ordered.into_iter().enumerate() {
+                for (i, rec) in ordered.into_iter().enumerate() {
+                    let mut rec = rec.clone();
                     rec.data_offset = new_data.len() as u64;
                     if blocks[i].len() >= 8 {
                         rec.block_len = u64::from_le_bytes(blocks[i][0..8].try_into().unwrap());
@@ -1004,7 +995,7 @@ pub(super) fn repair_vault(
                     crate::secret::reserve(&mut new_data, blocks[i].len())
                         .map_err(|e| e.to_string())?;
                     new_data.extend_from_slice(&blocks[i]);
-                    new_chunks.insert(id, rec);
+                    new_chunks.insert(rec.id.clone(), rec);
                 }
                 let mut old_data = zeroize::Zeroizing::new(std::mem::replace(
                     &mut vault.data,

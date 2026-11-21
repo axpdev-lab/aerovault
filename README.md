@@ -184,7 +184,7 @@ V3 keeps stored data in memory. Plaintext archives load their declared frames wi
 
 Embedders can cap the stored data section by passing `VaultV3Limits::default().with_max_data_bytes(bytes)` to `VaultV3::open_with_limits` or `VaultV3::open_plaintext_with_limits`. The handle applies the same limit to later writes. Detached export and strip also provide `*_with_limits` variants. This limit covers stored data bytes. Compression, encryption and recovery may need additional memory. A pending recovery journal may be finished before the open checks the budget.
 
-For CLI use and existing library entry points, `AEROVAULT_V3_DATA_BUDGET_BYTES` remains an optional decimal-byte limit of at least 1 GiB. Explicit limits are independent of that environment variable.
+For CLI use and existing library entry points, `AEROVAULT_V3_DATA_BUDGET_BYTES` is an optional decimal-byte limit from 1 GiB to the platform allocation limit. An invalid configured value returns an error. Explicit library limits are independent of that variable.
 
 ### Error Correction API
 

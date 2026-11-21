@@ -361,25 +361,79 @@ pub(super) fn copy_file_capped(
     target: &Path,
     limit: u64,
 ) -> Result<Generation, String> {
-    let mut copied = 0u64;
     let mut input = crate::source::open_regular_no_follow(source).map_err(|e| e.to_string())?;
-    let mut output = private_options().open(target).map_err(|e| e.to_string())?;
-    let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
-    loop {
-        let n = input.read(&mut *buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        copied = copied
-            .checked_add(n as u64)
-            .ok_or("Recovery copy length overflow")?;
-        if copied > limit {
-            return Err("Recovery input grew beyond its validated copy bound".into());
-        }
-        output.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    let expected = input.metadata().map_err(|e| e.to_string())?.len();
+    if expected > limit {
+        return Err("Recovery input grew beyond its validated copy bound".into());
     }
+    let mut output = private_options().open(target).map_err(|e| e.to_string())?;
+    copy_recovery_data(&mut input, &mut output, expected, 0).map_err(|e| e.to_string())?;
     output.sync_all().map_err(|e| e.to_string())?;
     generation(target)
+}
+
+pub(super) fn copy_recovery_data(
+    input: &mut fs::File,
+    output: &mut fs::File,
+    expected: u64,
+    output_offset: u64,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Seek, SeekFrom};
+
+    let output_len = output_offset
+        .checked_add(expected)
+        .ok_or(ErrorKind::InvalidInput)?;
+    let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
+    let mut copy_range = |input: &mut fs::File,
+                          output: &mut fs::File,
+                          range: std::ops::Range<u64>|
+     -> std::io::Result<()> {
+        input.seek(SeekFrom::Start(range.start))?;
+        output.seek(SeekFrom::Start(output_offset + range.start))?;
+        let mut remaining = range.end - range.start;
+        while remaining > 0 {
+            let n = remaining.min(buf.len() as u64) as usize;
+            input.read_exact(&mut buf[..n])?;
+            output.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
+        Ok(())
+    };
+    let mut cursor = 0;
+    #[cfg(windows)]
+    let mut marked_sparse = false;
+    while cursor < expected {
+        match super::sparse::data_range(input, cursor, expected) {
+            Ok(Some(range)) => {
+                #[cfg(windows)]
+                if range.start > cursor && !marked_sparse {
+                    marked_sparse = super::sparse::mark_sparse_if_supported(output)?;
+                }
+                cursor = range.end;
+                copy_range(input, output, range)?;
+            }
+            Ok(None) => {
+                #[cfg(windows)]
+                if !marked_sparse {
+                    super::sparse::mark_sparse_if_supported(output)?;
+                }
+                break;
+            }
+            Err(_) => {
+                // A volume without extent queries still gets a full byte copy.
+                copy_range(input, output, 0..expected)?;
+                break;
+            }
+        }
+    }
+    if input.metadata()?.len() != expected {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery input changed length while being copied",
+        ));
+    }
+    output.set_len(output_len)?;
+    Ok(())
 }
 
 fn replace_from(
@@ -395,17 +449,8 @@ fn replace_from(
         .prefix("replacement-")
         .tempfile_in(private.path())
         .map_err(|e| e.to_string())?;
-    let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
-    let mut remaining = expected.len;
-    while remaining > 0 {
-        let n = remaining.min(buf.len() as u64) as usize;
-        input.read_exact(&mut buf[..n]).map_err(|e| e.to_string())?;
-        temp.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        remaining -= n as u64;
-    }
-    if input.read(&mut buf[..1]).map_err(|e| e.to_string())? != 0 {
-        return Err("strip rollback copy grew while being read".into());
-    }
+    copy_recovery_data(&mut input, temp.as_file_mut(), expected.len, 0)
+        .map_err(|e| e.to_string())?;
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
     #[cfg(all(test, target_os = "macos"))]
     if let Some(inspect) = INSPECT_ROLLBACK_STAGE.with(|h| h.borrow_mut().take()) {
@@ -1134,8 +1179,16 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
                 super::pending_pair::state::pending_location(&source),
                 Ok(None)
             ) {
-                let lock =
-                    crate::lock::acquire_without_recovery(&source).map_err(|e| e.to_string())?;
+                let lock = crate::lock::try_acquire_without_recovery(&source).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        format!(
+                            "Vault publication is in progress (lock {}); retry after the writer finishes",
+                            crate::lock::lock_path(&source).display()
+                        )
+                    } else {
+                        e.to_string()
+                    }
+                })?;
                 return recover_under_guard(&lock);
             }
             return Ok(());

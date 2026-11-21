@@ -16,7 +16,9 @@ All notable changes to the `aerovault` crate are documented here.
 
 - On Linux, recovery cleans up interrupted pair preparation before a retry. If a different XDG state directory was used before a later save, AeroVault can continue to normal vault authentication once the earlier journal proves its exchange or rollback finished. In that case it retains the earlier journal and recovery copies in private state, with one retained slot per vault and state directory.
 
-- Plaintext archives can repair damaged frames without loading intervening gaps. By default, the claimed frames must fit within the bytes backed by storage. Scrub reports the on-disk offsets and repairs keep existing frames at those offsets.
+- Plaintext archives load and repair frames without allocating intervening gaps. The default limit uses logical data ranges, including on compressed filesystems. Filesystems without extent queries use the file's logical length. Sparse saves preserve frame offsets and Error Correction order, including after a delete. Rollback copies preserve holes on supported filesystems.
+
+- On Linux, opening a vault with a private recovery journal reports an active publisher immediately. An abandoned journal still recovers when the reader can acquire the lock.
 
 - If a stale detached sidecar leaves damaged blocks unrepaired, `vault repair` now exits with an explicit error. Version 0.6.8 could exit successfully with the damaged blocks still present.
 
@@ -24,7 +26,7 @@ All notable changes to the `aerovault` crate are documented here.
 
 ### Added
 
-- Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The existing opt-in `AEROVAULT_V3_DATA_BUDGET_BYTES` setting still applies to callers that use the original entry points.
+- Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The original entry points honor `AEROVAULT_V3_DATA_BUDGET_BYTES` and report an error when a configured value falls outside the supported range.
 
 ## [0.6.9] - 2026-11-19
 

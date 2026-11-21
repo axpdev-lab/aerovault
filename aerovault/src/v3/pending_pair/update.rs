@@ -273,23 +273,19 @@ impl Stage {
             target
                 .write_all(prefix)
                 .map_err(|error| error.to_string())?;
-            target
-                .seek(SeekFrom::Start(offset))
-                .map_err(|error| error.to_string())?;
             body_offset = offset;
         }
         let observed = expected
             .len
             .checked_add(body_offset)
             .ok_or("Pending pair image is too large")?;
-        let copied = io::copy(
-            &mut Read::by_ref(&mut input).take(expected.len),
+        super::super::strip_transaction::copy_recovery_data(
+            &mut input,
             &mut target,
+            expected.len,
+            body_offset,
         )
         .map_err(|error| format!("Copy protected pair input: {error}"))?;
-        if copied != expected.len || input.read(&mut [0]).map_err(|error| error.to_string())? != 0 {
-            return Err("Protected pair input changed length".into());
-        }
         // The pending image carries an intact prior vault. Verify its payload
         // separately because the portable header is also part of the image.
         if envelope.is_some() {
@@ -1175,6 +1171,58 @@ mod tests {
                 "reject-old" => {
                     assert!(VaultV3::open(&path, OLD).is_err());
                 }
+                "reject-invalid-mac" => {
+                    let error = VaultV3::open(&path, LATER).unwrap_err();
+                    assert!(error.contains("header MAC mismatch"), "{error}");
+                }
+                "open-during-private-publication" => {
+                    let publisher = crate::lock::acquire_without_recovery(&path).unwrap();
+                    crate::lock::set_short_wait_for_this_thread();
+                    // Release exactly at contention. A waiting reader would
+                    // retry, acquire the lock and recover this draft.
+                    crate::lock::ON_LOCK_CONTENTION.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || drop(publisher)));
+                    });
+                    let started = std::time::Instant::now();
+                    let error = VaultV3::open(&path, OLD).unwrap_err();
+                    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+                    assert!(
+                        error.contains("Vault publication is in progress"),
+                        "{error}"
+                    );
+                    assert!(error.contains("retry after the writer finishes"), "{error}");
+                    let lock_path = crate::lock::lock_path(&path);
+                    assert!(error.contains(lock_path.to_str().unwrap()), "{error}");
+                }
+                "create-sparse" => {
+                    VaultV3::create_with_error_correction(
+                        &CreateOptionsV3::new_plaintext(&path),
+                        RecoveryPlacement::Both,
+                        20,
+                    )
+                    .unwrap();
+                    let mut vault = VaultV3::open_plaintext(&path).unwrap();
+                    let input = path.with_file_name("input");
+                    fs::write(&input, b"sparse strip fixture").unwrap();
+                    VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(64 * 1024 * 1024)
+                        .unwrap();
+                    VaultV3::export_parity(&path, "", None).unwrap();
+                }
+                "strip-sparse-prepared" => {
+                    STOP_AFTER.with(|stop| stop.set(Some(0)));
+                    VaultV3::strip_parity(&path, "", false).unwrap();
+                    panic!("strip must stop at prepared publication");
+                }
+                "strip-sparse-complete" => {
+                    VaultV3::strip_parity(&path, "", false).unwrap();
+                    let vault = VaultV3::open_plaintext(&path).unwrap();
+                    assert_eq!(VaultV3::list(&vault).len(), 1);
+                }
                 "rotate-cleanup-error" => {
                     let mut vault = VaultV3::open(&path, OLD).unwrap();
                     FAIL_CLEANUP.with(|fail| fail.set(true));
@@ -1263,25 +1311,7 @@ mod tests {
         let xdg = base.join("state");
         let root = xdg.join("aerovault/journals");
         let run = |target: &Path, action: &str, expected: i32| {
-            let (action, state_home) = match action.strip_suffix("@new-xdg") {
-                Some(action) => (action, base.join("new-state")),
-                None => (action, xdg.clone()),
-            };
-            let child = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
-                .env(PATH, target)
-                .env(ACTION, action)
-                .env("HOME", &home)
-                .env("XDG_STATE_HOME", state_home)
-                .output()
-                .unwrap();
-            assert_eq!(
-                child.status.code(),
-                Some(expected),
-                "{action}: {}{}",
-                String::from_utf8_lossy(&child.stdout),
-                String::from_utf8_lossy(&child.stderr)
-            );
+            run_update_test_case(target, &home, &xdg, action, expected);
         };
         let make = |label: &str| {
             let directory = base.join(label);
@@ -1590,6 +1620,140 @@ mod tests {
         assert!(active.join(RECORD).is_file());
     }
 
+    fn run_update_test_case(target: &Path, home: &Path, xdg: &Path, action: &str, expected: i32) {
+        let (action, state_home) = match action.strip_suffix("@new-xdg") {
+            Some(action) => (action, xdg.with_file_name("new-state")),
+            None => (action, xdg.to_path_buf()),
+        };
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(PATH, target)
+            .env(ACTION, action)
+            .env("HOME", home)
+            .env("XDG_STATE_HOME", state_home)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(expected),
+            "{action}: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    fn private_update_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let fixture = tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let base = fixture.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
+        let shared = base.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o775)).unwrap();
+        (fixture, home, base.join("state"), shared)
+    }
+
+    #[test]
+    fn invalid_successor_mac_with_matching_binding_preserves_recovery_assets() {
+        let (_fixture, home, xdg, directory) = private_update_fixture();
+        let target = directory.join("vault.aerovault");
+        let run = |target: &Path, action: &str, expected: i32| {
+            run_update_test_case(target, &home, &xdg, action, expected);
+        };
+        let bytes = |target: &Path| {
+            [
+                fs::read(target).unwrap(),
+                fs::read(default_sidecar_path(target)).unwrap(),
+            ]
+        };
+        run(&target, "create", 0);
+        run(&target, "rotate-4", 77);
+        let active = xdg
+            .join("aerovault/journals")
+            .join(state::source_key(&target).to_hex().as_str());
+        let record = load(&TrustedJournal::open(&active).unwrap()).unwrap();
+        let retained = retained_path(&active, &record.source_key);
+        let stage = target
+            .parent()
+            .unwrap()
+            .join(Stage::name(&record.transaction).to_str().unwrap());
+        let copies = PREPARED_FILES.map(|leaf| generation(&active.join(leaf)).unwrap());
+        let slots = SLOTS.map(|leaf| generation(&stage.join(leaf.to_str().unwrap())).unwrap());
+        run(&target, "rotate-later@new-xdg", 0);
+        let [mut vault, sidecar] = bytes(&target);
+        let mut header = VaultHeaderV3::from_bytes(&vault).unwrap();
+        header.header_mac[0] ^= 1;
+        vault[..HEADER_SIZE].copy_from_slice(&header.to_bytes());
+        use crate::error_correction::sidecar::AeroCorrectSidecar;
+        use sha2::{Digest, Sha256};
+        let mut segments = AeroCorrectSidecar::from_bytes(&sidecar).unwrap().segments;
+        // This fixture has no header repair path. The binding and the region
+        // directory still describe the current vault exactly.
+        segments[0].avec_bytes.clear();
+        let digest: [u8; 32] = Sha256::digest(&vault).into();
+        let sidecar = AeroCorrectSidecar::new(digest, vault.len() as u64, segments).to_bytes();
+        AeroCorrectSidecar::from_bytes(&sidecar)
+            .unwrap()
+            .verify_binding(&digest)
+            .unwrap();
+        fs::write(&target, &vault).unwrap();
+        fs::write(default_sidecar_path(&target), &sidecar).unwrap();
+        run(&target, "reject-invalid-mac", 0);
+        assert_eq!(bytes(&target), [vault, sidecar]);
+        assert_eq!(
+            load(&TrustedJournal::open(&retained).unwrap())
+                .unwrap()
+                .transaction,
+            record.transaction
+        );
+        assert_eq!(
+            PREPARED_FILES.map(|leaf| generation(&retained.join(leaf)).unwrap()),
+            copies
+        );
+        assert_eq!(
+            SLOTS.map(|leaf| generation(&stage.join(leaf.to_str().unwrap())).unwrap()),
+            slots
+        );
+    }
+
+    #[test]
+    fn sparse_strip_preserves_exact_private_and_portable_copies() {
+        let (_fixture, home, xdg, directory) = private_update_fixture();
+        let run = |target: &Path, action: &str, expected: i32| {
+            run_update_test_case(target, &home, &xdg, action, expected);
+        };
+        let target = directory.join("vault.aerozip");
+        run(&target, "create-sparse", 0);
+        let logical_size = target.metadata().unwrap().len();
+        if target.metadata().unwrap().blocks() * 512 < logical_size / 8 {
+            let before = generation(&target).unwrap();
+            run(&target, "strip-sparse-prepared", 77);
+            let active = xdg
+                .join("aerovault/journals")
+                .join(state::source_key(&target).to_hex().as_str());
+            let record = load(&TrustedJournal::open(&active).unwrap()).unwrap();
+            let stage = target
+                .parent()
+                .unwrap()
+                .join(Stage::name(&record.transaction).to_str().unwrap());
+            let old = active.join("old-vault");
+            assert_eq!(generation(&old).unwrap(), before);
+            for path in [old, stage.join(SLOTS[0].to_str().unwrap())] {
+                let bytes = path.metadata().unwrap().blocks() * 512;
+                assert!(
+                    bytes < logical_size / 8,
+                    "{} allocated {bytes} bytes",
+                    path.display()
+                );
+            }
+            run(&target, "strip-sparse-complete", 0);
+            assert!(!active.exists());
+        }
+    }
+
     #[test]
     fn explicit_xdg_and_aliased_home_recover_one_prepared_journal() {
         let fixture = tempfile::Builder::new()
@@ -1637,6 +1801,8 @@ mod tests {
             fs::metadata(&alias_journal).unwrap().ino()
         );
 
+        run("open-during-private-publication", 0);
+        assert!(journal.join(PREPARATION).is_file());
         run("open-old", 0);
         assert_eq!(generation(&target).unwrap(), before);
         assert!(!journal.exists());

@@ -27,6 +27,7 @@ pub mod format;
 pub mod manifest;
 pub mod packing;
 mod pending_pair;
+mod sparse;
 pub(crate) mod strip_transaction;
 pub mod telemetry;
 #[cfg(unix)]

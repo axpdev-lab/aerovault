@@ -68,13 +68,24 @@ impl VaultV3Limits {
         self
     }
 
-    fn from_env() -> Self {
+    fn from_env() -> Result<Self, String> {
         // Keep the valid values accepted by 0.6.9 when set explicitly.
-        let max_data_bytes = std::env::var(DATA_BUDGET_ENV)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|&size| (MIN_ENV_DATA_BUDGET..=isize::MAX as u64).contains(&size));
-        Self { max_data_bytes }
+        let invalid = || {
+            format!(
+                "{DATA_BUDGET_ENV} must be an integer byte count in {MIN_ENV_DATA_BUDGET}..={}",
+                isize::MAX
+            )
+        };
+        let value = match std::env::var(DATA_BUDGET_ENV) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+        };
+        let max = value.parse::<u64>().map_err(|_| invalid())?;
+        if !(MIN_ENV_DATA_BUDGET..=isize::MAX as u64).contains(&max) {
+            return Err(invalid());
+        }
+        Ok(Self::default().with_max_data_bytes(max))
     }
 
     fn check_data_len(self, size: u64) -> Result<(), String> {
@@ -250,6 +261,12 @@ impl OpenVaultV3 {
             .unwrap_or(record.data_offset)
     }
 
+    pub(super) fn frames_in_storage_order(&self) -> Vec<&ChunkRecordV3> {
+        let mut records: Vec<_> = self.manifest.chunks.values().collect();
+        sort_stored_frames(&mut records, Some(&self.plaintext_file_offsets));
+        records
+    }
+
     /// Attach an embedder telemetry sink to receive content-pipeline events for
     /// the operations run on this open vault (see [`super::telemetry`]). Without
     /// one the pipeline emits nothing; attaching one never changes the bytes
@@ -380,7 +397,7 @@ impl VaultV3 {
         password: &str,
         out: Option<&Path>,
     ) -> Result<super::ec::ExportParityResult, String> {
-        Self::export_parity_with_limits(vault_path, password, out, VaultV3Limits::from_env())
+        Self::export_parity_with_limits(vault_path, password, out, VaultV3Limits::from_env()?)
     }
 
     /// Export a sidecar with an explicit data budget, independent of the environment.
@@ -402,7 +419,7 @@ impl VaultV3 {
         password: &str,
         force: bool,
     ) -> Result<super::ec::StripParityResult, String> {
-        Self::strip_parity_with_limits(vault_path, password, force, VaultV3Limits::from_env())
+        Self::strip_parity_with_limits(vault_path, password, force, VaultV3Limits::from_env()?)
     }
 
     /// Strip embedded parity with an explicit data budget, independent of the environment.
@@ -480,7 +497,7 @@ impl VaultV3 {
     /// password unlock into an unencrypted archive whose later writes are stored
     /// in the clear. Open those with [`VaultV3::open_plaintext`].
     pub fn open(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
-        Self::open_with_limits(path, password, VaultV3Limits::from_env())
+        Self::open_with_limits(path, password, VaultV3Limits::from_env()?)
     }
 
     /// Open an encrypted vault using the caller's limits instead of the environment.
@@ -501,7 +518,7 @@ impl VaultV3 {
     /// Open a plaintext (`.aerovz`) container, which has no password.
     /// Errors if the container is an encrypted `.aerovault`.
     pub fn open_plaintext(path: impl Into<PathBuf>) -> Result<OpenVaultV3, String> {
-        Self::open_plaintext_with_limits(path, VaultV3Limits::from_env())
+        Self::open_plaintext_with_limits(path, VaultV3Limits::from_env()?)
     }
 
     /// Open the plaintext lane with an explicit budget retained by the handle.
@@ -1517,9 +1534,22 @@ fn append_sources_batched(
     Ok(())
 }
 
-/// Garbage-collect orphaned chunks: keep only chunk records still referenced by
-/// a live entry, rewrite the data section in block-index order, and remap each
-/// surviving record's `data_offset`.
+/// In a sparse layout new frames are appended after all existing disk offsets.
+/// Otherwise the records already carry the section offsets used on disk.
+fn sort_stored_frames<T: std::borrow::Borrow<ChunkRecordV3>>(
+    records: &mut [T],
+    file_offsets: Option<&BTreeMap<String, u64>>,
+) {
+    records.sort_by_key(|record| {
+        let record = record.borrow();
+        let offset = file_offsets.and_then(|offsets| offsets.get(&record.id));
+        (
+            offset.is_none(),
+            offset.copied().unwrap_or(record.data_offset),
+        )
+    });
+}
+
 /// Rewrite the data section with only the live chunks; returns the old one.
 fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<Vec<u8>, String> {
     let live_chunk_ids: HashSet<String> = vault
@@ -1534,25 +1564,23 @@ fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<Vec<u8>, String> {
         return Ok(std::mem::take(&mut vault.data));
     }
 
-    let mut ordered_ids: Vec<(u64, String)> = vault
+    let mut ordered_chunks: Vec<_> = vault
         .manifest
         .chunks
-        .iter()
-        .filter(|(id, _)| live_chunk_ids.contains(*id))
-        .map(|(id, record)| (record.block_index, id.clone()))
+        .values()
+        .filter(|record| live_chunk_ids.contains(&record.id))
         .collect();
-    ordered_ids.sort_by_key(|(index, _)| *index);
+    if vault.plaintext_file_offsets.is_empty() {
+        ordered_chunks.sort_by_key(|record| record.block_index);
+    } else {
+        sort_stored_frames(&mut ordered_chunks, Some(&vault.plaintext_file_offsets));
+    }
 
     let mut new_data = Vec::new();
     let mut new_chunks = BTreeMap::new();
 
-    for (_, chunk_id) in ordered_ids {
-        let mut record = vault
-            .manifest
-            .chunks
-            .get(&chunk_id)
-            .cloned()
-            .ok_or_else(|| format!("Missing chunk record: {chunk_id}"))?;
+    for record in ordered_chunks {
+        let mut record = record.clone();
         let len_start = record.data_offset as usize;
         let len_end = len_start
             .checked_add(8)
@@ -1579,7 +1607,7 @@ fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<Vec<u8>, String> {
         record.data_offset = new_data.len() as u64;
         new_data.extend_from_slice(&block_len.to_le_bytes());
         new_data.extend_from_slice(&vault.data[block_start..block_end]);
-        new_chunks.insert(chunk_id, record);
+        new_chunks.insert(record.id.clone(), record);
     }
 
     vault.manifest.chunks = new_chunks;
@@ -2742,9 +2770,8 @@ fn open_vault_with_guard(
     if let Some(hook) = BEFORE_OPEN_GENERATION.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let hashed_file_len = sparse_hash_extent(&file, file_len);
-    let (opened_hash, scanned_bytes) =
-        file_generation_starting_with(&mut file, &header_bytes, hashed_file_len, file_len)?;
+    let (opened_hash, scanned_bytes, hashed_file_len) =
+        vault_generation_baseline(&mut file, &header_bytes, file_len)?;
     let encrypted_manifest = read_capped(
         &mut file,
         header.manifest_offset,
@@ -2846,7 +2873,7 @@ fn open_vault_with_guard(
         mut bytes,
         file_offsets,
     } = if plaintext_header {
-        let storage_bound = plaintext_storage_bound(&file, scanned_bytes, limits)?;
+        let storage_bound = limits.max_data_bytes.is_none().then_some(scanned_bytes);
         read_plaintext_data(&mut file, &header, &mut manifest, storage_bound)?
     } else {
         let mut data = vault_data_buffer(header.data_len)?;
@@ -2911,46 +2938,6 @@ struct LoadedData {
     file_offsets: BTreeMap<String, u64>,
 }
 
-fn plaintext_storage_bound(
-    file: &std::fs::File,
-    scanned_bytes: u64,
-    limits: VaultV3Limits,
-) -> Result<Option<u64>, String> {
-    if limits.max_data_bytes.is_some() {
-        return Ok(None);
-    }
-    // Some filesystems report the whole file as data to SEEK_DATA or may
-    // not implement an extent query. Use the descriptor's allocation as a
-    // second bound, including when the generation was hashed in raw mode.
-    #[cfg(unix)]
-    let allocated_bytes = {
-        use std::os::unix::fs::MetadataExt;
-        file.metadata()
-            .map_err(|error| format!("Stat plaintext archive: {error}"))?
-            .blocks()
-            .saturating_mul(512)
-    };
-    #[cfg(windows)]
-    let allocated_bytes = {
-        use std::os::windows::fs::MetadataExt;
-        const SPARSE_OR_COMPRESSED: u32 = 0x0200 | 0x0800;
-        let metadata = file
-            .metadata()
-            .map_err(|error| format!("Stat plaintext archive: {error}"))?;
-        if metadata.file_attributes() & SPARSE_OR_COMPRESSED == 0 {
-            metadata.len()
-        } else {
-            super::windows_security::allocated_file_bytes(file).unwrap_or(0)
-        }
-    };
-    #[cfg(not(any(unix, windows)))]
-    let allocated_bytes = {
-        let _ = file;
-        0
-    };
-    Ok(Some(scanned_bytes.min(allocated_bytes)))
-}
-
 fn read_plaintext_data(
     file: &mut (impl Read + Seek),
     header: &VaultHeaderV3,
@@ -2961,7 +2948,7 @@ fn read_plaintext_data(
     // so extraction and Error Correction see the same bytes. A frame offset
     // from the plaintext manifest can never grow the buffer across a gap.
     let mut records: Vec<_> = manifest.chunks.values_mut().collect();
-    records.sort_unstable_by_key(|record| record.data_offset);
+    sort_stored_frames(&mut records, None);
     let mut previous_end = 0;
     let mut data_size = 0u64;
     let mut has_gaps = false;
@@ -2988,7 +2975,7 @@ fn read_plaintext_data(
         let section_bytes = header.data_len;
         let env_bytes = section_bytes.max(MIN_ENV_DATA_BUDGET);
         return Err(format!(
-            "Plaintext frames claim {data_size} bytes but the file has {allocated} bytes backed by storage. For a trusted archive requiring repair, set {DATA_BUDGET_ENV}={env_bytes} (bytes) or use VaultV3Limits::with_max_data_bytes({section_bytes})"
+            "Plaintext frames claim {data_size} bytes but the file has {allocated} bytes covered by logical data ranges. For a trusted archive requiring repair, set {DATA_BUDGET_ENV}={env_bytes} (bytes) or use VaultV3Limits::with_max_data_bytes({section_bytes})"
         ));
     }
     let mut data = vault_data_buffer(data_size)?;
@@ -3117,59 +3104,32 @@ thread_local! {
     static GENERATION_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(test)]
 thread_local! {
-    static FORCE_NO_SEEK_DATA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_SPARSE_TAIL_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static REPORT_DENSE_EXTENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Use a sparse fingerprint when the filesystem reports an interior hole.
+/// Start a sparse fingerprint at the first hole after the verified header.
 fn sparse_hash_extent(file: &std::fs::File, file_len: u64) -> u64 {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let Ok(Some(hole)) = seek_extent(file, 0, libc::SEEK_HOLE) {
-        let prefix = hole.max(HEADER_SIZE as u64);
-        if prefix < file_len && seek_extent(file, prefix, libc::SEEK_DATA).is_ok() {
-            return prefix;
-        }
+    #[cfg(all(test, target_os = "linux"))]
+    if REPORT_DENSE_EXTENTS.with(|dense| dense.replace(false)) {
+        return file_len;
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = file;
-    file_len
+    match super::sparse::data_range(file, 0, file_len) {
+        Ok(Some(range)) if range.start == 0 => range.end.max((HEADER_SIZE as u64).min(file_len)),
+        Ok(_) => file_len.min(HEADER_SIZE as u64),
+        Err(_) => file_len,
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn seek_extent(
-    file: &std::fs::File,
-    offset: u64,
-    whence: libc::c_int,
-) -> std::io::Result<Option<u64>> {
-    use std::os::fd::AsRawFd;
-
-    #[cfg(test)]
-    if whence == libc::SEEK_DATA && FORCE_NO_SEEK_DATA.with(|force| force.replace(false)) {
-        return Err(std::io::ErrorKind::Unsupported.into());
-    }
-
-    let start = libc::off_t::try_from(offset)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: the fd is live and the offset is absolute and representable.
-    let found = unsafe { libc::lseek(file.as_raw_fd(), start, whence) };
-    if found >= 0 {
-        return Ok(Some(found as u64));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ENXIO) {
-        return Ok(None);
-    }
-    Err(error)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn hash_sparse_tail(
     file: &mut std::fs::File,
     hasher: &mut blake3::Hasher,
     prefix_len: u64,
     file_len: u64,
-) -> Result<u64, String> {
+) -> Result<Option<u64>, String> {
     // The offsets, lengths and logical file length commit to every hole.
     // An allocated extent in a previously empty region changes this hash.
     hasher.update(b"aerovault sparse generation v1\0");
@@ -3178,36 +3138,26 @@ fn hash_sparse_tail(
     let mut cursor = prefix_len;
     let mut scanned_bytes = 0;
     while cursor < file_len {
-        let data = seek_extent(file, cursor, libc::SEEK_DATA)
-            .map_err(|error| format!("Find vault data extent: {error}"))?;
-        let Some(start) = data else {
+        #[cfg(test)]
+        if FAIL_SPARSE_TAIL_QUERY.with(|fail| fail.replace(false)) {
+            return Ok(None);
+        }
+        let Some(range) = (match super::sparse::data_range(file, cursor, file_len) {
+            Ok(range) => range,
+            Err(_) => return Ok(None),
+        }) else {
             break;
         };
-        let end = seek_extent(file, start, libc::SEEK_HOLE)
-            .map_err(|error| format!("Find vault hole: {error}"))?
-            .ok_or("Vault extent changed while it was being read")?;
-        if start < cursor || start >= end || end > file_len {
-            return Err("Vault extent changed while it was being read".into());
-        }
-        hasher.update(&start.to_le_bytes());
-        hasher.update(&(end - start).to_le_bytes());
-        file.seek(std::io::SeekFrom::Start(start))
+        let len = range.end - range.start;
+        hasher.update(&range.start.to_le_bytes());
+        hasher.update(&len.to_le_bytes());
+        file.seek(std::io::SeekFrom::Start(range.start))
             .map_err(|error| format!("Read vault extent: {error}"))?;
-        hash_generation_bytes(file, hasher, end - start)?;
-        scanned_bytes += end - start;
-        cursor = end;
+        hash_generation_bytes(file, hasher, len)?;
+        scanned_bytes += len;
+        cursor = range.end;
     }
-    Ok(scanned_bytes)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn hash_sparse_tail(
-    _file: &mut std::fs::File,
-    _hasher: &mut blake3::Hasher,
-    _prefix_len: u64,
-    _file_len: u64,
-) -> Result<u64, String> {
-    Err("Sparse generation checks are unavailable on this platform".into())
+    Ok(Some(scanned_bytes))
 }
 
 fn hash_generation_bytes(
@@ -3238,7 +3188,29 @@ fn file_generation(
     if len != expected_len {
         return Err("Vault changed while this write was in progress; retry operation".into());
     }
-    file_generation_starting_with(file, &[], hashed_len, len).map(|(hash, _)| hash)
+    file_generation_starting_with(file, &[], hashed_len, len)?
+        .map(|(hash, _)| hash)
+        .ok_or_else(|| "Cannot recheck sparse vault generation; open it again".into())
+}
+
+/// Start a generation using logical extent lengths when available. If a
+/// query fails, retry with a raw hash and use the full logical length.
+fn vault_generation_baseline(
+    file: &mut std::fs::File,
+    header: &[u8],
+    file_len: u64,
+) -> Result<([u8; 32], u64, u64), String> {
+    let prefix = sparse_hash_extent(file, file_len);
+    if prefix < file_len {
+        if let Some((hash, covered)) =
+            file_generation_starting_with(file, header, prefix, file_len)?
+        {
+            return Ok((hash, covered, prefix));
+        }
+    }
+    let (hash, logical_len) = file_generation_starting_with(file, header, file_len, file_len)?
+        .expect("raw generation does not query extents");
+    Ok((hash, logical_len, file_len))
 }
 
 /// Hash the file bytes, including a sparse description of the tail if the
@@ -3248,7 +3220,7 @@ fn file_generation_starting_with(
     prefix: &[u8],
     hashed_len: u64,
     len: u64,
-) -> Result<([u8; 32], u64), String> {
+) -> Result<Option<([u8; 32], u64)>, String> {
     #[cfg(test)]
     GENERATION_READS.with(|n| n.set(n.get() + 1));
     #[cfg(test)]
@@ -3271,7 +3243,9 @@ fn file_generation_starting_with(
     GENERATION_BYTES_READ.with(|n| n.set(n.get() + head.len() as u64));
     hash_generation_bytes(file, &mut hasher, expected)?;
     let scanned_bytes = if hashed_len < len {
-        let tail = hash_sparse_tail(file, &mut hasher, hashed_len, len)?;
+        let Some(tail) = hash_sparse_tail(file, &mut hasher, hashed_len, len)? else {
+            return Ok(None);
+        };
         if file
             .metadata()
             .map_err(|e| format!("Stat vault: {e}"))?
@@ -3290,7 +3264,7 @@ fn file_generation_starting_with(
         }
         len
     };
-    Ok((*hasher.finalize().as_bytes(), scanned_bytes))
+    Ok(Some((*hasher.finalize().as_bytes(), scanned_bytes)))
 }
 
 /// Persist the in-memory vault back to disk with an atomic single-rename seal.
@@ -3351,26 +3325,7 @@ pub(super) fn save_locked_to(
         .iter()
         .position(|e| e.extension_id == super::constants::ERROR_CORRECTION_EXTENSION_ID)
     {
-        // On-disk blocks in data-section order (sorted by data_offset). Each
-        // full block is [u64 len][ciphertext of that len]. Offset arithmetic is
-        // checked so a manifest record near usize::MAX yields an empty slice
-        // instead of panicking (matches collect_live_block_refs / scrub_vault).
-        let mut chunk_records: Vec<_> = vault.manifest.chunks.values().cloned().collect();
-        chunk_records.sort_by_key(|r| r.data_offset);
-
-        let blocks: Vec<&[u8]> = chunk_records
-            .iter()
-            .map(|rec| {
-                let start = rec.data_offset as usize;
-                let end = (rec.block_len as usize)
-                    .checked_add(8)
-                    .and_then(|full| start.checked_add(full));
-                match end {
-                    Some(end) if end <= vault.data.len() => &vault.data[start..end],
-                    _ => &[] as &[u8],
-                }
-            })
-            .collect();
+        let blocks = super::ec::collect_live_block_refs(vault);
 
         let (k, p) = crate::error_correction::manifest_error_correction_grid(
             vault.manifest.error_correction_pct,
@@ -3406,6 +3361,9 @@ pub(super) fn save_locked_to(
             .tempfile_in(parent)
             .map_err(|e| format!("Create temp file: {e}"))?;
         let dense_generation = if let Some(layout) = &disk_layout {
+            #[cfg(windows)]
+            super::sparse::mark_sparse_if_supported(tmp.as_file())
+                .map_err(|error| format!("Prepare sparse vault staging file: {error}"))?;
             write_container_with_data(
                 tmp.as_file_mut(),
                 vault.header.clone(),
@@ -3456,8 +3414,7 @@ pub(super) fn save_locked_to(
             Some((length, hash)) => (length, length, hash),
             None => {
                 let length = file.metadata().map_err(|error| error.to_string())?.len();
-                let prefix = sparse_hash_extent(file, length);
-                let (hash, _) = file_generation_starting_with(file, &header_bytes, prefix, length)?;
+                let (hash, _, prefix) = vault_generation_baseline(file, &header_bytes, length)?;
                 (length, prefix, hash)
             }
         };
@@ -3507,7 +3464,7 @@ impl SparsePlaintextLayout {
         }
         let mut manifest = vault.manifest.clone();
         let mut records: Vec<_> = manifest.chunks.values_mut().collect();
-        records.sort_unstable_by_key(|record| record.data_offset);
+        sort_stored_frames(&mut records, Some(&vault.plaintext_file_offsets));
         let mut data_len = vault.header.data_len;
         let mut frames = Vec::with_capacity(records.len());
         for record in records {
@@ -7256,6 +7213,8 @@ mod tests {
         header.extension_payload_len = 0;
         header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
         let mut file = std::fs::File::create(&vault.path).unwrap();
+        #[cfg(windows)]
+        super::super::sparse::mark_sparse_if_supported(&file).unwrap();
         file.write_all(&header.to_bytes()).unwrap();
         file.seek(std::io::SeekFrom::Start(header.data_offset + block_offset))
             .unwrap();
@@ -7263,6 +7222,180 @@ mod tests {
         file.write_all(&manifest).unwrap();
         file.write_all(b"[]").unwrap();
         header
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sparse_plaintext_save_marks_windows_staging_before_writing() {
+        use std::os::windows::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let probe = tempfile::tempfile_in(dir.path()).unwrap();
+        if !super::super::sparse::mark_sparse_if_supported(&probe).unwrap() {
+            eprintln!(
+                "Skipping sparse reseal: the temporary volume lacks FILE_SUPPORTS_SPARSE_FILES"
+            );
+            return;
+        }
+        let path = dir.path().join("sparse.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"live frame").unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+
+        let block_offset = 128 * 1024 * 1024;
+        put_plaintext_test_block_at(&mut vault, block_offset);
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::create_directory(&mut vault, "added").unwrap();
+        assert!(vault.hashed_file_len < block_offset);
+        assert_vault_generation_current(&vault).unwrap();
+        let reopened = VaultV3::open_plaintext(&path).unwrap();
+        let block = reopened.manifest.chunks.values().next().unwrap();
+        assert_eq!(reopened.file_data_offset(block), block_offset);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_ne!(meta.file_attributes() & 0x200, 0);
+        let (_, covered, _) = vault_generation_baseline(&mut file, &[], meta.len()).unwrap();
+        assert!(covered < 1024 * 1024, "{covered} logical data bytes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_plaintext_open_uses_logical_coverage_on_compressed_or_unreported_extents() {
+        use std::io::{SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compressible.aerozip");
+        let input = dir.path().join("input");
+        let payload = vec![0; 128 * 1024];
+        std::fs::write(&input, &payload).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        let record = vault.manifest.chunks.values_mut().next().unwrap();
+        assert_eq!(record.plaintext_len, payload.len() as u64);
+        let len = record.plaintext_len;
+        record.stored_raw = true;
+        record.block_len = len;
+        record.compressed_len = len;
+        record.cipher_hash = blake3::hash(&payload).to_hex().to_string();
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        write_container_with_data(
+            &mut file,
+            vault.header.clone(),
+            &vault.mac_key,
+            &vault.master_key,
+            &vault.manifest,
+            &[],
+            &[],
+            len + 8,
+            |file| {
+                file.write_all(&len.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+                // A hole supplies the exact stored zero bytes of this valid
+                // frame, simulating a start-to-end compressed logical extent.
+                file.seek(SeekFrom::Current(len as i64))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        if file.metadata().unwrap().blocks() * 512 >= len {
+            eprintln!(
+                "Skipping compressed allocation surrogate: filesystem allocated the zero range"
+            );
+            return;
+        }
+
+        for mode in ["dense-extents", "query-failure"] {
+            if mode == "dense-extents" {
+                REPORT_DENSE_EXTENTS.with(|flag| flag.set(true));
+            } else {
+                FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
+            }
+            let opened = VaultV3::open_plaintext(&path).unwrap();
+            FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(false));
+            assert_eq!(opened.hashed_file_len, opened.opened_file_len, "{mode}");
+            assert!(VaultV3::scrub(&opened).is_empty());
+            let output = dir.path().join(mode);
+            VaultV3::extract_entry(&opened, "input", &output).unwrap();
+            assert_eq!(std::fs::read(&output).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn sparse_plaintext_delete_keeps_repair_order_in_session_and_after_reopen() {
+        use std::io::{SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        for reopen in [false, true] {
+            let path = dir.path().join(format!("parity-{reopen}.aerozip"));
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new_plaintext(&path),
+                super::super::RecoveryPlacement::Embedded,
+                20,
+            )
+            .unwrap();
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            let data = ["first", "second", "delete"];
+            for name in data {
+                let input = dir.path().join(name);
+                std::fs::write(&input, name.repeat(1500)).unwrap();
+                VaultV3::add_files(&mut vault, &[(input, name.into())]).unwrap();
+            }
+            assert_eq!(vault.manifest.chunks.len(), 3);
+            for record in vault.manifest.chunks.values() {
+                vault
+                    .plaintext_file_offsets
+                    .insert(record.id.clone(), (3 - record.block_index) * 1024 * 1024);
+            }
+            save_open_vault(&mut vault).unwrap();
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            VaultV3::delete_entry(&mut vault, "delete").unwrap();
+            let stored = vault.frames_in_storage_order();
+            assert!(
+                stored
+                    .windows(2)
+                    .all(|pair| pair[0].data_offset < pair[1].data_offset),
+                "compact frames must follow physical order"
+            );
+            let id = vault
+                .manifest
+                .entries
+                .iter()
+                .find(|entry| entry.path == "first")
+                .unwrap()
+                .chunks[0]
+                .clone();
+            let record = &vault.manifest.chunks[&id];
+            if reopen {
+                let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(
+                    DATA_OFFSET + vault.file_data_offset(record) + 8,
+                ))
+                .unwrap();
+                file.write_all(&[vault.data[record.data_offset as usize + 8] ^ 1])
+                    .unwrap();
+                drop(file);
+                vault = VaultV3::open_plaintext(&path).unwrap();
+            } else {
+                vault.data[record.data_offset as usize + 8] ^= 1;
+            }
+            assert_eq!(
+                VaultV3::repair(&mut vault, false, None).unwrap(),
+                (1, super::super::ParitySource::Embedded),
+                "reopened={reopen}"
+            );
+            for name in &data[..2] {
+                let output = dir.path().join(format!("restored-{name}-{reopen}"));
+                VaultV3::extract_entry(&vault, name, &output).unwrap();
+                assert_eq!(std::fs::read(output).unwrap(), name.repeat(1500).as_bytes());
+            }
+        }
     }
 
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -7455,6 +7588,55 @@ mod tests {
     }
 
     #[test]
+    fn invalid_environment_data_budget_is_reported_and_explicit_limits_ignore_it() {
+        const SAMPLE: &str = "AEROVAULT_TEST_ENV_BUDGET_PATH";
+        const TEST: &str = "v3::vault::tests::invalid_environment_data_budget_is_reported_and_explicit_limits_ignore_it";
+        if let Some(path) = std::env::var_os(SAMPLE).map(PathBuf::from) {
+            let result = VaultV3::open_plaintext(&path);
+            match std::env::var(DATA_BUDGET_ENV).ok().as_deref() {
+                None | Some("1073741824") => {
+                    result.unwrap();
+                }
+                Some(_) => {
+                    let error = result.unwrap_err();
+                    assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+                    assert!(
+                        error.contains(&format!("{MIN_ENV_DATA_BUDGET}..={}", isize::MAX)),
+                        "{error}"
+                    );
+                }
+            }
+            VaultV3::open_plaintext_with_limits(
+                &path,
+                VaultV3Limits::default().with_max_data_bytes(0),
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        for value in [None, Some("1073741824"), Some("536870912"), Some("invalid")] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", TEST, "--nocapture"])
+                .env(SAMPLE, &path);
+            if let Some(value) = value {
+                child.env(DATA_BUDGET_ENV, value);
+            } else {
+                child.env_remove(DATA_BUDGET_ENV);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
     fn distant_plaintext_frame_keeps_disk_offsets_and_repairs_without_loading_the_gap() {
         use std::io::{SeekFrom, Write};
 
@@ -7556,7 +7738,7 @@ mod tests {
         );
         assert_vault_generation_current(&vault).unwrap();
 
-        FORCE_NO_SEEK_DATA.with(|force| force.set(true));
+        FAIL_SPARSE_TAIL_QUERY.with(|fail| fail.set(true));
         let raw = VaultV3::open_plaintext(&path).unwrap();
         assert_eq!(raw.hashed_file_len, file_len);
         assert_eq!(
@@ -7667,28 +7849,19 @@ mod tests {
                     },
                 );
             }
-            let prefix = sparse_hash_extent(&file, file_len);
-            let (_, scanned) =
-                file_generation_starting_with(&mut file, &[], prefix, file_len).unwrap();
-            assert!(scanned < MAX_BLOCK_SIZE);
-            let limits = VaultV3Limits::default();
-            let bound = plaintext_storage_bound(&file, scanned, limits).unwrap();
-            assert!(bound.unwrap() < MAX_BLOCK_SIZE);
-            let error = read_plaintext_data(&mut file, &header, &mut manifest, bound)
+            let (_, covered, prefix) = vault_generation_baseline(&mut file, &[], file_len).unwrap();
+            assert!(prefix < file_len && covered < MAX_BLOCK_SIZE);
+            let error = read_plaintext_data(&mut file, &header, &mut manifest, Some(covered))
                 .err()
                 .expect("unbacked ranges must be rejected before allocation");
-            assert!(error.contains("bytes backed by storage"), "{error}");
+            assert!(
+                error.contains("bytes covered by logical data ranges"),
+                "{error}"
+            );
             assert!(
                 error.contains(&format!("{DATA_BUDGET_ENV}={LOGICAL_LEN} (bytes)")),
                 "{error}"
             );
-            // A raw generation fallback still has an independent disk bound.
-            let raw_bound = plaintext_storage_bound(&file, file_len, limits).unwrap();
-            assert!(raw_bound.unwrap() < MAX_BLOCK_SIZE);
-            let explicit = limits.with_max_data_bytes(LOGICAL_LEN);
-            assert!(plaintext_storage_bound(&file, scanned, explicit)
-                .unwrap()
-                .is_none());
             crate::source::memory_test::complete();
             return;
         }
