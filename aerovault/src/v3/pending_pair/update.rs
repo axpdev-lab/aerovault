@@ -1101,6 +1101,50 @@ mod tests {
     const LATER: &str = "isolated-later-vault-password";
 
     #[test]
+    fn portable_header_propagates_legacy_reconstruction_failure() {
+        use crate::error_correction::sidecar::AeroCorrectSidecar;
+        use crate::v3::constants::HEADER_SIZE;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_vault = dir.path().join("old-vault");
+        let old_sidecar = dir.path().join("old-sidecar");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&old_vault)).unwrap();
+        VaultV3::export_parity(&old_vault, "", Some(&old_sidecar)).unwrap();
+        let valid = AeroCorrectSidecar::from_bytes(&fs::read(&old_sidecar).unwrap()).unwrap();
+        fs::copy(&old_vault, dir.path().join("new-vault")).unwrap();
+        let new_sidecar = dir.path().join("new-sidecar");
+        fs::copy(&old_sidecar, &new_sidecar).unwrap();
+        let original = generation(&old_vault).unwrap();
+        let transaction = [1; 16];
+        let (with_parity, _) = portable_header(dir.path(), transaction, original).unwrap();
+        assert!(with_parity.payload_offset > HEADER_SIZE as u64);
+
+        let mut empty = valid.clone();
+        empty.segments[0].avec_bytes.clear();
+        for sidecar in [&old_sidecar, &new_sidecar] {
+            fs::write(sidecar, empty.to_bytes()).unwrap();
+        }
+        let (without_parity, _) = portable_header(dir.path(), transaction, original).unwrap();
+        assert_eq!(without_parity.payload_offset, HEADER_SIZE as u64);
+
+        // Valid AVEC framing for a region shorter than the pending header. Its
+        // stream cannot reconstruct the caller's full header.
+        let mut wrong_length = valid;
+        wrong_length.segments[0].avec_bytes =
+            crate::error_correction::compute_metadata_parity(&[0; HEADER_SIZE / 2], 10, 2).unwrap();
+        for sidecar in [&old_sidecar, &new_sidecar] {
+            fs::write(sidecar, wrong_length.to_bytes()).unwrap();
+        }
+        let error = portable_header(dir.path(), transaction, original)
+            .expect_err("a failed reconstruction must refuse the envelope");
+        assert!(
+            error.contains("Cannot reconstruct the legacy header"),
+            "{error}"
+        );
+        assert!(error.contains("block stream length"), "{error}");
+    }
+
+    #[test]
     fn update_recovers_each_durable_boundary_and_preserves_conflicts() {
         if let Some(path) = std::env::var_os(PATH) {
             let path = PathBuf::from(path);

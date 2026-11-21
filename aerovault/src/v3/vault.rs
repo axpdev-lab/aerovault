@@ -482,14 +482,18 @@ impl VaultV3 {
     /// Pre-flight: which Error-Correction parity source a [`repair`](Self::repair)
     /// would draw from (`explicit` path wins, else the detached sidecar, else the
     /// embedded extension). An explicit path that is unreadable/malformed is a
-    /// hard error; an absent default source returns
-    /// [`ParitySource::None`](super::ec::ParitySource). Read-only; discards the
-    /// resolved parity bytes.
+    /// hard error, as is absence of all parity sources. Read-only; discards
+    /// the resolved parity bytes.
     pub fn resolve_parity_source(
         vault: &OpenVaultV3,
         explicit: Option<&Path>,
     ) -> Result<super::ec::ParitySource, String> {
-        super::ec::resolve_parity_source(vault, explicit).map(|(_, source)| source)
+        super::ec::resolve_parity_source(vault, explicit)?
+            .map(|(_, source)| source)
+            .ok_or_else(|| {
+                "No Error Correction parity available (no --parity, no .aerocorrect sidecar, no embedded extension)"
+                    .into()
+            })
     }
 
     /// Recovery surfaces available for a vault without the password.
@@ -2502,7 +2506,7 @@ fn create_empty_vault(
     };
     let ext_payloads = if embed {
         let (p, _shards, _prot, _ov) =
-            crate::error_correction::compute_error_correction_shards(&[]);
+            crate::error_correction::compute_error_correction_shards(&[])?;
         if let Some(e) = extensions.first_mut() {
             e.offset = 0;
             e.length = p.len() as u64;
@@ -3065,6 +3069,43 @@ thread_local! {
 }
 
 #[cfg(target_os = "linux")]
+fn cgroup_v2_reclaimable_cache(dir: &Path, clean_cache: u64) -> Option<u64> {
+    if clean_cache == 0 {
+        return Some(0);
+    }
+    let mut reclaimable = clean_cache;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let child = entry.path();
+        let read_protection = |name: &str| {
+            let value = std::fs::read_to_string(child.join(name)).ok()?;
+            match value.trim() {
+                "max" => Some(u64::MAX),
+                value => value.parse::<u64>().ok(),
+            }
+        };
+        let protection = read_protection("memory.min")?.max(read_protection("memory.low")?);
+        if protection == 0 {
+            continue;
+        }
+        // Effective protection at this reclaim target is capped by the
+        // immediate child's settings and applies only to charged memory.
+        // Keep the soft protection too for a conservative cache credit.
+        let charged = std::fs::read_to_string(child.join("memory.current"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        reclaimable = reclaimable.saturating_sub(protection.min(charged.unwrap_or(protection)));
+        if reclaimable == 0 {
+            break;
+        }
+    }
+    Some(reclaimable)
+}
+
+#[cfg(target_os = "linux")]
 fn cgroup_v2_headroom(root: &Path, group: &Path, mut memory: u64, mut swap: u64) -> u64 {
     for relative in group.ancestors() {
         let dir = root.join(relative);
@@ -3088,13 +3129,15 @@ fn cgroup_v2_headroom(root: &Path, group: &Path, mut memory: u64, mut swap: u64)
                     })
                     .unwrap_or(0)
             };
-            // Both file LRUs can be reclaimed. The host limit still caps
-            // the estimate. Do not credit dirty or writeback file pages.
+            // The kernel counters are sampled separately, so this is an
+            // estimate. Credit only clean file cache beyond possible
+            // protection. The host limit still caps total headroom.
             let clean_cache = bytes("active_file")
                 .saturating_add(bytes("inactive_file"))
                 .saturating_sub(bytes("file_dirty"))
                 .saturating_sub(bytes("file_writeback"));
-            let working_set = current.saturating_sub(clean_cache);
+            let reclaimable = cgroup_v2_reclaimable_cache(&dir, clean_cache).unwrap_or(0);
+            let working_set = current.saturating_sub(reclaimable);
             memory = memory.min(max.saturating_sub(working_set));
         }
         if swap > 0 {
@@ -3710,7 +3753,12 @@ pub(super) fn save_locked_to(
             vault.manifest.error_correction_pct,
         );
         let (payload, shards, protected, overhead) =
-            crate::error_correction::compute_error_correction_shards_grid(&blocks, k, p);
+            crate::error_correction::compute_error_correction_shards_with_headroom(
+                &blocks,
+                k,
+                p,
+                vault.default_memory_headroom(),
+            )?;
 
         let entry = &mut extensions[error_correction_idx];
         entry.offset = 0;
@@ -8375,6 +8423,8 @@ mod tests {
         let parent = root.join("parent");
         std::fs::create_dir_all(root.join(&group)).unwrap();
         std::fs::write(root.join(&group).join("memory.max"), "max").unwrap();
+        std::fs::write(root.join(&group).join("memory.min"), "0").unwrap();
+        std::fs::write(root.join(&group).join("memory.low"), "0").unwrap();
         std::fs::write(parent.join("memory.max"), (bytes + 1).to_string()).unwrap();
         std::fs::write(parent.join("memory.current"), bytes.to_string()).unwrap();
         std::fs::write(parent.join("memory.swap.max"), "0").unwrap();
@@ -8390,6 +8440,26 @@ mod tests {
         std::fs::write(parent.join("memory.stat"), format!("active_file {bytes}\n")).unwrap();
         let opened = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
         assert_eq!(VaultV3::list(&opened).len(), 1);
+        drop(opened);
+
+        let sibling = parent.join("protected");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("memory.current"), bytes.to_string()).unwrap();
+        for (minimum, low, admits) in [("max", "0", false), ("0", "max", false), ("0", "0", true)] {
+            std::fs::write(sibling.join("memory.min"), minimum).unwrap();
+            std::fs::write(sibling.join("memory.low"), low).unwrap();
+            let result = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default());
+            assert_eq!(
+                result.is_ok(),
+                admits,
+                "sibling minimum {minimum}, low {low}"
+            );
+            if let Err(error) = result {
+                assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+            }
+        }
+        std::fs::remove_file(sibling.join("memory.low")).unwrap();
+        assert!(VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).is_err());
         TEST_CGROUP_V2.with(|paths| paths.replace(None));
     }
 

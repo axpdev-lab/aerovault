@@ -22,6 +22,28 @@ fn memory_cgroup() -> PathBuf {
     Path::new("/sys/fs/cgroup").join(scope)
 }
 
+fn file_cache_bytes(scope: &Path) -> u64 {
+    let stats = fs::read_to_string(scope.join("memory.stat")).unwrap();
+    let counter = |name: &str| {
+        stats
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.parse::<u64>().unwrap())
+            })
+            .unwrap()
+    };
+    counter("active_file") + counter("inactive_file")
+}
+
+fn resident_bytes(scope: &Path) -> u64 {
+    fs::read_to_string(scope.join("memory.current"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 fn open_in_scope(path: &Path, mode: &str) {
     let scope = memory_cgroup();
     let max = fs::read_to_string(scope.join("memory.max")).unwrap();
@@ -56,7 +78,19 @@ fn open_in_scope(path: &Path, mode: &str) {
                 "fixture must require cache reclaim"
             );
             if mode == "warm" {
+                let resident = VaultV3::peek(path).unwrap().data_len;
+                let cache_before = file_cache_bytes(&scope);
+                let current_before = resident_bytes(&scope);
                 io::copy(&mut File::open(path).unwrap(), &mut io::sink()).unwrap();
+                let charged = file_cache_bytes(&scope).saturating_sub(cache_before);
+                let current_after = resident_bytes(&scope);
+                let uncredited = cap.saturating_sub(current_after);
+                assert!(
+                    cap.saturating_sub(current_before) >= resident
+                        && uncredited < resident && resident <= uncredited + charged,
+                    "warm scope charged {charged} file-cache bytes, has {uncredited} free, and needs {resident} for the vault buffer"
+                );
+                println!("warm scope resident charge {current_before} -> {current_after} bytes, including {charged} new file-cache bytes; {uncredited} bytes available before reclaim");
             }
             let vault =
                 VaultV3::open_plaintext_with_limits(path, VaultV3Limits::default()).unwrap();
@@ -92,8 +126,21 @@ fn cold_and_warm_opens_reclaim_cache_and_obey_ancestor_limit() {
     drop(vault);
     let file = File::open(&archive).unwrap();
     file.sync_all().unwrap();
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the archive descriptor is live and the output has space for statfs.
+    assert_eq!(
+        unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: fstatfs returned success and initialized the structure.
+    let filesystem = unsafe { filesystem.assume_init() };
+    assert_ne!(
+        filesystem.f_type,
+        libc::TMPFS_MAGIC,
+        "use disk-backed TMPDIR"
+    );
 
-    for (mode, cap) in [("cold", "96M"), ("warm", "96M"), ("ancestor", "48M")] {
+    for (mode, cap) in [("warm", "96M"), ("cold", "96M"), ("ancestor", "48M")] {
         // SAFETY: the descriptor is live. Only the synthetic archive cache
         // is dropped, and the file stays available to the child.
         assert_eq!(

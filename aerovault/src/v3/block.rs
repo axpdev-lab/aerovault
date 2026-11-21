@@ -41,7 +41,11 @@ pub fn read_section<R: Read + Seek>(
     reader
         .seek(SeekFrom::Start(offset))
         .map_err(|e| format!("Seek {label}: {e}"))?;
-    let mut buf = vec![0u8; len as usize];
+    let len = usize::try_from(len).map_err(|_| format!("{label} exceeds address space"))?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|error| format!("Cannot allocate {label}: {error}"))?;
+    buf.resize(len, 0);
     reader
         .read_exact(&mut buf)
         .map_err(|e| format!("Read {label}: {e}"))?;
@@ -157,14 +161,13 @@ pub(super) fn write_container_with_data<W: Write>(
         .filter(|e| e.extension_id != ERROR_CORRECTION_META_EXTENSION_ID)
         .cloned()
         .collect();
-    let mut extension_payloads = extension_payloads.to_vec();
-    if extensions
+    let meta_payload = if extensions
         .iter()
         .any(|e| e.extension_id == ERROR_CORRECTION_EXTENSION_ID)
     {
         let (k, p) = manifest_error_correction_grid(manifest.error_correction_pct);
         let (meta_payload, _shards, _prot, _ov) =
-            compute_error_correction_shards_grid(&[&encrypted_manifest], k, p);
+            compute_error_correction_shards_grid(&[&encrypted_manifest], k, p)?;
         extensions.push(ExtensionEntryV3 {
             extension_id: ERROR_CORRECTION_META_EXTENSION_ID.to_string(),
             algorithm_id: ERROR_CORRECTION_ALGORITHM_ID.to_string(),
@@ -173,8 +176,10 @@ pub(super) fn write_container_with_data<W: Write>(
             offset: extension_payloads.len() as u64,
             length: meta_payload.len() as u64,
         });
-        extension_payloads.extend_from_slice(&meta_payload);
-    }
+        meta_payload
+    } else {
+        Vec::new()
+    };
 
     let extension_dir =
         serde_json::to_vec(&extensions).map_err(|e| format!("Extension serialize: {e}"))?;
@@ -191,7 +196,7 @@ pub(super) fn write_container_with_data<W: Write>(
     header.extension_dir_offset = add(header.manifest_offset, header.manifest_len)?;
     header.extension_dir_len = extension_dir.len() as u64;
     header.extension_payload_offset = add(header.extension_dir_offset, header.extension_dir_len)?;
-    header.extension_payload_len = extension_payloads.len() as u64;
+    header.extension_payload_len = add(extension_payloads.len() as u64, meta_payload.len() as u64)?;
     header.header_mac = [0u8; MAC_SIZE];
     header.header_mac = header.compute_mac(mac_key)?;
 
@@ -203,7 +208,8 @@ pub(super) fn write_container_with_data<W: Write>(
     write_data(writer)?;
     write(writer, &encrypted_manifest)?;
     write(writer, &extension_dir)?;
-    write(writer, &extension_payloads)?;
+    write(writer, extension_payloads)?;
+    write(writer, &meta_payload)?;
     Ok(())
 }
 

@@ -37,7 +37,7 @@ use super::vault::{
     VaultV3Limits,
 };
 use crate::error_correction::{
-    compute_error_correction_shards_grid, compute_metadata_parity, manifest_error_correction_grid,
+    compute_error_correction_shards_with_headroom, manifest_error_correction_grid,
     reconstruct_from_error_correction, ErrorCorrectionPayloadHeader,
 };
 use crate::error_correction::{AeroCorrectSegment, AeroCorrectSidecar};
@@ -369,6 +369,30 @@ fn read_vault_segment_bounded(
     reader.read_segment_avec_bounded(index, max)
 }
 
+fn check_parity_read_memory(vault: &OpenVaultV3, bytes: u64) -> Result<(), String> {
+    if let Some(available) = vault
+        .default_memory_headroom()
+        .filter(|&available| bytes > available)
+    {
+        return Err(format!(
+            "Error Correction parity needs {bytes} more bytes in memory, but the system reports {available} bytes available"
+        ));
+    }
+    Ok(())
+}
+
+fn read_detached_data_parity(
+    vault: &OpenVaultV3,
+    reader: crate::error_correction::sidecar::AeroCorrectSidecarReader,
+) -> Result<Vec<u8>, String> {
+    let entry = reader
+        .segments()
+        .get(VAULT_SIDECAR_SEG_DATA)
+        .ok_or("Missing Error Correction data segment")?;
+    check_parity_read_memory(vault, entry.avec_len)?;
+    read_vault_segment_bounded(reader, VAULT_SIDECAR_SEG_DATA, vault.header.data_len)
+}
+
 /// Read the embedded `ERROR_CORRECTION_EXTENSION_ID` payload from the vault file,
 /// if present and non-empty. Located via the MAC-verified header.
 fn read_embedded_error_correction(vault: &OpenVaultV3) -> Result<Option<Vec<u8>>, String> {
@@ -380,12 +404,17 @@ fn read_embedded_error_correction(vault: &OpenVaultV3) -> Result<Option<Vec<u8>>
         Some(e) if e.length > 0 => e.clone(),
         _ => return Ok(None),
     };
+    let len = usize::try_from(entry.length).map_err(|_| "Embedded parity exceeds address space")?;
+    check_parity_read_memory(vault, entry.length)?;
     let mut f = crate::source::open_regular(&vault.path)
         .map_err(|e| format!("open for parity read: {e}"))?;
     let abs = vault.header.extension_payload_offset + entry.offset;
     f.seek(SeekFrom::Start(abs))
         .map_err(|e| format!("seek for parity read: {e}"))?;
-    let mut b = vec![0u8; entry.length as usize];
+    let mut b = Vec::new();
+    b.try_reserve_exact(len)
+        .map_err(|e| format!("Cannot allocate embedded Error Correction parity: {e}"))?;
+    b.resize(len, 0);
     f.read_exact(&mut b)
         .map_err(|e| format!("read error_correction payload: {e}"))?;
     Ok(Some(b))
@@ -398,31 +427,22 @@ fn read_embedded_error_correction(vault: &OpenVaultV3) -> Result<Option<Vec<u8>>
 pub(super) fn resolve_parity_source(
     vault: &OpenVaultV3,
     explicit: Option<&Path>,
-) -> Result<(Vec<u8>, ParitySource), String> {
+) -> Result<Option<(Vec<u8>, ParitySource)>, String> {
     // Read only the selected parity region under the vault-specific limits.
     if let Some(p) = explicit {
-        return Ok((
-            read_vault_segment(
-                &vault.path,
-                p,
-                VAULT_SIDECAR_SEG_DATA,
-                vault.header.data_len,
-            )?,
+        return Ok(Some((
+            read_detached_data_parity(vault, open_vault_sidecar(&vault.path, p)?)?,
             ParitySource::Explicit,
-        ));
+        )));
     }
     let sidecar_path = recovery_sidecar_path(&vault.path);
     if sidecar_path.exists() {
         match open_vault_sidecar(&vault.path, &sidecar_path) {
             Ok(reader) if reader.has_standalone_tiling() => {}
             Ok(reader) => {
-                let parity = read_vault_segment_bounded(
-                    reader,
-                    VAULT_SIDECAR_SEG_DATA,
-                    vault.header.data_len,
-                )?;
+                let parity = read_detached_data_parity(vault, reader)?;
                 if !parity.is_empty() {
-                    return Ok((parity, ParitySource::Detached));
+                    return Ok(Some((parity, ParitySource::Detached)));
                 }
             }
             Err(error) => {
@@ -438,13 +458,7 @@ pub(super) fn resolve_parity_source(
         }
     }
     // 3. Embedded extension payload.
-    if let Some(bytes) = read_embedded_error_correction(vault)? {
-        return Ok((bytes, ParitySource::Embedded));
-    }
-    Err(
-        "No Error Correction parity available (no --parity, no .aerocorrect sidecar, no embedded extension)"
-            .to_string(),
-    )
+    Ok(read_embedded_error_correction(vault)?.map(|bytes| (bytes, ParitySource::Embedded)))
 }
 
 /// A parsed empty creation seed has no recovery to protect. Missing sidecars
@@ -462,7 +476,9 @@ pub(super) fn detached_recovery_needs_protection(path: &Path) -> bool {
 
 /// Read the raw on-disk encrypted-manifest bytes (the exact bytes the manifest
 /// parity must protect; re-encrypting would use a fresh nonce and not match).
-fn read_manifest_raw(vault_path: &Path, header: &VaultHeaderV3) -> Result<Vec<u8>, String> {
+fn read_manifest_raw(vault_path: &Path, vault: &OpenVaultV3) -> Result<Vec<u8>, String> {
+    let header = &vault.header;
+    check_parity_read_memory(vault, header.manifest_len)?;
     let mut f = crate::source::open_regular(vault_path)
         .map_err(|e| format!("open for manifest read: {e}"))?;
     read_capped(
@@ -603,16 +619,33 @@ pub(super) fn export_parity_from_sealed(
     // parity section so a detached sidecar matches the user's chosen overhead.
     let (k, p) = manifest_error_correction_grid(vault.manifest.error_correction_pct);
     let blocks = collect_live_block_refs(vault);
-    let (payload, shards, protected, overhead) =
-        compute_error_correction_shards_grid(&blocks, k, p);
+    let (payload, shards, protected, overhead) = compute_error_correction_shards_with_headroom(
+        &blocks,
+        k,
+        p,
+        vault.default_memory_headroom(),
+    )?;
     // GAP-4 metadata bundle: protect the two regions the detached container cannot
     // self-locate once damaged. Header parity is over the authoritative in-memory
     // header (`to_bytes()` round-trips a clean header byte-for-byte); manifest
     // parity is over the exact on-disk encrypted bytes (a re-encrypt would use a
     // fresh nonce and not match).
-    let header_parity = compute_metadata_parity(&vault.header.to_bytes(), k, p);
-    let manifest_raw = read_manifest_raw(vault_path, &vault.header)?;
-    let manifest_parity = compute_metadata_parity(&manifest_raw, k, p);
+    let header_parity = compute_error_correction_shards_with_headroom(
+        &[&vault.header.to_bytes()],
+        k,
+        p,
+        vault.default_memory_headroom(),
+    )?
+    .0;
+    let manifest_raw = read_manifest_raw(vault_path, vault)?;
+    let manifest_parity = compute_error_correction_shards_with_headroom(
+        &[&manifest_raw],
+        k,
+        p,
+        vault.default_memory_headroom(),
+    )?
+    .0;
+    drop(manifest_raw);
     let payload_len = payload.len() as u64;
     let header_parity_len = header_parity.len() as u64;
     let manifest_parity_len = manifest_parity.len() as u64;
@@ -626,7 +659,7 @@ pub(super) fn export_parity_from_sealed(
         manifest_parity,
         header_parity,
     );
-    let bytes = sidecar.to_bytes();
+    let bytes = sidecar.try_to_bytes(vault.default_memory_headroom())?;
     // Lock-aware writers are held off by the lock. This check also catches a
     // writer that does not take it (an older version, a manual copy), if it
     // changed the vault before this point; not one that does so after it.
@@ -732,16 +765,33 @@ pub(super) fn strip_parity(
             .map_err(|e| format!("{e}; run export-parity before stripping, or pass --force"))?;
         let blocks = collect_live_block_refs(&vault);
         let (k, p) = manifest_error_correction_grid(vault.manifest.error_correction_pct);
-        let (expected, _, _, _) = compute_error_correction_shards_grid(&blocks, k, p);
+        let (expected, _, _, _) = compute_error_correction_shards_with_headroom(
+            &blocks,
+            k,
+            p,
+            vault.default_memory_headroom(),
+        )?;
         if detached.read_segment_avec_bounded(VAULT_SIDECAR_SEG_DATA, expected.len())? != expected {
             return Err("Refusing to strip embedded parity: detached data parity is missing, damaged or stale. Run \"vault export-parity\" first, or pass --force to drop recovery entirely.".to_string());
         }
         {
             // Data parity alone cannot protect current metadata, even when
             // data blocks have not changed since an earlier export.
-            let header = compute_metadata_parity(&vault.header.to_bytes(), k, p);
-            let manifest =
-                compute_metadata_parity(&read_manifest_raw(vault_path, &vault.header)?, k, p);
+            let header = compute_error_correction_shards_with_headroom(
+                &[&vault.header.to_bytes()],
+                k,
+                p,
+                vault.default_memory_headroom(),
+            )?
+            .0;
+            let raw = read_manifest_raw(vault_path, &vault)?;
+            let manifest = compute_error_correction_shards_with_headroom(
+                &[&raw],
+                k,
+                p,
+                vault.default_memory_headroom(),
+            )?
+            .0;
             if detached.read_segment_avec_bounded(VAULT_SIDECAR_SEG_HEADER, header.len())? != header
                 || detached.read_segment_avec_bounded(VAULT_SIDECAR_SEG_MANIFEST, manifest.len())?
                     != manifest
@@ -899,21 +949,9 @@ pub(super) fn repair_vault(
     }
 
     // Resolve parity in priority order (explicit -> detached sidecar -> embedded).
-    // An explicitly named source that fails is a hard error; a missing default
-    // source just means "nothing to repair from", leaving the vault untouched.
-    let (error_correction_bytes, source) = match resolve_parity_source(vault, parity) {
-        Ok((b, s)) => (Some(b), s),
-        Err(e) => {
-            if parity.is_some() {
-                return Err(e);
-            }
-            (None, ParitySource::None)
-        }
-    };
-
-    let mut repaired_count = 0;
-
-    if let Some(error_correction_b) = error_correction_bytes {
+    // Missing parity leaves the vault untouched. Read and allocation failures
+    // are propagated so callers can distinguish them from missing parity.
+    if let Some((error_correction_b, source)) = resolve_parity_source(vault, parity)? {
         let ordered = vault.frames_in_storage_order();
         // On the plaintext lane block_len comes from an unauthenticated manifest
         // and sizes the buffers below: bound each block like every other reader,
@@ -929,6 +967,7 @@ pub(super) fn repair_vault(
 
         // Reconstruction holds the individual blocks and the concatenated
         // stream together. Parsing also copies the serialized parity payload.
+        // Assembly uses two exact frame buffers and no parity workspace.
         let group_bytes = ErrorCorrectionPayloadHeader::from_bytes(&error_correction_b)
             .ok()
             .map_or(0, |header| {
@@ -974,6 +1013,7 @@ pub(super) fn repair_vault(
             .collect();
 
         let _ = reconstruct_from_error_correction(&mut blocks, &error_correction_b)?;
+        drop(error_correction_b);
 
         // Safety gate (CLAUDE-AV-ECC-01): RS reconstruction is only correct when
         // the surviving data shards AND the parity shards were themselves intact.
@@ -1005,9 +1045,12 @@ pub(super) fn repair_vault(
         let all_verified = blocks.iter().enumerate().all(|(i, _)| block_verified(i));
 
         if all_verified {
-            repaired_count = bad_indices.len();
+            let repaired_count = bad_indices.len();
             if !dry_run {
                 let mut new_data = zeroize::Zeroizing::new(Vec::new());
+                new_data
+                    .try_reserve_exact(total as usize)
+                    .map_err(allocation_error)?;
                 let mut new_chunks = BTreeMap::new();
                 for (i, rec) in ordered.into_iter().enumerate() {
                     let mut rec = rec.clone();
@@ -1015,11 +1058,10 @@ pub(super) fn repair_vault(
                     if blocks[i].len() >= 8 {
                         rec.block_len = u64::from_le_bytes(blocks[i][0..8].try_into().unwrap());
                     }
-                    crate::secret::reserve(&mut new_data, blocks[i].len())
-                        .map_err(|e| e.to_string())?;
                     new_data.extend_from_slice(&blocks[i]);
                     new_chunks.insert(rec.id.clone(), rec);
                 }
+                drop(blocks);
                 let mut old_data = zeroize::Zeroizing::new(std::mem::replace(
                     &mut vault.data,
                     std::mem::take(&mut *new_data),
@@ -1033,6 +1075,9 @@ pub(super) fn repair_vault(
                 }
                 wipe_repair_discard(old_data);
             }
+            if repaired_count > 0 {
+                return Ok((repaired_count, source));
+            }
         }
         // else: reconstruction could not be verified -> leave the vault
         // byte-for-byte untouched (repaired_count stays 0) so no redundancy is lost.
@@ -1041,13 +1086,10 @@ pub(super) fn repair_vault(
     // Damage was found but nothing could be repaired (no parity, damage beyond
     // the parity budget, or a stale/foreign sidecar): say so instead of
     // returning a zero count that reads as "nothing to repair".
-    if repaired_count == 0 {
-        return Err(format!(
-            "{} damaged block(s) could not be repaired from the available Error Correction parity",
-            damaged.len()
-        ));
-    }
-    Ok((repaired_count, source))
+    Err(format!(
+        "{} damaged block(s) could not be repaired from the available Error Correction parity",
+        damaged.len()
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1062,12 +1104,11 @@ pub(super) fn legacy_extension_bound(
         return Ok(0);
     }
     let mut header = [pending_header.to_vec()];
-    if reconstruct_from_error_correction(&mut header, &header_parity).is_err() {
-        return Ok(0);
-    }
-    let Ok(header) = VaultHeaderV3::from_bytes(&header[0]) else {
-        return Ok(0);
+    let context = |error| {
+        format!("Cannot reconstruct the legacy header for the extension directory bound: {error}")
     };
+    reconstruct_from_error_correction(&mut header, &header_parity).map_err(context)?;
+    let header = VaultHeaderV3::from_bytes(&header[0]).map_err(context)?;
     if header.extension_dir_len == 0 {
         return Ok(0); // Legacy JSON decoding also rejects an empty directory.
     }
@@ -1390,6 +1431,116 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn memory_fixture(dir: &Path, mebibytes: usize, embedded: bool) -> PathBuf {
+        use rand::{RngCore, SeedableRng};
+
+        let path = dir.join("limited.aerozip");
+        let input = dir.join("input");
+        let mut options = CreateOptionsV3::new_plaintext(&path);
+        options.cdc_bounds = Some(super::super::chunking::CdcBounds {
+            min: 1024 * 1024,
+            avg: 1024 * 1024,
+            max: 1024 * 1024,
+        });
+        if embedded {
+            VaultV3::create_with_error_correction(&options, RecoveryPlacement::Embedded, 20)
+                .unwrap();
+        } else {
+            VaultV3::create(&options).unwrap();
+        }
+        let mut payload = vec![0; mebibytes * 1024 * 1024];
+        rand::rngs::StdRng::seed_from_u64(810).fill_bytes(&mut payload);
+        std::fs::write(&input, payload).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        path
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn limit_additional_address_space(bytes: u64) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let mapped = super::super::vault::parse_linux_kib(&status, "VmSize").unwrap();
+        let limit = mapped + bytes;
+        let bounds = libc::rlimit {
+            rlim_cur: limit,
+            rlim_max: limit,
+        };
+        // SAFETY: only the test child changes its own address-space limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &bounds) }, 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn write_repair_uses_one_exact_replacement_buffer() {
+        const KEY: &str = "AEROVAULT_TEST_WRITE_REPAIR_PEAK";
+        const TEST: &str = "v3::ec::tests::write_repair_uses_one_exact_replacement_buffer";
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            assert!(vault.manifest.chunks.len() >= 17);
+            let mut capacity = 0usize;
+            let mut written = 0usize;
+            let mut overlap = 0usize;
+            for frame in vault.frames_in_storage_order() {
+                written += 8 + usize::try_from(frame.block_len).unwrap();
+                if written > capacity {
+                    let next = written.max(2 * capacity);
+                    overlap = overlap.max(capacity + next);
+                    capacity = next;
+                }
+            }
+            let budget = 57 * 1024 * 1024;
+            assert!(written * 2 < budget && written + overlap > budget);
+            limit_additional_address_space(budget as u64);
+            crate::secret::WIPED_GROWTH.with(|count| count.set(0));
+            assert_eq!(
+                VaultV3::repair(&mut vault, false, None).unwrap(),
+                (1, ParitySource::Detached)
+            );
+            assert_eq!(crate::secret::WIPED_GROWTH.with(|count| count.get()), 0);
+            assert!(VaultV3::scrub(&vault).is_empty());
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = memory_fixture(dir.path(), 17, false);
+        VaultV3::export_parity(&path, "", None).unwrap();
+        let clean = super::super::strip_transaction::generation(&path).unwrap();
+        corrupt_data_section(&path, 1);
+        crate::source::memory_test::run(TEST, KEY, &path);
+        assert_eq!(
+            super::super::strip_transaction::generation(&path).unwrap(),
+            clean
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn export_returns_memory_error_and_preserves_existing_sidecar() {
+        const KEY: &str = "AEROVAULT_TEST_EXPORT_MEMORY";
+        const TEST: &str =
+            "v3::ec::tests::export_returns_memory_error_and_preserves_existing_sidecar";
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            limit_additional_address_space(12 * 1024 * 1024);
+            let error = VaultV3::export_parity(&path, "", None).unwrap_err();
+            assert!(
+                error.contains("Error Correction generation needs"),
+                "{error}"
+            );
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = memory_fixture(dir.path(), 8, false);
+        VaultV3::export_parity(&path, "", None).unwrap();
+        let sidecar = default_sidecar_path(&path);
+        let before = std::fs::read(&sidecar).unwrap();
+        crate::source::memory_test::run(TEST, KEY, &path);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), before);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     #[test]
     fn repair_returns_a_memory_error_with_the_data_already_resident() {
         use std::io::{Seek, SeekFrom, Write};
@@ -1425,24 +1576,32 @@ mod tests {
                         .contains("Cannot allocate Error Correction reconstruction buffers") => {}
                 result => panic!("Expected repair or a fallible allocation error, got {result:?}"),
             }
+            let parity_len = vault
+                .extensions
+                .iter()
+                .find(|entry| entry.extension_id == ERROR_CORRECTION_EXTENSION_ID)
+                .unwrap()
+                .length;
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let mapped = super::super::vault::parse_linux_kib(&status, "VmSize").unwrap();
+            let bounds = libc::rlimit {
+                rlim_cur: mapped + parity_len / 2,
+                rlim_max: limit,
+            };
+            assert!(bounds.rlim_cur < bounds.rlim_max);
+            // SAFETY: this only lowers the address-space limit of the child.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &bounds) }, 0);
+            for dry_run in [true, false] {
+                let error = VaultV3::repair(&mut vault, dry_run, None).unwrap_err();
+                assert!(error.contains("Error Correction parity needs"), "{error}");
+            }
             crate::source::memory_test::complete();
             return;
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("repair.aerozip");
-        let input = dir.path().join("input");
-        let mut payload = vec![0; 8 * 1024 * 1024];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut payload);
-        std::fs::write(&input, payload).unwrap();
-        VaultV3::create_with_error_correction(
-            &CreateOptionsV3::new_plaintext(&path),
-            RecoveryPlacement::Embedded,
-            20,
-        )
-        .unwrap();
-        let mut vault = VaultV3::open_plaintext(&path).unwrap();
-        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        let path = memory_fixture(dir.path(), 8, true);
+        let vault = VaultV3::open_plaintext(&path).unwrap();
         let record = vault.manifest.chunks.values().next().unwrap();
         let offset = vault.header.data_offset + vault.file_data_offset(record) + 8;
         let changed = vault.data[record.data_offset as usize + 8] ^ 1;

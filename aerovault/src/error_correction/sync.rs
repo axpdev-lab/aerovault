@@ -122,7 +122,8 @@ fn build_windowed_sidecar(data: &[u8], pct: u32, window: u64) -> (AeroCorrectSid
     for (off, len) in aerocorrect_windows(file_size, window) {
         let w = &data[off as usize..(off + len) as usize];
         let (avec_bytes, shards, _protected, _overhead) =
-            compute_error_correction_shards_grid(&[w], k, p);
+            compute_error_correction_shards_grid(&[w], k, p)
+                .expect("Cannot generate in-memory Error Correction sidecar");
         total_shards += shards;
         total_avec += avec_bytes.len() as u64;
         segments.push(AeroCorrectSegment {
@@ -295,7 +296,7 @@ fn generate_sync_sidecar_for_file_capped_windowed(
         })?;
         hasher.update(&buf);
         let (avec_bytes, shards, _protected, _overhead) =
-            compute_error_correction_shards_grid(&[&buf], k, p);
+            compute_error_correction_shards_grid(&[&buf], k, p)?;
         total_shards += shards;
         total_avec += avec_bytes.len() as u64;
         segments.push(AeroCorrectSegment {

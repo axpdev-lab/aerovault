@@ -190,10 +190,14 @@ pub(crate) struct ErrorCorrectionPayload {
 }
 
 impl ErrorCorrectionPayload {
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, String> {
         let cksum_bytes = (self.data_checksums.len() + self.parity_checksums.len())
             * ERROR_CORRECTION_SHARD_CKSUM_LEN;
-        let mut out = Vec::with_capacity(32 + cksum_bytes + self.parity_data.len());
+        let capacity = 32usize
+            .checked_add(cksum_bytes)
+            .and_then(|bytes| bytes.checked_add(self.parity_data.len()))
+            .ok_or("Error Correction payload exceeds address space")?;
+        let mut out = parity_generation_buffer(capacity)?;
         out.extend_from_slice(&self.header.to_bytes());
         for c in &self.data_checksums {
             out.extend_from_slice(c);
@@ -202,7 +206,7 @@ impl ErrorCorrectionPayload {
             out.extend_from_slice(c);
         }
         out.extend_from_slice(&self.parity_data);
-        out
+        Ok(out)
     }
 
     pub(crate) fn from_bytes(data: &[u8]) -> Result<Self, String> {
@@ -281,7 +285,9 @@ impl ErrorCorrectionPayload {
 /// (header+checksums+parity data) vs protected.
 /// Empty input -> (vec![], 0, 0, 0.0).
 #[allow(dead_code)]
-pub(crate) fn compute_error_correction_shards(data_blocks: &[&[u8]]) -> (Vec<u8>, u64, u64, f64) {
+pub(crate) fn compute_error_correction_shards(
+    data_blocks: &[&[u8]],
+) -> Result<(Vec<u8>, u64, u64, f64), String> {
     compute_error_correction_shards_grid(
         data_blocks,
         ERROR_CORRECTION_DATA_SHARDS,
@@ -342,15 +348,23 @@ pub(crate) fn compute_error_correction_shards_grid(
     data_blocks: &[&[u8]],
     k: usize,
     p: usize,
-) -> (Vec<u8>, u64, u64, f64) {
+) -> Result<(Vec<u8>, u64, u64, f64), String> {
+    compute_error_correction_shards_with_headroom(data_blocks, k, p, None)
+}
+
+pub(crate) fn compute_error_correction_shards_with_headroom(
+    data_blocks: &[&[u8]],
+    k: usize,
+    p: usize,
+    available: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64, f64), String> {
     // Concatenate the live blocks into the logical stream D of length L.
-    let l: usize = data_blocks.iter().map(|b| b.len()).sum();
+    let l = data_blocks
+        .iter()
+        .try_fold(0usize, |sum, block| sum.checked_add(block.len()))
+        .ok_or("Error Correction input exceeds address space")?;
     if l == 0 {
-        return (vec![], 0, 0, 0.0);
-    }
-    let mut d = Vec::with_capacity(l);
-    for b in data_blocks {
-        d.extend_from_slice(b);
+        return Ok((Vec::new(), 0, 0, 0.0));
     }
     // S = ceil(L/K) clamped: a small payload becomes one full group (overhead == P/K);
     // a large payload becomes many full groups at capped shard granularity.
@@ -360,23 +374,40 @@ pub(crate) fn compute_error_correction_shards_grid(
 
     let num_data_shards = l.div_ceil(s);
     let num_groups = num_data_shards.div_ceil(k);
-    let total_shards = (num_data_shards + num_groups * p) as u64;
-
-    // Bytes of data shard `idx` (zero-padded past the end of D).
-    let shard_at = |idx: usize| -> Vec<u8> {
-        let start = idx * s;
-        let end = (start + s).min(l);
-        let mut v = vec![0u8; s];
-        if start < end {
-            v[..end - start].copy_from_slice(&d[start..end]);
-        }
-        v
-    };
-
-    let mut data_checksums = Vec::with_capacity(num_data_shards);
-    for i in 0..num_data_shards {
-        data_checksums.push(error_correction_shard_checksum(&shard_at(i)));
+    let parity_count = num_groups
+        .checked_mul(p)
+        .ok_or("Error Correction shard count overflow")?;
+    let parity_len = parity_count
+        .checked_mul(s)
+        .ok_or("Error Correction parity size overflow")?;
+    let total_shards = num_data_shards
+        .checked_add(parity_count)
+        .ok_or("Error Correction shard count overflow")?;
+    let table_bytes = (total_shards as u64)
+        .saturating_mul(ERROR_CORRECTION_SHARD_CKSUM_LEN as u64)
+        .saturating_add(parity_len as u64);
+    let peak = table_bytes
+        .saturating_add((l as u64).saturating_add(((k + p) * s) as u64))
+        .max(table_bytes.saturating_mul(2).saturating_add(32));
+    if let Some(available) = available.filter(|&available| peak > available) {
+        return Err(format!(
+            "Error Correction generation needs {peak} more bytes in memory, but the system reports {available} bytes available"
+        ));
     }
+
+    let mut d = parity_generation_buffer(l)?;
+    for block in data_blocks {
+        d.extend_from_slice(block);
+    }
+    let mut data_checksums = parity_generation_buffer(num_data_shards)?;
+    let mut scratch = parity_generation_buffer(s)?;
+    scratch.resize(s, 0);
+    for chunk in d.chunks(s) {
+        scratch[..chunk.len()].copy_from_slice(chunk);
+        scratch[chunk.len()..].fill(0);
+        data_checksums.push(error_correction_shard_checksum(&scratch));
+    }
+    drop(scratch);
 
     // Invariant: (k, p) always originate from `error_correction_grid` (k in [2,20],
     // p in {1,2}, so k+p < 256 and both >= 1). RS construction therefore cannot fail,
@@ -385,18 +416,28 @@ pub(crate) fn compute_error_correction_shards_grid(
     let rs = ReedSolomon::<reed_solomon_erasure::galois_8::Field>::new(k, p)
         .expect("invalid ReedSolomon parameters (k,p must come from error_correction_grid)");
 
-    let mut parity_data = Vec::with_capacity(num_groups * p * s);
-    let mut parity_checksums = Vec::with_capacity(num_groups * p);
+    let mut parity_data = parity_generation_buffer(parity_len)?;
+    let mut parity_checksums = parity_generation_buffer(parity_count)?;
+    let mut shards = parity_generation_buffer(k + p)?;
+    for _ in 0..k + p {
+        let mut shard = parity_generation_buffer(s)?;
+        shard.resize(s, 0);
+        shards.push(shard);
+    }
 
     for g in 0..num_groups {
         // K data slots + P parity slots. Slots past num_data_shards stay zero
         // (virtual padding); parity slots are filled by encode.
-        let mut shards: Vec<Vec<u8>> = vec![vec![0u8; s]; k + p];
         for (local, shard) in shards.iter_mut().take(k).enumerate() {
             let gi = g * k + local;
-            if gi < num_data_shards {
-                *shard = shard_at(gi);
-            }
+            let chunk = if gi < num_data_shards {
+                let start = gi * s;
+                &d[start..start.saturating_add(s).min(l)]
+            } else {
+                &[]
+            };
+            shard[..chunk.len()].copy_from_slice(chunk);
+            shard[chunk.len()..].fill(0);
         }
         rs.encode(&mut shards).expect("RS encode failed");
         for pp in 0..p {
@@ -405,6 +446,8 @@ pub(crate) fn compute_error_correction_shards_grid(
             parity_data.extend_from_slice(par);
         }
     }
+    drop(shards);
+    drop(d);
 
     let header = ErrorCorrectionPayloadHeader {
         data_shards: k as u16,
@@ -419,25 +462,33 @@ pub(crate) fn compute_error_correction_shards_grid(
         parity_checksums,
         parity_data,
     }
-    .to_bytes();
+    .to_bytes()?;
     let protected = l as u64;
     let overhead = if protected > 0 {
         (payload.len() as f64 / protected as f64) * 100.0
     } else {
         0.0
     };
-    (payload, total_shards, protected, overhead)
+    Ok((payload, total_shards as u64, protected, overhead))
+}
+
+fn parity_generation_buffer<T>(capacity: usize) -> Result<Vec<T>, String> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|error| format!("Cannot allocate Error Correction generation buffers: {error}"))?;
+    Ok(bytes)
 }
 
 /// Compute the AVEC parity for a single fixed metadata region, treating it as one
 /// block. An empty region yields an empty payload.
 #[allow(dead_code)]
-pub(crate) fn compute_metadata_parity(region: &[u8], k: usize, p: usize) -> Vec<u8> {
-    if region.is_empty() {
-        return Vec::new();
-    }
-    let (payload, _shards, _prot, _ov) = compute_error_correction_shards_grid(&[region], k, p);
-    payload
+pub(crate) fn compute_metadata_parity(
+    region: &[u8],
+    k: usize,
+    p: usize,
+) -> Result<Vec<u8>, String> {
+    compute_error_correction_shards_grid(&[region], k, p).map(|(payload, _, _, _)| payload)
 }
 
 // Reconstruction allocates these buffers at their final sizes. Reed-Solomon
@@ -1043,7 +1094,8 @@ mod tests {
     #[test]
     fn roundtrip_recovers_single_erasure() {
         let data = sample(50_000);
-        let (payload, _shards, prot, _ov) = compute_error_correction_shards_grid(&[&data], 10, 2);
+        let (payload, _shards, prot, _ov) =
+            compute_error_correction_shards_grid(&[&data], 10, 2).unwrap();
         assert_eq!(prot, data.len() as u64);
         let mut damaged = data.clone();
         damaged[12_345] ^= 0xFF;
@@ -1056,7 +1108,7 @@ mod tests {
     #[test]
     fn erasure_budget_boundary_recovers_p_and_leaves_p_plus_1() {
         let data = sample(60_000);
-        let (payload, _s, _p, _o) = compute_error_correction_shards_grid(&[&data], 10, 2);
+        let (payload, _s, _p, _o) = compute_error_correction_shards_grid(&[&data], 10, 2).unwrap();
         let s = ErrorCorrectionPayload::from_bytes(&payload)
             .unwrap()
             .header
@@ -1086,7 +1138,7 @@ mod tests {
     fn multigroup_recovers_one_erasure_per_group() {
         // 10 MiB at (4,2) forces shard size to clamp at MAX_SHARD and >1 group.
         let data = sample(10 * 1024 * 1024);
-        let (payload, _s, _p, _o) = compute_error_correction_shards_grid(&[&data], 4, 2);
+        let (payload, _s, _p, _o) = compute_error_correction_shards_grid(&[&data], 4, 2).unwrap();
         let header = ErrorCorrectionPayload::from_bytes(&payload).unwrap().header;
         let (num_data, num_groups) = error_correction_geometry(&header);
         assert!(num_groups > 1, "expected multiple groups, got {num_groups}");
@@ -1107,7 +1159,7 @@ mod tests {
     #[test]
     fn round11_reconstruction_wipes_discarded_stream_and_shards() {
         let original = vec![0xa7; 40 * 1024];
-        let parity = compute_metadata_parity(&original, 10, 2);
+        let parity = compute_metadata_parity(&original, 10, 2).unwrap();
         let mut damaged = original.clone();
         damaged[37] ^= 1;
         let mut blocks = [damaged];
@@ -1125,16 +1177,16 @@ mod tests {
     #[test]
     fn reconstruct_rejects_wrong_total_len() {
         let data = sample(20_000);
-        let (payload, _s, _p, _o) = compute_error_correction_shards_grid(&[&data], 10, 2);
+        let (payload, _s, _p, _o) = compute_error_correction_shards_grid(&[&data], 10, 2).unwrap();
         let mut wrong = vec![sample(19_999)];
         assert!(reconstruct_from_error_correction(&mut wrong, &payload).is_err());
     }
 
     #[test]
     fn metadata_parity_empty_and_single_region() {
-        assert!(compute_metadata_parity(&[], 10, 2).is_empty());
+        assert!(compute_metadata_parity(&[], 10, 2).unwrap().is_empty());
         let region = sample(8_000);
-        let parity = compute_metadata_parity(&region, 10, 2);
+        let parity = compute_metadata_parity(&region, 10, 2).unwrap();
         assert!(!parity.is_empty());
         let mut damaged = region.clone();
         damaged[1234] ^= 0xFF;
@@ -1187,7 +1239,7 @@ mod tests {
 
     #[test]
     fn empty_input_yields_empty_payload() {
-        let (payload, shards, prot, ov) = compute_error_correction_shards_grid(&[], 10, 2);
+        let (payload, shards, prot, ov) = compute_error_correction_shards_grid(&[], 10, 2).unwrap();
         assert!(payload.is_empty());
         assert_eq!((shards, prot, ov), (0, 0, 0.0));
         // Reconstruct with an empty payload is a no-op.
@@ -1629,6 +1681,7 @@ mod tests {
             for len in [1, 256, ERROR_CORRECTION_MIN_SHARD - 1, 9001] {
                 let input = vec![0x5a; len];
                 let actual = compute_error_correction_shards_grid(&[&input], k, p)
+                    .unwrap()
                     .0
                     .len() as u64;
                 assert_eq!(
@@ -1648,6 +1701,7 @@ mod tests {
                 assert_eq!(
                     parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
                     compute_error_correction_shards_grid(&[&input], k, p)
+                        .unwrap()
                         .0
                         .len() as u64
                 );
@@ -1659,6 +1713,7 @@ mod tests {
             assert_eq!(
                 parity_payload_len(len as u64, k as u64, p as u64).unwrap(),
                 compute_error_correction_shards_grid(&[&input], k, p)
+                    .unwrap()
                     .0
                     .len() as u64
             );
@@ -1729,7 +1784,8 @@ mod tests {
         for (k, p) in grids {
             for length in [1, 4097, 16385] {
                 let original = vec![0x5a; length];
-                let (bytes, _, _, _) = compute_error_correction_shards_grid(&[&original], k, p);
+                let (bytes, _, _, _) =
+                    compute_error_correction_shards_grid(&[&original], k, p).unwrap();
                 ErrorCorrectionPayload::from_bytes(&bytes).unwrap();
                 let mut blocks = vec![original.clone()];
                 blocks[0][0] ^= 1;

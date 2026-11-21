@@ -151,8 +151,14 @@ impl AeroCorrectSidecar {
     /// Encode one directory copy (the locator): the fixed prefix plus, per segment, its
     /// window placement, AVEC length, and a copy of the AVEC payload's 32-byte geometry
     /// header (so a rotted in-payload header can be healed from here on read).
-    fn encode_directory(&self) -> Vec<u8> {
-        let mut d = Vec::with_capacity(DIR_FIXED_LEN + DIR_PER_SEG_LEN * self.segments.len());
+    fn encode_directory(&self) -> Result<Vec<u8>, String> {
+        let len = DIR_PER_SEG_LEN
+            .checked_mul(self.segments.len())
+            .and_then(|len| len.checked_add(DIR_FIXED_LEN))
+            .ok_or("Error Correction directory exceeds address space")?;
+        let mut d = Vec::new();
+        d.try_reserve_exact(len)
+            .map_err(|error| format!("Cannot allocate Error Correction directory: {error}"))?;
         d.extend_from_slice(&self.total_len.to_le_bytes());
         d.extend_from_slice(&self.binding_id);
         d.extend_from_slice(&self.content_sha256);
@@ -165,15 +171,36 @@ impl AeroCorrectSidecar {
             geom[..g].copy_from_slice(&segment.avec_bytes[..g]);
             d.extend_from_slice(&geom);
         }
-        d
+        Ok(d)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.try_to_bytes(None)
+            .expect("Cannot serialize Error Correction sidecar")
+    }
+
+    pub(crate) fn try_to_bytes(&self, available: Option<u64>) -> Result<Vec<u8>, String> {
         let n = self.segments.len();
-        let dir = self.encode_directory();
-        let parity_len: usize = self.segments.iter().map(|s| s.avec_bytes.len()).sum();
-        let total = V2_PREFIX_LEN + DIRECTORY_COPIES * (dir.len() + COPY_CKSUM_LEN) + parity_len;
-        let mut out = Vec::with_capacity(total);
+        let dir = self.encode_directory()?;
+        let total = dir
+            .len()
+            .checked_add(COPY_CKSUM_LEN)
+            .and_then(|len| len.checked_mul(DIRECTORY_COPIES))
+            .and_then(|len| len.checked_add(V2_PREFIX_LEN))
+            .and_then(|len| {
+                self.segments.iter().try_fold(len, |total, segment| {
+                    total.checked_add(segment.avec_bytes.len())
+                })
+            })
+            .ok_or("Error Correction sidecar exceeds address space")?;
+        if let Some(available) = available.filter(|&available| total as u64 > available) {
+            return Err(format!(
+                "Error Correction sidecar needs {total} more bytes in memory, but the system reports {available} bytes available"
+            ));
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(total)
+            .map_err(|error| format!("Cannot allocate Error Correction sidecar: {error}"))?;
         out.extend_from_slice(AEROCORRECT_MAGIC);
         out.push(AEROCORRECT_VERSION);
         let count = (n as u32).to_le_bytes();
@@ -188,7 +215,7 @@ impl AeroCorrectSidecar {
         for segment in &self.segments {
             out.extend_from_slice(&segment.avec_bytes);
         }
-        out
+        Ok(out)
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
@@ -1029,7 +1056,10 @@ impl AeroCorrectSidecarReader {
         self.file
             .seek(SeekFrom::Start(off))
             .map_err(|e| format!("seek aerocorrect segment avec: {e}"))?;
-        let mut buf = vec![0u8; len];
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len)
+            .map_err(|e| format!("Cannot allocate detached Error Correction parity: {e}"))?;
+        buf.resize(len, 0);
         self.file
             .read_exact(&mut buf)
             .map_err(|e| format!("read aerocorrect segment avec: {e}"))?;
@@ -1067,7 +1097,8 @@ mod tests {
 
     fn single_segment(data: &[u8], pct: u32) -> AeroCorrectSidecar {
         let (k, p) = error_correction_grid(pct);
-        let (avec, _shards, _prot, _ovh) = compute_error_correction_shards_grid(&[data], k, p);
+        let (avec, _shards, _prot, _ovh) =
+            compute_error_correction_shards_grid(&[data], k, p).unwrap();
         AeroCorrectSidecar::new(
             sha256(data),
             data.len() as u64,
@@ -1084,6 +1115,9 @@ mod tests {
         let data = sample(96 * 1024 + 17);
         let sc = single_segment(&data, 15);
         let bytes = sc.to_bytes();
+        let error = sc.try_to_bytes(Some(bytes.len() as u64 - 1)).unwrap_err();
+        assert!(error.contains("Error Correction sidecar needs"), "{error}");
+        assert_eq!(sc.try_to_bytes(Some(bytes.len() as u64)).unwrap(), bytes);
         let parsed = AeroCorrectSidecar::from_bytes(&bytes).expect("parse");
         assert_eq!(parsed, sc);
         assert_eq!(parsed.to_bytes(), bytes);
@@ -1150,7 +1184,8 @@ mod tests {
             .into_iter()
             .map(|(off, len)| {
                 let w = &data[off as usize..(off + len) as usize];
-                let (avec, _s, _prot, _ovh) = compute_error_correction_shards_grid(&[w], k, p);
+                let (avec, _s, _prot, _ovh) =
+                    compute_error_correction_shards_grid(&[w], k, p).unwrap();
                 AeroCorrectSegment {
                     window_offset: off,
                     window_len: len,
