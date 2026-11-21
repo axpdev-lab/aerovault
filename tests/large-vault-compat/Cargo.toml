@@ -1,0 +1,13 @@
+[package]
+name = "aerovault-large-compat"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+aerovault = { path = "../../aerovault" }
+aerovault_068 = { package = "aerovault", version = "=0.6.8" }
+sha2 = "0.10"
+tempfile = "3.15"

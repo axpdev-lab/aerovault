@@ -178,6 +178,14 @@ vault.move_entry("secret.pdf", "archive/secret.pdf")?;
 vault.copy_entry("archive/secret.pdf", "backup/secret.pdf")?;
 ```
 
+### Large v3 vaults and resource limits
+
+V3 keeps stored data in memory. Plaintext archives load their declared frames without the unused gaps between them. Opening validates file ranges and metadata and checks reported memory headroom before allocating a buffer under the default policy. Writes hash and compare the source generation under the writer lock before publishing. If the filesystem cannot identify sparse extents and the archive has an unused tail larger than 4 GiB, the vault can open for extraction. Writes and parity exports then require a complete generation check.
+
+Embedders can cap the stored data section by passing `VaultV3Limits::default().with_max_data_bytes(bytes)` to `VaultV3::open_with_limits` or `VaultV3::open_plaintext_with_limits`. The handle applies the same limit to later writes. Detached export and strip also provide `*_with_limits` variants. This limit covers stored data bytes. Compression, encryption and recovery may need additional memory. A pending recovery journal may be finished before the open checks the budget.
+
+For CLI use and existing library entry points, `AEROVAULT_V3_DATA_BUDGET_BYTES` is an optional decimal-byte limit from 1 GiB to the platform allocation limit. An invalid configured value returns an error. Explicit library limits are independent of that variable.
+
 ### Error Correction API
 
 ```rust
@@ -201,6 +209,8 @@ fn protect_and_repair() -> Result<(), Box<dyn std::error::Error>> {
 The current version is **v4 = v3 container + Error Correction**. See [docs/AEROVAULT-V3-SPEC.md](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V3-SPEC.md) for the full v3 container specification (header, wrapper pipeline, manifest, extension directory, cryptography matrix) and the v4 Error Correction layer that rides on top of it. v4 is not a new on-disk major: the container stays v3 (magic `AEROVAULT3`, `format = 3`) and a plain v3 reader still opens a v4 container, skipping the non-critical Error Correction extension. The base binary layout that v3 builds on is in [docs/AEROVAULT-V2-SPEC.md](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROVAULT-V2-SPEC.md), and the detached recovery sidecar is in [docs/AEROCORRECT-SPEC.md](https://github.com/axpdev-lab/aerovault/blob/main/docs/AEROCORRECT-SPEC.md). See the [CHANGELOG](https://github.com/axpdev-lab/aerovault/blob/main/CHANGELOG.md) (0.4.0, 0.5.0) for the v3 and `.aerocorrect` deltas.
 
 ## Error Correction (`.aerocorrect`)
+
+On Linux, paired vault and sidecar writes that require a private journal use `$XDG_STATE_HOME/aerovault/journals`, with `~/.local/state` as the default base. If a writable ancestor makes that location unsafe, AeroVault creates `~/.aerovault-state` with mode 0700 and stores the journal in its `journals` subdirectory. This directory appears only when the fallback is needed. The fallback requires a trusted home with an absolute `HOME`. A usable XDG state directory works independently of `HOME`. If you changed a custom `XDG_STATE_HOME` after an interrupted update and AeroVault cannot find the journal, restore its previous value and reopen the vault. If an earlier exchange or rollback had finished and the current ordinary vault or its sidecar has since changed, AeroVault retains the earlier journal as `.aerostrip-completed-<vault-key>` in the same private state directory and proceeds to normal vault authentication. Each vault has one retained slot in each state directory. When it is occupied, a second completed journal stays at its active name until you free the retained slot. The journals and any remaining protected stage files still use disk space. See [completed private journals](docs/AEROVAULT-V3-SPEC.md#completed-private-journals) for the retirement procedure.
 
 `.aerocorrect` is a detached, par2-style Reed-Solomon recovery sidecar for **any** byte stream. It protects the bytes of the target without embedding anything into it, so the same format repairs `.aerovault` containers, synced files, or ordinary standalone files. The sidecar binds to the **SHA-256 of the protected content**, not to a path, salt, account, or provider identity.
 

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use zeroize::{Zeroize, Zeroizing};
 
-use super::block::{build_file_bytes, write_container};
+use super::block::{build_file_bytes, write_container, write_container_with_data};
 use super::chunking::{chunk_ranges_with, keyed_chunk_id, CdcBounds, StreamingChunker};
 use super::constants::{
     CDC_MAX, CRYPT_ALGORITHM_ENCRYPTED, CRYPT_ALGORITHM_NONE, DATA_OFFSET, DEFAULT_ZSTD_LEVEL,
@@ -47,46 +47,64 @@ use crate::aerocrypt::{
     wrap_key, KEY_SIZE, SALT_SIZE, WRAPPED_KEY_SIZE,
 };
 
-// Bound the generation scan independently of the in-memory data allocation.
-// The remainder covers the manifest, extension directory, parity and any
-// trailing bytes accepted from existing containers.
-pub(super) const MAX_GENERATION_EXTENT: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
 const DATA_BUDGET_ENV: &str = "AEROVAULT_V3_DATA_BUDGET_BYTES";
+const MIN_ENV_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
+const MAX_OPEN_TRAILING_SCAN: u64 = 4 * 1024 * 1024 * 1024;
 
-fn data_budget() -> u64 {
-    #[cfg(test)]
-    if let Some(limit) = TEST_DATA_BUDGET.with(|limit| limit.get()) {
-        return limit;
-    }
-    std::env::var(DATA_BUDGET_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|&size| (DEFAULT_DATA_BUDGET..=isize::MAX as u64).contains(&size))
-        .unwrap_or(DEFAULT_DATA_BUDGET)
+/// Optional resource policy for opening and editing a v3 container.
+///
+/// The data section is kept in memory. This limits its stored bytes, not the
+/// total process memory needed for compression, encryption or Error Correction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaultV3Limits {
+    max_data_bytes: Option<u64>,
 }
 
-fn ensure_data_budget(size: u64) -> Result<(), String> {
-    let budget = data_budget();
-    if size > budget {
-        return Err(format!(
-            "Vault data section exceeds the {budget}-byte in-memory open budget"
-        ));
+impl VaultV3Limits {
+    /// Limit the data section at open and on subsequent saves of the handle.
+    /// By default, there is no fixed size limit: an open is refused only when
+    /// the data section exceeds the memory the operating system reports as
+    /// available. An explicit limit replaces that check.
+    pub const fn with_max_data_bytes(mut self, max: u64) -> Self {
+        self.max_data_bytes = Some(max);
+        self
     }
-    Ok(())
-}
 
-fn ensure_write_data_budget(size: u64) -> Result<(), String> {
-    ensure_data_budget(size)?;
-    if size > MAX_GENERATION_EXTENT - DATA_OFFSET {
-        return Err("Vault data exceeds the 4 GiB write generation budget".into());
+    fn from_env() -> Result<Self, String> {
+        // Keep the valid values accepted by 0.6.9 when set explicitly.
+        let invalid = || {
+            format!(
+                "{DATA_BUDGET_ENV} must be an integer byte count in {MIN_ENV_DATA_BUDGET}..={}",
+                isize::MAX
+            )
+        };
+        let value = match std::env::var(DATA_BUDGET_ENV) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+        };
+        let max = value.parse::<u64>().map_err(|_| invalid())?;
+        if !(MIN_ENV_DATA_BUDGET..=isize::MAX as u64).contains(&max) {
+            return Err(invalid());
+        }
+        Ok(Self::default().with_max_data_bytes(max))
     }
-    Ok(())
-}
 
-#[cfg(test)]
-thread_local! {
-    static TEST_DATA_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    fn check_data_len(self, size: u64) -> Result<(), String> {
+        if let Some(max) = self.max_data_bytes.filter(|&max| size > max) {
+            return Err(format!(
+                "Vault data section of {size} bytes exceeds the configured {max}-byte data budget"
+            ));
+        }
+        Ok(())
+    }
+
+    fn default_memory_headroom(self) -> Option<u64> {
+        self.max_data_bytes
+            .is_none()
+            .then(available_memory_bytes)
+            .flatten()
+    }
 }
 
 /// Error returned by [`VaultV3::open`] for a plaintext container. Kept stable:
@@ -179,23 +197,26 @@ impl CreateOptionsV3 {
 
 /// An unlocked, fully in-memory AEROVAULT3 container.
 ///
-/// Holds the decrypted master and MAC keys plus the whole data section in RAM.
+/// Holds the decrypted master and MAC keys plus the vault data in RAM.
 /// Drop it when done: the [`Drop`] impl zeroizes the key material.
 pub struct OpenVaultV3 {
     pub(super) path: PathBuf,
     pub(super) header: VaultHeaderV3,
-    /// Length and BLAKE3 hash of the whole file as read at open (or as written
-    /// by the last save): the generation baseline. Taken from the bytes on
-    /// disk, so a header recovered from the sidecar does not count as a change.
+    /// Generation baseline measured from the raw file, including when the
+    /// decoded header was recovered from a sidecar.
     pub(super) opened_file_len: u64,
-    // Oversized legacy containers can be read through their bounded sections,
-    // without establishing a whole-file baseline that authorizes mutations.
+    /// End of the dense prefix. A sparse fingerprint also covers the
+    /// positions and contents of every extent beyond this point.
+    hashed_file_len: u64,
     opened_hash: Option<[u8; 32]>,
+    limits: VaultV3Limits,
     pub(super) master_key: [u8; KEY_SIZE],
     pub(super) mac_key: [u8; KEY_SIZE],
     pub(super) manifest: VaultManifestV3,
     pub(super) extensions: Vec<ExtensionEntryV3>,
     pub(super) data: Vec<u8>,
+    /// Original offsets for plaintext frames moved into a compact buffer.
+    plaintext_file_offsets: BTreeMap<String, u64>,
     /// Set when `open_vault` had to rebuild a corrupted encrypted manifest from
     /// Error-Correction parity (rev. 4). `repair` persists the healed region.
     pub(super) manifest_repaired_on_open: bool,
@@ -240,6 +261,29 @@ impl OpenVaultV3 {
     /// The container's filesystem path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(super) fn complete_generation(&self) -> Result<[u8; 32], String> {
+        self.opened_hash.ok_or_else(|| {
+            "Vault opened without a complete generation baseline. Use a filesystem with sparse extent support or remove the unused tail from a verified copy before writing".into()
+        })
+    }
+
+    pub(super) fn default_memory_headroom(&self) -> Option<u64> {
+        self.limits.default_memory_headroom()
+    }
+
+    pub(super) fn file_data_offset(&self, record: &ChunkRecordV3) -> u64 {
+        self.plaintext_file_offsets
+            .get(&record.id)
+            .copied()
+            .unwrap_or(record.data_offset)
+    }
+
+    pub(super) fn frames_in_storage_order(&self) -> Vec<&ChunkRecordV3> {
+        let mut records: Vec<_> = self.manifest.chunks.values().collect();
+        sort_stored_frames(&mut records, Some(&self.plaintext_file_offsets));
+        records
     }
 
     /// Attach an embedder telemetry sink to receive content-pipeline events for
@@ -372,7 +416,17 @@ impl VaultV3 {
         password: &str,
         out: Option<&Path>,
     ) -> Result<super::ec::ExportParityResult, String> {
-        super::ec::export_parity(vault_path, password, out)
+        Self::export_parity_with_limits(vault_path, password, out, VaultV3Limits::from_env()?)
+    }
+
+    /// Export a sidecar with an explicit data budget, independent of the environment.
+    pub fn export_parity_with_limits(
+        vault_path: &Path,
+        password: &str,
+        out: Option<&Path>,
+        limits: VaultV3Limits,
+    ) -> Result<super::ec::ExportParityResult, String> {
+        super::ec::export_parity(vault_path, password, out, limits)
     }
 
     /// Drop the embedded Error-Correction extension on the next seal. Refuses
@@ -384,7 +438,17 @@ impl VaultV3 {
         password: &str,
         force: bool,
     ) -> Result<super::ec::StripParityResult, String> {
-        super::ec::strip_parity(vault_path, password, force)
+        Self::strip_parity_with_limits(vault_path, password, force, VaultV3Limits::from_env()?)
+    }
+
+    /// Strip embedded parity with an explicit data budget, independent of the environment.
+    pub fn strip_parity_with_limits(
+        vault_path: &Path,
+        password: &str,
+        force: bool,
+        limits: VaultV3Limits,
+    ) -> Result<super::ec::StripParityResult, String> {
+        super::ec::strip_parity(vault_path, password, force, limits)
     }
 
     /// Verify every stored content block against its manifest `cipher_hash`,
@@ -418,14 +482,18 @@ impl VaultV3 {
     /// Pre-flight: which Error-Correction parity source a [`repair`](Self::repair)
     /// would draw from (`explicit` path wins, else the detached sidecar, else the
     /// embedded extension). An explicit path that is unreadable/malformed is a
-    /// hard error; an absent default source returns
-    /// [`ParitySource::None`](super::ec::ParitySource). Read-only; discards the
-    /// resolved parity bytes.
+    /// hard error, as is absence of all parity sources. Read-only; discards
+    /// the resolved parity bytes.
     pub fn resolve_parity_source(
         vault: &OpenVaultV3,
         explicit: Option<&Path>,
     ) -> Result<super::ec::ParitySource, String> {
-        super::ec::resolve_parity_source(vault, explicit).map(|(_, source)| source)
+        super::ec::resolve_parity_source(vault, explicit)?
+            .map(|(_, source)| source)
+            .ok_or_else(|| {
+                "No Error Correction parity available (no --parity, no .aerocorrect sidecar, no embedded extension)"
+                    .into()
+            })
     }
 
     /// Recovery surfaces available for a vault without the password.
@@ -452,9 +520,18 @@ impl VaultV3 {
     /// password unlock into an unencrypted archive whose later writes are stored
     /// in the clear. Open those with [`VaultV3::open_plaintext`].
     pub fn open(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
-        // Refused from the header alone, before any payload is read: a hostile
-        // plaintext container can declare a data section as large as the file.
-        let vault = open_vault_with(path, password, true)?;
+        Self::open_with_limits(path, password, VaultV3Limits::from_env()?)
+    }
+
+    /// Open an encrypted vault using the caller's limits instead of the environment.
+    /// The returned handle retains the same limits for all later mutations.
+    pub fn open_with_limits(
+        path: impl Into<PathBuf>,
+        password: &str,
+        limits: VaultV3Limits,
+    ) -> Result<OpenVaultV3, String> {
+        // Refused from the header alone, before any payload is read.
+        let vault = open_vault_with_guard(path, password, true, None, limits)?;
         if vault.header.flags & FLAG_PLAINTEXT_CONTENT != 0 {
             return Err(PLAINTEXT_NOT_A_VAULT.to_string());
         }
@@ -464,7 +541,15 @@ impl VaultV3 {
     /// Open a plaintext (`.aerovz`) container, which has no password.
     /// Errors if the container is an encrypted `.aerovault`.
     pub fn open_plaintext(path: impl Into<PathBuf>) -> Result<OpenVaultV3, String> {
-        let vault = open_vault(path, "")?;
+        Self::open_plaintext_with_limits(path, VaultV3Limits::from_env()?)
+    }
+
+    /// Open the plaintext lane with an explicit budget retained by the handle.
+    pub fn open_plaintext_with_limits(
+        path: impl Into<PathBuf>,
+        limits: VaultV3Limits,
+    ) -> Result<OpenVaultV3, String> {
+        let vault = open_vault_with_guard(path, "", false, None, limits)?;
         if vault.header.flags & FLAG_PLAINTEXT_CONTENT == 0 {
             return Err("Not a plaintext .aerovz archive (it is encrypted)".to_string());
         }
@@ -661,7 +746,7 @@ impl VaultV3 {
         if new_password.len() < MIN_PASSWORD_LEN {
             return Err("Password must be at least 8 characters".to_string());
         }
-        vault.writable_generation()?;
+        vault.complete_generation()?;
         let lock = write_lock(&vault.path)?;
         vault.path = lock.source_path().to_path_buf();
         let sidecar = super::ec::default_sidecar_path(lock.source_path());
@@ -694,6 +779,7 @@ impl VaultV3 {
             vault.header.clone(),
             vault.manifest.modified.clone(),
             vault.opened_file_len,
+            vault.hashed_file_len,
             vault.opened_hash,
             vault.header_repaired_on_open,
             vault.manifest_repaired_on_open,
@@ -708,8 +794,8 @@ impl VaultV3 {
             // leave old-header recovery beside a newly rotated container.
             // Use the same bounded, restart-recoverable pair transaction as
             // non-forced stripping, under the already held source/sidecar locks.
-            let prepared = super::strip_transaction::private_dir(
-                output_parent_dir(lock.source_path()),
+            let prepared = super::strip_transaction::prepare_update(
+                lock.source_path(),
                 ".aeropassword-prepare-",
             )?;
             super::strip_transaction::copy_file(
@@ -725,7 +811,12 @@ impl VaultV3 {
                 &target,
                 &prepared.path().join("new-sidecar"),
             )?;
-            super::strip_transaction::publish(lock.source_path(), prepared, &lock)
+            super::strip_transaction::publish_update(
+                lock.source_path(),
+                prepared,
+                &lock,
+                sidecar_lock.as_ref(),
+            )
         })();
         if let Err(error) = result {
             if staged && assert_vault_generation_current(vault).is_ok() {
@@ -737,6 +828,7 @@ impl VaultV3 {
                 vault.header,
                 vault.manifest.modified,
                 vault.opened_file_len,
+                vault.hashed_file_len,
                 vault.opened_hash,
                 vault.header_repaired_on_open,
                 vault.manifest_repaired_on_open,
@@ -1128,7 +1220,7 @@ fn ingest_chunk(
             .checked_add(8)
             .and_then(|start| start.checked_add(enc))
             .ok_or("Vault data length overflow")?;
-        ensure_write_data_budget(end)?;
+        vault.limits.check_data_len(end)?;
         let additional = encrypted.len() + 8;
         if plaintext {
             crate::secret::reserve_vec(&mut vault.data, additional)
@@ -1327,7 +1419,7 @@ fn write_op<T>(
     vault: &mut OpenVaultV3,
     op: impl FnOnce(&mut OpenVaultV3, &WriteLock, Option<&WriteLock>) -> Result<T, String>,
 ) -> Result<T, String> {
-    vault.writable_generation()?;
+    vault.complete_generation()?;
     let lock = write_lock(&vault.path)?;
     #[cfg(test)]
     if let Some(hook) = BEFORE_MUTATION_SIDECAR_LOCK.with(|h| h.borrow_mut().take()) {
@@ -1467,9 +1559,22 @@ fn append_sources_batched(
     Ok(())
 }
 
-/// Garbage-collect orphaned chunks: keep only chunk records still referenced by
-/// a live entry, rewrite the data section in block-index order, and remap each
-/// surviving record's `data_offset`.
+/// In a sparse layout new frames are appended after all existing disk offsets.
+/// Otherwise the records already carry the section offsets used on disk.
+fn sort_stored_frames<T: std::borrow::Borrow<ChunkRecordV3>>(
+    records: &mut [T],
+    file_offsets: Option<&BTreeMap<String, u64>>,
+) {
+    records.sort_by_key(|record| {
+        let record = record.borrow();
+        let offset = file_offsets.and_then(|offsets| offsets.get(&record.id));
+        (
+            offset.is_none(),
+            offset.copied().unwrap_or(record.data_offset),
+        )
+    });
+}
+
 /// Rewrite the data section with only the live chunks; returns the old one.
 fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<Vec<u8>, String> {
     let live_chunk_ids: HashSet<String> = vault
@@ -1484,25 +1589,23 @@ fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<Vec<u8>, String> {
         return Ok(std::mem::take(&mut vault.data));
     }
 
-    let mut ordered_ids: Vec<(u64, String)> = vault
+    let mut ordered_chunks: Vec<_> = vault
         .manifest
         .chunks
-        .iter()
-        .filter(|(id, _)| live_chunk_ids.contains(*id))
-        .map(|(id, record)| (record.block_index, id.clone()))
+        .values()
+        .filter(|record| live_chunk_ids.contains(&record.id))
         .collect();
-    ordered_ids.sort_by_key(|(index, _)| *index);
+    if vault.plaintext_file_offsets.is_empty() {
+        ordered_chunks.sort_by_key(|record| record.block_index);
+    } else {
+        sort_stored_frames(&mut ordered_chunks, Some(&vault.plaintext_file_offsets));
+    }
 
     let mut new_data = Vec::new();
     let mut new_chunks = BTreeMap::new();
 
-    for (_, chunk_id) in ordered_ids {
-        let mut record = vault
-            .manifest
-            .chunks
-            .get(&chunk_id)
-            .cloned()
-            .ok_or_else(|| format!("Missing chunk record: {chunk_id}"))?;
+    for record in ordered_chunks {
+        let mut record = record.clone();
         let len_start = record.data_offset as usize;
         let len_end = len_start
             .checked_add(8)
@@ -1529,7 +1632,7 @@ fn compact_live_chunks(vault: &mut OpenVaultV3) -> Result<Vec<u8>, String> {
         record.data_offset = new_data.len() as u64;
         new_data.extend_from_slice(&block_len.to_le_bytes());
         new_data.extend_from_slice(&vault.data[block_start..block_end]);
-        new_chunks.insert(chunk_id, record);
+        new_chunks.insert(record.id.clone(), record);
     }
 
     vault.manifest.chunks = new_chunks;
@@ -2300,10 +2403,35 @@ fn create_empty_vault(
     // key. The lock file lives next to the vault: create the folder first, as
     // `atomic_write` would, unless the vault path names a lock file.
     crate::lock::refuse_lock_file_name(path).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(output_parent_dir(path))
+    let writes_sidecar = error_correction.is_some_and(|p| p.writes_sidecar());
+    let mut parent_builder = std::fs::DirBuilder::new();
+    parent_builder.recursive(true);
+    #[cfg(unix)]
+    if writes_sidecar {
+        use std::os::unix::fs::DirBuilderExt;
+        // Create missing ancestors with private permissions. Existing
+        // permissions still belong to the caller and are only checked.
+        parent_builder.mode(0o700);
+    }
+    parent_builder
+        .create(output_parent_dir(path))
         .map_err(|e| format!("Create parent dir: {e}"))?;
+    // Validate publication before acquiring either stable lock. Linux can
+    // publish a genuinely new pair using its owner-private state.
+    #[cfg(target_os = "linux")]
+    let fresh =
+        if writes_sidecar && super::strip_transaction::validate_publication_parent(path).is_err() {
+            Some(super::pending_pair::fresh::Plan::prepare(path)?)
+        } else {
+            None
+        };
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if writes_sidecar {
+        super::strip_transaction::validate_publication_parent(path)?;
+    }
     let _lock = write_lock(path)?;
     let path = _lock.source_path();
+    super::pending_pair::require_replaceable(path)?;
 
     // Keys are zeroized on every return, the early ones included.
     let (salt, wrapped_master_key, wrapped_mac_key, master_key, mac_key, flags) = if plaintext {
@@ -2378,7 +2506,7 @@ fn create_empty_vault(
     };
     let ext_payloads = if embed {
         let (p, _shards, _prot, _ov) =
-            crate::error_correction::compute_error_correction_shards(&[]);
+            crate::error_correction::compute_error_correction_shards(&[])?;
         if let Some(e) = extensions.first_mut() {
             e.offset = 0;
             e.length = p.len() as u64;
@@ -2398,7 +2526,7 @@ fn create_empty_vault(
     )?;
     drop((master_key, mac_key));
     // Refuse sidecar contention before replacing even the container itself.
-    let sidecar_lock = if error_correction.is_some_and(|p| p.writes_sidecar()) {
+    let sidecar_lock = if writes_sidecar {
         let out = super::ec::default_sidecar_path(path);
         let guard =
             crate::lock::acquire_destination(&out, path, &_lock).map_err(|e| e.to_string())?;
@@ -2407,7 +2535,17 @@ fn create_empty_vault(
     } else {
         None
     };
-    if error_correction.is_some_and(|p| p.writes_sidecar()) {
+    #[cfg(target_os = "linux")]
+    if let Some(plan) = fresh {
+        let seed = super::ec::empty_sidecar_bytes(&bytes);
+        return plan.publish(
+            &_lock,
+            sidecar_lock.as_ref().unwrap_or(&_lock),
+            &bytes,
+            &seed,
+        );
+    }
+    if writes_sidecar {
         let sidecar = super::ec::default_sidecar_path(path);
         let prepared =
             super::strip_transaction::private_dir(output_parent_dir(path), ".aerocreate-prepare-")?;
@@ -2504,41 +2642,35 @@ fn plaintext_lane_header(header_bytes: &[u8]) -> bool {
         .is_some_and(|h| aerovz_mac_key().is_ok_and(|k| h.verify_mac(&k).is_ok()))
 }
 
-pub(super) fn open_vault(path: impl Into<PathBuf>, password: &str) -> Result<OpenVaultV3, String> {
-    open_vault_with(path, password, false)
-}
-
-/// `encrypted_only` refuses a plaintext-lane container from its header, read
-/// from the same handle as the payload, before the payload is decoded.
-fn open_vault_with(
-    path: impl Into<PathBuf>,
-    password: &str,
-    encrypted_only: bool,
-) -> Result<OpenVaultV3, String> {
-    open_vault_with_guard(path, password, encrypted_only, None)
-}
-
 pub(super) fn open_vault_under_guard(
     path: impl Into<PathBuf>,
     password: &str,
     lock: &WriteLock,
+    limits: VaultV3Limits,
 ) -> Result<OpenVaultV3, String> {
     let path = path.into();
     let guard = lock.covers_namespace(&path).then_some(lock);
-    open_vault_with_guard(path, password, false, guard)
+    open_vault_with_guard(path, password, false, guard, limits)
 }
 
 fn retry_open_for_recovery(
     path: &Path,
     password: &str,
     encrypted_only: bool,
+    limits: VaultV3Limits,
 ) -> Result<OpenVaultV3, String> {
     // Healthy reads stay lock-free. Before using detached recovery, reopen the
     // source under the same guard that excludes paired rotation and stripping.
     // This also recovers a journal published after the first optimistic check.
     let real = std::fs::canonicalize(path).map_err(|e| format!("Resolve recovery source: {e}"))?;
     let guard = crate::lock::acquire_for_export(&real).map_err(|e| e.to_string())?;
-    open_vault_with_guard(path.to_path_buf(), password, encrypted_only, Some(&guard))
+    open_vault_with_guard(
+        path.to_path_buf(),
+        password,
+        encrypted_only,
+        Some(&guard),
+        limits,
+    )
 }
 
 pub(super) fn recovery_namespace(path: &Path) -> Result<PathBuf, String> {
@@ -2560,6 +2692,7 @@ fn open_vault_with_guard(
     password: &str,
     encrypted_only: bool,
     recovery_guard: Option<&WriteLock>,
+    limits: VaultV3Limits,
 ) -> Result<OpenVaultV3, String> {
     let path = recovery_namespace(&path.into())?;
     if let Some(guard) = recovery_guard {
@@ -2582,6 +2715,8 @@ fn open_vault_with_guard(
     let mut header_bytes = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_bytes)
         .map_err(|e| format!("Read header: {e}"))?;
+    // This is a publication state, not damaged AEROVAULT3 metadata.
+    super::pending_pair::require_ordinary_at_open(source, &mut file, &header_bytes, file_len)?;
 
     // Plaintext (`.aerovz`) lane: when the header parses and carries
     // FLAG_PLAINTEXT_CONTENT, there is no password — verify the header MAC under
@@ -2634,7 +2769,7 @@ fn open_vault_with_guard(
                         return Err(orig);
                     }
                     drop(file);
-                    return retry_open_for_recovery(&path, password, encrypted_only);
+                    return retry_open_for_recovery(&path, password, encrypted_only, limits);
                 }
                 match super::ec::recover_header_from_sidecar(&path, &header_bytes, password)? {
                     Some((h, mac, master)) => (h, mac, master, true),
@@ -2645,18 +2780,8 @@ fn open_vault_with_guard(
     };
 
     // Reject impossible ranges before reading any payload for the baseline.
-    validate_ranges(&header, file_len)?;
-
-    // Opening keeps the data section in memory. Bound and reserve it before
-    // the baseline scan, so an oversized data section fails before scanning
-    // and an allocation failure cannot abort the process.
-    ensure_data_budget(header.data_len)?;
-    let data_size =
-        usize::try_from(header.data_len).map_err(|_| "Data section exceeds address space")?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(data_size)
-        .map_err(|e| format!("Cannot allocate vault data section: {e}"))?;
-    data.resize(data_size, 0);
+    let extent = validate_ranges(&header, file_len)?;
+    limits.check_data_len(header.data_len)?;
 
     // The generation is taken once the header is checked, so a wrong password
     // or a file that is not a vault costs no extra read, and before the
@@ -2670,25 +2795,8 @@ fn open_vault_with_guard(
     if let Some(hook) = BEFORE_OPEN_GENERATION.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let opened_hash = if file_len <= MAX_GENERATION_EXTENT {
-        let (hashed_len, hash) = file_generation_starting_with(&mut file, &header_bytes, file_len)?;
-        if hashed_len != file_len {
-            return Err(format!(
-                "{} changed while it was being opened; open it again",
-                path.display()
-            ));
-        }
-        Some(hash)
-    } else {
-        // The validated data and metadata reads below are bounded separately.
-        // An older container can contain a large, unused tail or a sparse gap.
-        None
-    };
-
-    file.seek(std::io::SeekFrom::Start(header.data_offset))
-        .map_err(|e| format!("Seek data section: {e}"))?;
-    file.read_exact(&mut data)
-        .map_err(|e| format!("Read data section: {e}"))?;
+    let (opened_hash, scanned_bytes, hashed_file_len) =
+        vault_generation_baseline(&mut file, &header_bytes, file_len, extent)?;
     let encrypted_manifest = read_capped(
         &mut file,
         header.manifest_offset,
@@ -2731,7 +2839,7 @@ fn open_vault_with_guard(
             decrypt_manifest(&master_key, blob)
         }
     };
-    let (manifest, manifest_repaired_on_open) = match decode_manifest(&encrypted_manifest) {
+    let (mut manifest, manifest_repaired_on_open) = match decode_manifest(&encrypted_manifest) {
         Ok(m) => (m, false),
         Err(orig) => {
             let embedded_metadata = extensions.iter().any(|e| {
@@ -2749,14 +2857,12 @@ fn open_vault_with_guard(
                 return Err(orig);
             }
             if recovery_guard.is_none() {
-                // The retry reads another complete data section. Release this
-                // attempt's payload and metadata before acquiring/reopening.
-                drop(data);
+                // Release this attempt's metadata before acquiring/reopening.
                 drop(encrypted_manifest);
                 drop(extension_json);
                 drop(extensions);
                 drop(file);
-                return retry_open_for_recovery(&path, password, encrypted_only);
+                return retry_open_for_recovery(&path, password, encrypted_only, limits);
             }
             let embedded = super::ec::reconstruct_encrypted_manifest(&mut file, &header, file_len)?;
             let rebuilt = match embedded {
@@ -2788,6 +2894,35 @@ fn open_vault_with_guard(
     #[cfg(test)]
     crate::lock::trace("decode");
 
+    // Without an explicit budget, the memory the system can still provide
+    // bounds the allocation. Extent reporting alone is not enough: it can be
+    // unavailable or report a sparse file as fully backed.
+    let memory_bound = limits.default_memory_headroom();
+    let LoadedData {
+        mut bytes,
+        file_offsets,
+    } = if plaintext_header {
+        let storage_bound = limits.max_data_bytes.is_none().then_some(scanned_bytes);
+        read_plaintext_data(
+            &mut file,
+            &header,
+            &mut manifest,
+            storage_bound,
+            memory_bound,
+        )?
+    } else {
+        check_available_memory(header.data_len, memory_bound, header.data_len)?;
+        let mut data = vault_data_buffer(header.data_len)?;
+        file.seek(std::io::SeekFrom::Start(header.data_offset))
+            .map_err(|e| format!("Seek data section: {e}"))?;
+        file.read_exact(&mut data)
+            .map_err(|e| format!("Read data section: {e}"))?;
+        LoadedData {
+            bytes: data,
+            file_offsets: BTreeMap::new(),
+        }
+    };
+
     // Do not round-trip the EC metadata-parity extension; build_file_bytes is
     // its sole author and recomputes it on every seal from the freshly
     // encrypted manifest. (No-op when no EC extension is present.)
@@ -2803,7 +2938,9 @@ fn open_vault_with_guard(
     Ok(OpenVaultV3 {
         path,
         opened_file_len: file_len,
+        hashed_file_len,
         opened_hash,
+        limits,
         header,
         // Copied into the handle, whose Drop wipes them; the wrapped copies
         // are wiped here.
@@ -2811,14 +2948,461 @@ fn open_vault_with_guard(
         mac_key: *mac_key,
         manifest,
         extensions,
-        data,
+        data: std::mem::take(&mut *bytes),
+        plaintext_file_offsets: file_offsets,
         manifest_repaired_on_open,
         header_repaired_on_open,
         telemetry: None,
     })
 }
 
-fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<(), String> {
+fn check_available_memory(
+    size: u64,
+    available: Option<u64>,
+    section_bytes: u64,
+) -> Result<(), String> {
+    if let Some(available) = available.filter(|&available| size > available) {
+        let env_bytes = section_bytes.max(MIN_ENV_DATA_BUDGET);
+        return Err(format!(
+            "Vault data section needs {size} bytes in memory but the system reports {available} bytes available. For a trusted archive on a host with enough memory, set {DATA_BUDGET_ENV}={env_bytes} (bytes) or use VaultV3Limits::with_max_data_bytes({section_bytes})"
+        ));
+    }
+    Ok(())
+}
+
+/// Memory this process can still obtain, as reported by the operating
+/// system, or `None` where it is not reported.
+fn available_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    return linux_available_memory();
+    #[cfg(target_os = "macos")]
+    return macos_available_memory();
+    #[cfg(windows)]
+    return windows_available_memory();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    None
+}
+
+/// Host memory and swap headroom, capped by the process's address-space
+/// limit and by the applicable cgroup v2 limits.
+#[cfg(target_os = "linux")]
+fn linux_available_memory() -> Option<u64> {
+    let (memory, swap) = parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+    let mut available =
+        cgroup_v2_available_memory(memory, swap).unwrap_or_else(|| memory.saturating_add(swap));
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable rlimit for the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } == 0
+        && limit.rlim_cur != libc::RLIM_INFINITY
+    {
+        #[allow(clippy::useless_conversion, reason = "rlim_t can be 32-bit on Linux")]
+        let address_limit = u64::from(limit.rlim_cur);
+        let mapped = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| parse_linux_kib(&status, "VmSize"))
+            .unwrap_or(0);
+        available = available.min(address_limit.saturating_sub(mapped));
+    }
+    Some(available)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_available(meminfo: &str) -> Option<(u64, u64)> {
+    Some((
+        parse_linux_kib(meminfo, "MemAvailable")?,
+        parse_linux_kib(meminfo, "SwapFree").unwrap_or(0),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn parse_linux_kib(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let kib = line
+            .strip_prefix(name)?
+            .strip_prefix(':')?
+            .trim()
+            .strip_suffix("kB")?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some(kib.saturating_mul(1024))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_available_memory(memory: u64, swap: u64) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(headroom) = TEST_CGROUP_V2.with(|paths| {
+        paths
+            .borrow()
+            .as_ref()
+            .map(|(root, group)| cgroup_v2_headroom(root, group, memory, swap))
+    }) {
+        return Some(headroom);
+    }
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let group = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let group = Path::new(group.strip_prefix('/')?);
+    if group
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(cgroup_v2_headroom(
+        Path::new("/sys/fs/cgroup"),
+        group,
+        memory,
+        swap,
+    ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static TEST_CGROUP_V2: std::cell::RefCell<Option<(PathBuf, PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_child_protection(child: &Path) -> Option<u64> {
+    let read = |name: &str| -> std::io::Result<u64> {
+        let value = std::fs::read_to_string(child.join(name))?;
+        match value.trim() {
+            "max" => Ok(u64::MAX),
+            value => value
+                .parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        }
+    };
+    let protection = read("memory.min").and_then(|min| Ok(min.max(read("memory.low")?)));
+    match protection {
+        Ok(protection) => Some(protection),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A scope that was removed after read_dir cannot protect cache.
+            // A surviving group with a missing setting is still unknown.
+            match std::fs::symlink_metadata(child) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_reclaimable_cache(dir: &Path, clean_cache: u64) -> Option<u64> {
+    if clean_cache == 0 {
+        return Some(0);
+    }
+    let mut reclaimable = clean_cache;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let child = entry.path();
+        let protection = cgroup_v2_child_protection(&child)?;
+        if protection == 0 {
+            continue;
+        }
+        // Effective protection at this reclaim target is capped by the
+        // immediate child's settings and applies only to charged memory.
+        // Keep the soft protection too for a conservative cache credit.
+        let charged = std::fs::read_to_string(child.join("memory.current"))
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        reclaimable = reclaimable.saturating_sub(protection.min(charged.unwrap_or(protection)));
+        if reclaimable == 0 {
+            break;
+        }
+    }
+    Some(reclaimable)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_headroom(root: &Path, group: &Path, mut memory: u64, mut swap: u64) -> u64 {
+    for relative in group.ancestors() {
+        let dir = root.join(relative);
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        };
+        // A value of "max" leaves this level unrestricted. Limits still
+        // apply at ancestors when the process's own group is unrestricted.
+        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current")) {
+            let stats = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
+            let bytes = |key: &str| {
+                stats
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(' ')?;
+                        (name == key).then_some(value)?.trim().parse::<u64>().ok()
+                    })
+                    .unwrap_or(0)
+            };
+            // The kernel counters are sampled separately, so this is an
+            // estimate. Credit only clean file cache beyond possible
+            // protection. The host limit still caps total headroom.
+            let clean_cache = bytes("active_file")
+                .saturating_add(bytes("inactive_file"))
+                .saturating_sub(bytes("file_dirty"))
+                .saturating_sub(bytes("file_writeback"));
+            let reclaimable = cgroup_v2_reclaimable_cache(&dir, clean_cache).unwrap_or(0);
+            let working_set = current.saturating_sub(reclaimable);
+            memory = memory.min(max.saturating_sub(working_set));
+        }
+        if swap > 0 {
+            if let Some(max) = read("memory.swap.max") {
+                let remaining =
+                    read("memory.swap.current").map_or(0, |used| max.saturating_sub(used));
+                swap = swap.min(remaining);
+            }
+        }
+    }
+    memory.saturating_add(swap)
+}
+
+/// Estimate headroom from live VM counters and current swap space.
+#[cfg(target_os = "macos")]
+fn macos_available_memory() -> Option<u64> {
+    fn sysctl<T>(name: &std::ffi::CStr, value: &mut T) -> bool {
+        let mut len = std::mem::size_of::<T>();
+        // SAFETY: the buffer and its byte size are valid for this fixed-size sysctl.
+        let status = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (value as *mut T).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        status == 0 && len == std::mem::size_of::<T>()
+    }
+
+    // SAFETY: xsw_usage is plain integers, valid when zeroed.
+    let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
+    let free_swap = if sysctl(c"vm.swapusage", &mut swap) {
+        swap.xsu_avail
+    } else {
+        0
+    };
+    let mut memsize = 0u64;
+    let mut level = 0u32;
+    if sysctl(c"hw.memsize", &mut memsize) && sysctl(c"kern.memorystatus_level", &mut level) {
+        if let Some(available) = macos_memory_level_headroom(memsize, level, free_swap) {
+            return Some(available);
+        }
+    }
+
+    unsafe extern "C" {
+        fn host_page_size(
+            host: libc::mach_port_t,
+            size: *mut libc::vm_size_t,
+        ) -> libc::kern_return_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
+    }
+
+    let mut page_size = 0;
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: VM statistics consists of integer counters, valid when zeroed.
+    let mut stat: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    // SAFETY: each output lives for its call, and the count is the buffer
+    // size in Mach integer units. Release the acquired host send right.
+    #[allow(
+        deprecated,
+        reason = "These libc bindings still expose the Darwin Mach ABI"
+    )]
+    let (size_status, vm_status) = unsafe {
+        let host = libc::mach_host_self();
+        let size_status = host_page_size(host, &mut page_size);
+        let vm_status = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut stat as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        );
+        mach_port_deallocate(libc::mach_task_self(), host);
+        (size_status, vm_status)
+    };
+    if size_status != libc::KERN_SUCCESS
+        || vm_status != libc::KERN_SUCCESS
+        || count != libc::HOST_VM_INFO64_COUNT
+    {
+        return None;
+    }
+    Some(macos_vm_headroom(
+        stat.free_count,
+        stat.inactive_count,
+        stat.external_page_count,
+        stat.speculative_count,
+        page_size as u64,
+        free_swap,
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_memory_level_headroom(memsize: u64, level: u32, swap_free: u64) -> Option<u64> {
+    (memsize > 0 && level <= 100).then(|| {
+        let available = (u128::from(memsize) * u128::from(level) / 100) as u64;
+        available.saturating_add(swap_free)
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_vm_headroom(
+    free: u32,
+    inactive: u32,
+    file_backed: u32,
+    speculative: u32,
+    page_size: u64,
+    swap_free: u64,
+) -> u64 {
+    // Darwin already includes speculative pages in free_count. Limit the
+    // estimate of additional reclaimable pages to inactive capacity.
+    let additional = inactive.min(file_backed.saturating_sub(speculative));
+    (u64::from(free) + u64::from(additional))
+        .saturating_mul(page_size)
+        .saturating_add(swap_free)
+}
+
+/// The commit charge still available, capped by the free address space.
+#[cfg(windows)]
+fn windows_available_memory() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `status` is a writable MEMORYSTATUSEX with its length set.
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
+        .then(|| status.avail_page_file.min(status.avail_virtual))
+}
+
+fn vault_data_buffer(size: u64) -> Result<Zeroizing<Vec<u8>>, String> {
+    let size = usize::try_from(size).map_err(|_| "Data section exceeds address space")?;
+    if size > isize::MAX as usize {
+        return Err("Data section exceeds address space".into());
+    }
+    // Wipe any plaintext read before a later seek or read error.
+    let mut data = Zeroizing::new(Vec::new());
+    data.try_reserve_exact(size)
+        .map_err(|error| format!("Cannot allocate vault data section: {error}"))?;
+    data.resize(size, 0);
+    Ok(data)
+}
+
+struct LoadedData {
+    bytes: Zeroizing<Vec<u8>>,
+    file_offsets: BTreeMap<String, u64>,
+}
+
+fn read_plaintext_data(
+    file: &mut (impl Read + Seek),
+    header: &VaultHeaderV3,
+    manifest: &mut VaultManifestV3,
+    storage_bound: Option<u64>,
+    memory_bound: Option<u64>,
+) -> Result<LoadedData, String> {
+    // Read the declared frames into a compact buffer in their on-disk order
+    // so extraction and Error Correction see the same bytes. A frame offset
+    // from the plaintext manifest can never grow the buffer across a gap.
+    let mut records: Vec<_> = manifest.chunks.values_mut().collect();
+    sort_stored_frames(&mut records, None);
+    let mut previous_end = 0;
+    let mut data_size = 0u64;
+    let mut has_gaps = false;
+    for record in &records {
+        let end = record
+            .data_offset
+            .checked_add(8)
+            .and_then(|start| start.checked_add(record.block_len));
+        let Some(end) =
+            end.filter(|&end| record.block_len <= MAX_BLOCK_SIZE && end <= header.data_len)
+        else {
+            return Err("AeroVault v3 chunk record exceeds the block limit or data section".into());
+        };
+        if record.data_offset < previous_end {
+            return Err("AeroVault v3 plaintext chunk ranges overlap".into());
+        }
+        // Ordered, disjoint ranges are bounded by the declared data length.
+        data_size += end - record.data_offset;
+        has_gaps |= record.data_offset != previous_end;
+        previous_end = end;
+    }
+
+    if let Some(allocated) = storage_bound.filter(|&allocated| data_size > allocated) {
+        let section_bytes = header.data_len;
+        let env_bytes = section_bytes.max(MIN_ENV_DATA_BUDGET);
+        return Err(format!(
+            "Plaintext frames claim {data_size} bytes but the file has {allocated} bytes covered by logical data ranges. For a trusted archive requiring repair, set {DATA_BUDGET_ENV}={env_bytes} (bytes) or use VaultV3Limits::with_max_data_bytes({section_bytes})"
+        ));
+    }
+    check_available_memory(data_size, memory_bound, header.data_len)?;
+    let mut data = vault_data_buffer(data_size)?;
+    let mut file_offsets = BTreeMap::new();
+    let mut position = None;
+    let mut written = 0;
+    for record in records {
+        let offset = header
+            .data_offset
+            .checked_add(record.data_offset)
+            .ok_or("Plaintext block offset overflow")?;
+        let size = (8 + record.block_len) as usize;
+        if position != Some(offset) {
+            file.seek(std::io::SeekFrom::Start(offset))
+                .map_err(|error| format!("Seek plaintext block: {error}"))?;
+        }
+        file.read_exact(&mut data[written..written + size])
+            .map_err(|error| format!("Read plaintext block: {error}"))?;
+        position = offset.checked_add(size as u64);
+        let compact_offset = written as u64;
+        if has_gaps {
+            file_offsets.insert(record.id.clone(), record.data_offset);
+            record.data_offset = compact_offset;
+        }
+        written += size;
+    }
+    Ok(LoadedData {
+        bytes: data,
+        file_offsets,
+    })
+}
+
+pub(super) fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<u64, String> {
     if header.data_offset != DATA_OFFSET {
         return Err("Invalid AeroVault v3 data offset".to_string());
     }
@@ -2842,6 +3426,7 @@ fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<(), String> 
             "extension payload",
         ),
     ];
+    let mut extent = HEADER_SIZE as u64;
     for (offset, len, label) in ranges {
         let end = offset
             .checked_add(len)
@@ -2849,31 +3434,24 @@ fn validate_ranges(header: &VaultHeaderV3, file_len: u64) -> Result<(), String> 
         if end > file_len {
             return Err(format!("{label} range exceeds file size"));
         }
+        extent = extent.max(end);
     }
-    Ok(())
+    Ok(extent)
 }
 
 /// Staleness guard: refuse to seal if the on-disk vault changed since open
-/// (concurrent writer), comparing the recorded whole-file length and BLAKE3 hash.
+/// (concurrent writer), comparing its length, hashed bytes and any sparse suffix.
 pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(), String> {
     assert_vault_generation_at(vault, &vault.path)
 }
 
 pub(super) fn assert_vault_generation_at(vault: &OpenVaultV3, path: &Path) -> Result<(), String> {
-    let expected = vault.writable_generation()?;
+    let expected = vault.complete_generation()?;
     let mut file = crate::source::open_regular(path).map_err(|e| format!("Open vault: {e}"))?;
-    if file_generation(&mut file)? != (vault.opened_file_len, expected) {
+    if file_generation(&mut file, vault.hashed_file_len, vault.opened_file_len)? != expected {
         return Err("Vault changed while this write was in progress; retry operation".to_string());
     }
     Ok(())
-}
-
-impl OpenVaultV3 {
-    pub(super) fn writable_generation(&self) -> Result<[u8; 32], String> {
-        self.opened_hash.ok_or_else(|| {
-            "Vault is available for reading and extraction. Its extent exceeds the 4 GiB write generation budget".into()
-        })
-    }
 }
 
 /// A writer that passes bytes through and keeps their count and BLAKE3 hash,
@@ -2893,8 +3471,7 @@ impl<'a> HashingWriter<'a> {
         }
     }
 
-    /// Length and hash of everything written, as [`file_generation`] would
-    /// read them back from the start of a fresh file.
+    /// Length and dense hash of everything the writer sealed.
     fn finish(self) -> (u64, [u8; 32]) {
         (self.len, *self.hasher.finalize().as_bytes())
     }
@@ -2917,49 +3494,218 @@ impl std::io::Write for HashingWriter<'_> {
 thread_local! {
     /// Test seam: how many whole-file reads [`file_generation`] made on this thread.
     pub(super) static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GENERATION_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Length and BLAKE3 hash of the whole file behind `file`, read from its start.
-/// The whole file, not the header: a write can leave the header identical
-/// (a rename to a name of the same length changes only the manifest bytes).
-fn file_generation(file: &mut std::fs::File) -> Result<(u64, [u8; 32]), String> {
+#[cfg(test)]
+thread_local! {
+    static FAIL_SPARSE_TAIL_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static REPORT_DENSE_EXTENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static REPORT_FIRST_EXTENT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Start a sparse fingerprint at the first hole after the verified header.
+fn sparse_hash_extent(file: &std::fs::File, file_len: u64) -> u64 {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(end) = REPORT_FIRST_EXTENT.with(|extent| extent.take()) {
+        return end;
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    if REPORT_DENSE_EXTENTS.with(|dense| dense.replace(false)) {
+        return file_len;
+    }
+    match super::sparse::data_range(file, 0, file_len) {
+        Ok(Some(range)) if range.start == 0 => range.end.max((HEADER_SIZE as u64).min(file_len)),
+        Ok(_) => file_len.min(HEADER_SIZE as u64),
+        Err(_) => file_len,
+    }
+}
+
+struct GenerationScan {
+    declared_end: u64,
+    remaining_tail: u64,
+}
+
+impl GenerationScan {
+    fn allow(&mut self, start: u64, end: u64) -> bool {
+        let unused = end.saturating_sub(start.max(self.declared_end));
+        let Some(remaining) = self.remaining_tail.checked_sub(unused) else {
+            return false;
+        };
+        self.remaining_tail = remaining;
+        true
+    }
+}
+
+fn hash_sparse_tail(
+    file: &mut std::fs::File,
+    hasher: &mut blake3::Hasher,
+    prefix_len: u64,
+    file_len: u64,
+    scan: &mut GenerationScan,
+) -> Result<Option<u64>, String> {
+    // The offsets, lengths and logical file length commit to every hole.
+    // An allocated extent in a previously empty region changes this hash.
+    hasher.update(b"aerovault sparse generation v1\0");
+    hasher.update(&prefix_len.to_le_bytes());
+    hasher.update(&file_len.to_le_bytes());
+    let mut cursor = prefix_len;
+    let mut scanned_bytes = 0;
+    while cursor < file_len {
+        #[cfg(test)]
+        if FAIL_SPARSE_TAIL_QUERY.with(|fail| fail.replace(false)) {
+            return Ok(None);
+        }
+        let Some(range) = (match super::sparse::data_range(file, cursor, file_len) {
+            Ok(range) => range,
+            Err(_) => return Ok(None),
+        }) else {
+            break;
+        };
+        let len = range.end - range.start;
+        if !scan.allow(range.start, range.end) {
+            return Ok(None);
+        }
+        hasher.update(&range.start.to_le_bytes());
+        hasher.update(&len.to_le_bytes());
+        file.seek(std::io::SeekFrom::Start(range.start))
+            .map_err(|error| format!("Read vault extent: {error}"))?;
+        hash_generation_bytes(file, hasher, len)?;
+        scanned_bytes += len;
+        cursor = range.end;
+    }
+    Ok(Some(scanned_bytes))
+}
+
+fn hash_generation_bytes(
+    file: &mut std::fs::File,
+    hasher: &mut blake3::Hasher,
+    expected: u64,
+) -> Result<(), String> {
+    let read = std::io::copy(&mut file.take(expected), hasher)
+        .map_err(|error| format!("Read vault: {error}"))?;
+    #[cfg(test)]
+    GENERATION_BYTES_READ.with(|n| n.set(n.get() + read));
+    if read != expected {
+        return Err("Vault changed while it was being read; open it again".into());
+    }
+    Ok(())
+}
+
+/// Reject a replacement of a different size before scanning its bytes.
+fn file_generation(
+    file: &mut std::fs::File,
+    hashed_len: u64,
+    expected_len: u64,
+) -> Result<[u8; 32], String> {
     let len = file
         .metadata()
         .map_err(|e| format!("Stat vault: {e}"))?
         .len();
-    if len > MAX_GENERATION_EXTENT {
-        return Err("Vault container exceeds the 4 GiB generation scan budget".into());
+    if len != expected_len {
+        return Err("Vault changed while this write was in progress; retry operation".into());
     }
-    file_generation_starting_with(file, &[], len)
+    let mut scan = GenerationScan {
+        declared_end: len,
+        remaining_tail: 0,
+    };
+    file_generation_starting_with(file, &[], hashed_len, len, &mut scan)?
+        .map(|(hash, _)| hash)
+        .ok_or_else(|| "Cannot recheck sparse vault generation; open it again".into())
 }
 
-/// [`file_generation`] of a file that must start with `prefix`: an error if it
-/// does not, so the hash is known to cover those bytes.
+/// Bound bytes read after the declared data, including across a raw retry.
+fn vault_generation_baseline(
+    file: &mut std::fs::File,
+    header: &[u8],
+    file_len: u64,
+    declared_end: u64,
+) -> Result<(Option<[u8; 32]>, u64, u64), String> {
+    let mut scan = GenerationScan {
+        declared_end,
+        remaining_tail: MAX_OPEN_TRAILING_SCAN,
+    };
+    let prefix = sparse_hash_extent(file, file_len);
+    if prefix < file_len {
+        if let Some((hash, covered)) =
+            file_generation_starting_with(file, header, prefix, file_len, &mut scan)?
+        {
+            return Ok((Some(hash), covered, prefix));
+        }
+    }
+    let Some((hash, logical_len)) =
+        file_generation_starting_with(file, header, file_len, file_len, &mut scan)?
+    else {
+        verify_generation_prefix(file, header)?;
+        return Ok((None, file_len, 0));
+    };
+    Ok((Some(hash), logical_len, file_len))
+}
+
+fn verify_generation_prefix(file: &mut std::fs::File, prefix: &[u8]) -> Result<(), String> {
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("Read vault: {e}"))?;
+    let mut head = [0; HEADER_SIZE];
+    let bytes = &mut head[..prefix.len()];
+    file.read_exact(bytes)
+        .map_err(|e| format!("Read vault: {e}"))?;
+    if bytes != prefix {
+        return Err("vault changed while it was being read; open it again".into());
+    }
+    #[cfg(test)]
+    GENERATION_BYTES_READ.with(|n| n.set(n.get() + bytes.len() as u64));
+    Ok(())
+}
+
+/// Hash the file bytes, including a sparse description of the tail if the
+/// baseline recorded a dense prefix shorter than the logical file.
 fn file_generation_starting_with(
     file: &mut std::fs::File,
     prefix: &[u8],
+    hashed_len: u64,
     len: u64,
-) -> Result<(u64, [u8; 32]), String> {
+    scan: &mut GenerationScan,
+) -> Result<Option<([u8; 32], u64)>, String> {
+    if !scan.allow(0, hashed_len) {
+        return Ok(None);
+    }
     #[cfg(test)]
     GENERATION_READS.with(|n| n.set(n.get() + 1));
     #[cfg(test)]
     crate::lock::trace("generation");
-    file.seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| format!("Read vault: {e}"))?;
-    let mut head = vec![0u8; prefix.len()];
-    file.read_exact(&mut head)
-        .map_err(|e| format!("Read vault: {e}"))?;
-    if head != prefix {
-        return Err("vault changed while it was being read; open it again".to_string());
-    }
+    let changed = || "vault changed while it was being read; open it again".to_string();
+    let expected = hashed_len
+        .checked_sub(prefix.len() as u64)
+        .ok_or_else(changed)?;
+    verify_generation_prefix(file, prefix)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&head);
-    let rest = std::io::copy(
-        &mut file.take(len.saturating_sub(prefix.len() as u64) + 1),
-        &mut hasher,
-    )
-    .map_err(|e| format!("Read vault: {e}"))?;
-    Ok((prefix.len() as u64 + rest, *hasher.finalize().as_bytes()))
+    hasher.update(prefix);
+    hash_generation_bytes(file, &mut hasher, expected)?;
+    let scanned_bytes = if hashed_len < len {
+        let Some(tail) = hash_sparse_tail(file, &mut hasher, hashed_len, len, scan)? else {
+            return Ok(None);
+        };
+        if file
+            .metadata()
+            .map_err(|e| format!("Stat vault: {e}"))?
+            .len()
+            != len
+        {
+            return Err(changed());
+        }
+        hashed_len + tail
+    } else {
+        if std::io::copy(&mut file.take(1), &mut std::io::sink())
+            .map_err(|e| format!("Read vault: {e}"))?
+            != 0
+        {
+            return Err(changed());
+        }
+        len
+    };
+    Ok(Some((*hasher.finalize().as_bytes(), scanned_bytes)))
 }
 
 /// Persist the in-memory vault back to disk with an atomic single-rename seal.
@@ -2995,7 +3741,11 @@ pub(super) fn save_locked_to(
     lock: &WriteLock,
     target: &Path,
 ) -> Result<(), String> {
-    ensure_write_data_budget(vault.data.len() as u64)?;
+    let disk_layout = SparsePlaintextLayout::from_vault(vault)?;
+    let data_len = disk_layout
+        .as_ref()
+        .map_or(vault.data.len() as u64, |layout| layout.data_len);
+    vault.limits.check_data_len(data_len)?;
     if !lock.covers_namespace(&vault.path) {
         return Err("source lock namespace changed; retry operation".to_string());
     }
@@ -3016,32 +3766,18 @@ pub(super) fn save_locked_to(
         .iter()
         .position(|e| e.extension_id == super::constants::ERROR_CORRECTION_EXTENSION_ID)
     {
-        // On-disk blocks in data-section order (sorted by data_offset). Each
-        // full block is [u64 len][ciphertext of that len]. Offset arithmetic is
-        // checked so a manifest record near usize::MAX yields an empty slice
-        // instead of panicking (matches collect_live_block_refs / scrub_vault).
-        let mut chunk_records: Vec<_> = vault.manifest.chunks.values().cloned().collect();
-        chunk_records.sort_by_key(|r| r.data_offset);
-
-        let blocks: Vec<&[u8]> = chunk_records
-            .iter()
-            .map(|rec| {
-                let start = rec.data_offset as usize;
-                let end = (rec.block_len as usize)
-                    .checked_add(8)
-                    .and_then(|full| start.checked_add(full));
-                match end {
-                    Some(end) if end <= vault.data.len() => &vault.data[start..end],
-                    _ => &[] as &[u8],
-                }
-            })
-            .collect();
+        let blocks = super::ec::collect_live_block_refs(vault);
 
         let (k, p) = crate::error_correction::manifest_error_correction_grid(
             vault.manifest.error_correction_pct,
         );
         let (payload, shards, protected, overhead) =
-            crate::error_correction::compute_error_correction_shards_grid(&blocks, k, p);
+            crate::error_correction::compute_error_correction_shards_with_headroom(
+                &blocks,
+                k,
+                p,
+                vault.default_memory_headroom(),
+            )?;
 
         let entry = &mut extensions[error_correction_idx];
         entry.offset = 0;
@@ -3062,7 +3798,7 @@ pub(super) fn save_locked_to(
     // second whole-file buffer, so the seal no longer doubles peak memory
     // (T5 sub-task #2). Same atomic temp + sync + persist + dir-fsync discipline
     // as `atomic_write`, via the shared helpers.
-    let ((file_len, file_hash), header) = {
+    let ((file_len, hashed_file_len, file_hash), header) = {
         use std::io::Write;
         let parent = output_parent_dir(target);
         std::fs::create_dir_all(parent).map_err(|e| format!("Create parent dir: {e}"))?;
@@ -3070,27 +3806,40 @@ pub(super) fn save_locked_to(
             .prefix(".aerovault-v3-")
             .tempfile_in(parent)
             .map_err(|e| format!("Create temp file: {e}"))?;
-        // Hash the bytes as they are written: the generation baseline of the
-        // sealed file, without reading it back.
-        let mut sealed = HashingWriter::new(tmp.as_file_mut());
-        {
-            let mut w = std::io::BufWriter::new(&mut sealed);
-            write_container(
-                &mut w,
+        let dense_generation = if let Some(layout) = &disk_layout {
+            #[cfg(windows)]
+            super::sparse::mark_sparse_if_supported(tmp.as_file())
+                .map_err(|error| format!("Prepare sparse vault staging file: {error}"))?;
+            write_container_with_data(
+                tmp.as_file_mut(),
                 vault.header.clone(),
                 &vault.mac_key,
                 &vault.master_key,
-                &vault.manifest,
+                &layout.manifest,
                 &extensions,
                 &ext_payloads,
-                &vault.data,
+                layout.data_len,
+                |file| layout.write_data(file, &vault.data),
             )?;
-            w.flush().map_err(|e| format!("Flush temp file: {e}"))?;
-        }
-        let generation = sealed.finish();
-        if generation.0 > MAX_GENERATION_EXTENT {
-            return Err("Vault container exceeds the 4 GiB generation scan budget".into());
-        }
+            None
+        } else {
+            let mut sealed = HashingWriter::new(tmp.as_file_mut());
+            {
+                let mut w = std::io::BufWriter::new(&mut sealed);
+                write_container(
+                    &mut w,
+                    vault.header.clone(),
+                    &vault.mac_key,
+                    &vault.master_key,
+                    &vault.manifest,
+                    &extensions,
+                    &ext_payloads,
+                    &vault.data,
+                )?;
+                w.flush().map_err(|e| format!("Flush temp file: {e}"))?;
+            }
+            Some(sealed.finish())
+        };
         tmp.as_file_mut()
             .sync_all()
             .map_err(|e| format!("Sync temp file: {e}"))?;
@@ -3107,6 +3856,19 @@ pub(super) fn save_locked_to(
             header_bytes[0] ^= 1;
         }
         let header = VaultHeaderV3::from_bytes(&header_bytes)?;
+        let generation = match dense_generation {
+            Some((length, hash)) => (length, length, hash),
+            None => {
+                let length = file.metadata().map_err(|error| error.to_string())?.len();
+                let (hash, _, prefix) =
+                    vault_generation_baseline(file, &header_bytes, length, u64::MAX)?;
+                (
+                    length,
+                    prefix,
+                    hash.expect("sealing requires a complete generation"),
+                )
+            }
+        };
         #[cfg(test)]
         run_in_save_window_hook();
         if !lock.covers_namespace(&vault.path) {
@@ -3124,11 +3886,81 @@ pub(super) fn save_locked_to(
     // Refresh the staleness baseline so a second save in the same session does
     // not trip the generation guard against the bytes we just wrote.
     vault.opened_file_len = file_len;
+    vault.hashed_file_len = hashed_file_len;
     vault.opened_hash = Some(file_hash);
     vault.header = header;
+    if let Some(layout) = disk_layout {
+        vault.plaintext_file_offsets = layout
+            .manifest
+            .chunks
+            .into_iter()
+            .map(|(id, record)| (id, record.data_offset))
+            .collect();
+    }
     vault.header_repaired_on_open = false;
     vault.manifest_repaired_on_open = false;
     Ok(())
+}
+
+struct SparsePlaintextLayout {
+    manifest: VaultManifestV3,
+    frames: Vec<(u64, std::ops::Range<usize>)>,
+    data_len: u64,
+}
+
+impl SparsePlaintextLayout {
+    fn from_vault(vault: &OpenVaultV3) -> Result<Option<Self>, String> {
+        if vault.plaintext_file_offsets.is_empty() {
+            return Ok(None);
+        }
+        let mut manifest = vault.manifest.clone();
+        let mut records: Vec<_> = manifest.chunks.values_mut().collect();
+        sort_stored_frames(&mut records, Some(&vault.plaintext_file_offsets));
+        let mut data_len = vault.header.data_len;
+        let mut frames = Vec::with_capacity(records.len());
+        for record in records {
+            let size = record
+                .block_len
+                .checked_add(8)
+                .ok_or("Vault frame length overflows")?;
+            let start = usize::try_from(record.data_offset)
+                .map_err(|_| "Vault frame offset exceeds address space")?;
+            let end = usize::try_from(size)
+                .ok()
+                .and_then(|size| start.checked_add(size))
+                .filter(|&end| end <= vault.data.len())
+                .ok_or("Vault frame is outside loaded data")?;
+            let offset = vault
+                .plaintext_file_offsets
+                .get(&record.id)
+                .copied()
+                .unwrap_or(data_len);
+            let disk_end = offset
+                .checked_add(size)
+                .ok_or("Vault frame offset overflows")?;
+            data_len = data_len.max(disk_end);
+            record.data_offset = offset;
+            frames.push((offset, start..end));
+        }
+        Ok(Some(Self {
+            manifest,
+            frames,
+            data_len,
+        }))
+    }
+
+    fn write_data(&self, file: &mut std::fs::File, data: &[u8]) -> Result<(), String> {
+        use std::io::{SeekFrom, Write};
+
+        for (offset, range) in &self.frames {
+            file.seek(SeekFrom::Start(DATA_OFFSET + offset))
+                .and_then(|_| file.write_all(&data[range.clone()]))
+                .map_err(|error| format!("Write stored vault frame: {error}"))?;
+        }
+        file.seek(SeekFrom::Start(DATA_OFFSET + self.data_len))
+            .map_err(|error| format!("Seek vault manifest: {error}"))?;
+        Ok(())
+    }
 }
 
 fn extract_entry(
@@ -3386,6 +4218,25 @@ fn add_directory_into(
     Ok((total_files, added_dirs))
 }
 
+/// Seed a large encrypted data section for memory-pressure regressions.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn seed_live_test_extent(vault: &mut OpenVaultV3, data_len: usize) {
+    let input = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(input.path(), b"memory regression fixture").unwrap();
+    VaultV3::add_files(vault, &[(input.path().to_owned(), "fixture".into())]).unwrap();
+
+    let original_len = vault.data.len();
+    let offset = data_len - original_len;
+    assert!(offset >= original_len);
+    vault.data.resize(data_len, 0);
+    vault.data.copy_within(..original_len, offset);
+    vault.data[..original_len].fill(0);
+    for chunk in vault.manifest.chunks.values_mut() {
+        chunk.data_offset += offset as u64;
+    }
+    save_open_vault(vault).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3639,6 +4490,7 @@ mod tests {
                 &super::super::ec::default_sidecar_path(&path),
                 true,
                 &lock,
+                VaultV3Limits::default(),
             )
             .unwrap();
         });
@@ -3789,7 +4641,7 @@ mod tests {
     fn review_seed_and_password_refresh_obey_destination_lock() {
         use super::super::ec::{default_sidecar_path, RecoveryPlacement};
         crate::lock::set_short_wait_for_this_thread();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("source.aerovault");
         let sidecar = default_sidecar_path(&path);
         VaultV3::create(&CreateOptionsV3::new_plaintext(&sidecar)).unwrap();
@@ -4122,8 +4974,8 @@ mod tests {
         // The baseline the save kept is the file now on disk.
         let mut file = std::fs::File::open(&vp).unwrap();
         assert_eq!(
-            file_generation(&mut file).unwrap(),
-            (v.opened_file_len, v.opened_hash.unwrap())
+            Some(file_generation(&mut file, v.hashed_file_len, v.opened_file_len).unwrap()),
+            v.opened_hash
         );
         drop(file);
         VaultV3::add_files(&mut v, &[(src.join("a.txt"), "b.txt".to_string())]).unwrap();
@@ -5472,7 +6324,10 @@ mod tests {
                 header_mac: [0u8; MAC_SIZE],
             },
             opened_file_len: 0,
+            hashed_file_len: 0,
             opened_hash: Some([0u8; 32]),
+            plaintext_file_offsets: BTreeMap::new(),
+            limits: VaultV3Limits::default(),
             master_key: [0u8; KEY_SIZE],
             mac_key: [0u8; KEY_SIZE],
             manifest,
@@ -5838,28 +6693,27 @@ mod tests {
         const DATA_LEN: usize = 768 * 1024 * 1024;
         if let Some(path) = std::env::var_os(KEY) {
             crate::source::memory_test::limit();
-            let opened = VaultV3::open_plaintext(PathBuf::from(path)).unwrap();
+            let opened = VaultV3::open(PathBuf::from(path), PW).unwrap();
             assert!(opened.manifest_repaired_on_open);
             assert_eq!(opened.data.len(), DATA_LEN);
             assert_eq!(opened.data[0], 0);
-            assert_eq!(opened.data[DATA_LEN - 1], 0);
+            assert!(VaultV3::scrub(&opened).is_empty());
             crate::source::memory_test::complete();
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("large-manifest.aerozip");
+        let path = dir.path().join("large-manifest.aerovault");
         VaultV3::create_with_error_correction(
-            &CreateOptionsV3::new_plaintext(&path),
+            &CreateOptionsV3::new(&path, PW),
             super::super::ec::RecoveryPlacement::Detached,
             20,
         )
         .unwrap();
-        let mut vault = VaultV3::open_plaintext(&path).unwrap();
-        vault.data.resize(DATA_LEN, 0);
-        save_open_vault(&mut vault).unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        seed_live_test_extent(&mut vault, DATA_LEN);
         let manifest_at = vault.header.manifest_offset;
         drop(vault);
-        super::super::ec::export_parity(&path, "", None).unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -5881,11 +6735,11 @@ mod tests {
     fn review_reader_past_journal_check_cannot_recover_old_password_mid_rotation() {
         use super::super::ec::RecoveryPlacement;
         for placement in [RecoveryPlacement::Detached, RecoveryPlacement::Both] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = super::super::strip_transaction::adjacent_test_dir();
             let path = dir.path().join("reader-race.aerovault");
             VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
                 .unwrap();
-            super::super::ec::export_parity(&path, PW, None).unwrap();
+            VaultV3::export_parity(&path, PW, None).unwrap();
             let mut vault = VaultV3::open(&path, PW).unwrap();
             std::thread::scope(|scope| {
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -5931,7 +6785,7 @@ mod tests {
     #[test]
     fn round7d_alias_manifest_failure_checks_late_physical_journal() {
         use super::super::{ec, strip_transaction as tx};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = super::super::strip_transaction::adjacent_test_dir();
         let path = dir.path().join("physical.aerovault");
         let alias = dir.path().join("alias.aerovault");
         VaultV3::create_with_error_correction(
@@ -5940,7 +6794,7 @@ mod tests {
             20,
         )
         .unwrap();
-        ec::export_parity(&path, PW, None).unwrap();
+        VaultV3::export_parity(&path, PW, None).unwrap();
         let at = VaultV3::open(&path, PW).unwrap().header.manifest_offset as usize;
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[at] ^= 0xff;
@@ -6049,9 +6903,16 @@ mod tests {
     #[test]
     fn review_password_rotation_recovers_after_first_pair_replacement() {
         const KEY: &str = "AEROVAULT_PASSWORD_RESTART_DIR";
+        #[cfg(unix)]
+        const RECOVER: &str = "AEROVAULT_PASSWORD_RESTART_RECOVER";
         const NEW_PW: &str = "new-password-restart-123";
         if let Some(root) = std::env::var_os(KEY) {
             let path = PathBuf::from(root).join("restart.aerovault");
+            #[cfg(unix)]
+            if std::env::var_os(RECOVER).is_some() {
+                VaultV3::open(&path, PW).unwrap();
+                return;
+            }
             super::super::strip_transaction::AFTER_STRIP_VAULT
                 .with(|h| *h.borrow_mut() = Some(Box::new(|| std::process::exit(77))));
             let mut vault = VaultV3::open(&path, PW).unwrap();
@@ -6069,8 +6930,18 @@ mod tests {
             super::super::ec::RecoveryPlacement::Detached,
             super::super::ec::RecoveryPlacement::Both,
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("restart.aerovault");
+            let dir = super::super::strip_transaction::adjacent_test_dir();
+            #[cfg(unix)]
+            let namespace = {
+                let link = dir.path().join("home-link");
+                std::os::unix::fs::symlink(dir.path().canonicalize().unwrap(), &link).unwrap();
+                link
+            };
+            #[cfg(not(unix))]
+            let namespace = dir.path().to_path_buf();
+            let path = namespace.join("restart.aerovault");
+            let physical = dir.path().join("restart.aerovault");
+            let journal = super::super::strip_transaction::journal_path(&physical);
             VaultV3::create_with_error_correction(&CreateOptionsV3::new(&path, PW), placement, 20)
                 .unwrap();
             let payload = dir.path().join("payload");
@@ -6082,9 +6953,16 @@ mod tests {
             let sidecar = super::super::ec::default_sidecar_path(&path);
             let old_vault = std::fs::read(&path).unwrap();
             let old_sidecar = std::fs::read(&sidecar).unwrap();
-            let mut child = Child(std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "v3::vault::tests::review_password_rotation_recovers_after_first_pair_replacement", "--nocapture"])
-                .env(KEY, dir.path()).spawn().unwrap());
+            let restart_command = || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", "v3::vault::tests::review_password_rotation_recovers_after_first_pair_replacement", "--nocapture"])
+                    .env(KEY, &namespace);
+                #[cfg(unix)]
+                command.env("HOME", &namespace);
+                command
+            };
+            let mut child = Child(restart_command().spawn().unwrap());
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
             let status = loop {
                 if let Some(status) = child.0.try_wait().unwrap() {
@@ -6097,12 +6975,21 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             };
             assert_eq!(status.code(), Some(77));
-            assert!(super::super::strip_transaction::journal_path(&path).exists());
+            assert!(journal.exists());
             assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+            // On Unix the recovering process uses the same aliased HOME and
+            // vault parent as the interrupted writer.
+            #[cfg(unix)]
+            assert!(restart_command()
+                .env(RECOVER, "1")
+                .status()
+                .unwrap()
+                .success());
             // An interrupted rotation rolls back before any password is tried.
             let mut recovered = VaultV3::open(&path, PW).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), old_vault);
-            assert!(!super::super::strip_transaction::journal_path(&path).exists());
+            assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+            assert!(!journal.exists());
             assert!(VaultV3::open(&path, NEW_PW).is_err());
             VaultV3::change_password(&mut recovered, NEW_PW).unwrap();
             drop(recovered);
@@ -6195,7 +7082,7 @@ mod tests {
         for placement in [RecoveryPlacement::Detached, RecoveryPlacement::Both] {
             for existing in [false, true] {
                 for had_sidecar in [false, true] {
-                    let dir = tempfile::tempdir().unwrap();
+                    let dir = super::super::strip_transaction::adjacent_test_dir();
                     let path = dir.path().join("create.aerovault");
                     let sidecar = default_sidecar_path(&path);
                     if existing {
@@ -6639,60 +7526,125 @@ mod tests {
         assert!(save_open_vault(&mut opened).is_ok());
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn round12_legacy_sparse_tail_allows_extraction_without_a_write_baseline() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.aerozip");
-        let input = dir.path().join("input");
-        std::fs::write(&input, b"valid 0.6.8 payload").unwrap();
-        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
-        let mut opened = VaultV3::open_plaintext(&path).unwrap();
-        VaultV3::add_files(&mut opened, &[(input.clone(), "input".into())]).unwrap();
-        drop(opened);
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let original_len = file.metadata().unwrap().len();
-        file.set_len(original_len + 8).unwrap();
-        assert!(VaultV3::open_plaintext(&path)
-            .unwrap()
-            .opened_hash
-            .is_some());
-        file.set_len(MAX_GENERATION_EXTENT + 1).unwrap();
-        drop(file);
-        crate::lock::take_trace();
-        let mut opened = VaultV3::open_plaintext(&path).unwrap();
-        assert!(opened.opened_hash.is_none());
-        assert!(!crate::lock::take_trace().contains(&"generation"));
-        let output = dir.path().join("output");
-        VaultV3::extract_entry(&opened, "input", &output).unwrap();
-        assert_eq!(std::fs::read(output).unwrap(), b"valid 0.6.8 payload");
-        let error = VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap_err();
-        assert!(error.contains("write generation budget"), "{error}");
-        assert_eq!(
-            std::fs::metadata(path).unwrap().len(),
-            MAX_GENERATION_EXTENT + 1
-        );
-    }
-
-    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
-    #[test]
-    #[ignore = "requires a 64-bit host and 5 GiB of available memory; set AEROVAULT_V3_DATA_BUDGET_BYTES=4294975488"]
-    fn round13_explicit_budget_reads_a_legacy_data_section_over_four_gib() {
+    fn open_plaintext_bounds_chunk_ranges_and_excludes_unused_padding() {
         use super::super::manifest::serialize_manifest_plaintext;
         use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.aerozip");
         let input = dir.path().join("input");
-        let payload = b"referenced block beyond 4 GiB";
+        let payload = b"only the recorded block is live";
         std::fs::write(&input, payload).unwrap();
         VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
         let mut vault = VaultV3::open_plaintext(&path).unwrap();
-        VaultV3::add_files(&mut vault, &[(input.clone(), "input".into())]).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        let live_len = vault.data.len();
 
-        // Write the ordinary v3 layout accepted by 0.6.8. The data section
-        // is sparse, with a live block past 4 GiB and the manifest after it.
-        let block_offset = MAX_GENERATION_EXTENT + 4096;
+        let write_archive = |vault: &OpenVaultV3| {
+            let manifest = serialize_manifest_plaintext(&vault.manifest).unwrap();
+            let mut header = vault.header.clone();
+            header.data_len = live_len as u64 + 2 * 1024 * 1024;
+            header.manifest_offset = header.data_offset + header.data_len;
+            header.manifest_len = manifest.len() as u64;
+            header.extension_dir_offset = header.manifest_offset + header.manifest_len;
+            header.extension_dir_len = 2;
+            header.extension_payload_offset =
+                header.extension_dir_offset + header.extension_dir_len;
+            header.extension_payload_len = 0;
+            header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&header.to_bytes()).unwrap();
+            file.seek(std::io::SeekFrom::Start(header.data_offset))
+                .unwrap();
+            file.write_all(&vault.data).unwrap();
+            file.seek(std::io::SeekFrom::Start(header.manifest_offset))
+                .unwrap();
+            file.write_all(&manifest).unwrap();
+            file.write_all(b"[]").unwrap();
+        };
+
+        write_archive(&vault);
+        let opened = VaultV3::open_plaintext(&path).unwrap();
+        assert_eq!(opened.data.len(), live_len);
+        let output = dir.path().join("output");
+        VaultV3::extract_entry(&opened, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), payload);
+
+        for (offset, block_len) in [(u64::MAX, 1), (0, MAX_BLOCK_SIZE + 1)] {
+            let record = vault.manifest.chunks.values_mut().next().unwrap();
+            record.data_offset = offset;
+            record.block_len = block_len;
+            write_archive(&vault);
+            let before = std::fs::read(&path).unwrap();
+            let error = VaultV3::open_plaintext(&path).unwrap_err();
+            assert!(
+                error.contains("chunk record exceeds the block limit or data section"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_sparse_tail_above_four_gib_can_be_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"valid 0.6.8 payload").unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input.clone(), "input".into())]).unwrap();
+        drop(vault);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let sealed_len = file.metadata().unwrap().len();
+        let probe_extent = sealed_len + 1024 * 1024;
+        file.set_len(probe_extent).unwrap();
+        let supports_holes = sparse_hash_extent(&file, probe_extent) < probe_extent;
+        let original_extent = if supports_holes {
+            64 * 1024 * 1024 * 1024
+        } else {
+            4 * 1024 * 1024 * 1024 + 1
+        };
+        file.set_len(original_extent).unwrap();
+
+        let mut opened = VaultV3::open_plaintext(&path).unwrap();
+        assert_eq!(opened.opened_file_len, original_extent);
+        if supports_holes {
+            assert!(opened.hashed_file_len < probe_extent);
+            assert_vault_generation_current(&opened).unwrap();
+
+            // A non-cooperating writer within the skipped suffix must still
+            // invalidate the generation even though the file length is unchanged.
+            file.seek(std::io::SeekFrom::Start(original_extent - 1))
+                .unwrap();
+            std::io::Write::write_all(&mut file, b"x").unwrap();
+            file.sync_data().unwrap();
+            assert_eq!(file.metadata().unwrap().len(), original_extent);
+            assert!(save_open_vault(&mut opened)
+                .unwrap_err()
+                .contains("changed"));
+
+            file.set_len(probe_extent).unwrap();
+            file.set_len(original_extent).unwrap();
+            opened = VaultV3::open_plaintext(&path).unwrap();
+            assert!(opened.hashed_file_len < probe_extent);
+        }
+        drop(file);
+        let output = dir.path().join("output");
+        VaultV3::extract_entry(&opened, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), b"valid 0.6.8 payload");
+        VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap();
+        assert_eq!(VaultV3::list(&opened).len(), 2);
+        assert!(opened.opened_file_len < original_extent);
+        assert_vault_generation_current(&opened).unwrap();
+    }
+
+    fn put_plaintext_test_block_at(vault: &mut OpenVaultV3, block_offset: u64) -> VaultHeaderV3 {
+        use super::super::manifest::serialize_manifest_plaintext;
+        use std::io::Write;
+
         assert_eq!(vault.manifest.chunks.len(), 1);
         vault
             .manifest
@@ -6711,37 +7663,225 @@ mod tests {
         header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
         header.extension_payload_len = 0;
         header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
-        let mut file = std::fs::File::create(&path).unwrap();
+        let mut file = std::fs::File::create(&vault.path).unwrap();
+        #[cfg(windows)]
+        super::super::sparse::mark_sparse_if_supported(&file).unwrap();
         file.write_all(&header.to_bytes()).unwrap();
         file.seek(std::io::SeekFrom::Start(header.data_offset + block_offset))
             .unwrap();
         file.write_all(&vault.data).unwrap();
         file.write_all(&manifest).unwrap();
         file.write_all(b"[]").unwrap();
-        drop(file);
+        header
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sparse_plaintext_save_marks_windows_staging_before_writing() {
+        use std::os::windows::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let probe = tempfile::tempfile_in(dir.path()).unwrap();
+        if !super::super::sparse::mark_sparse_if_supported(&probe).unwrap() {
+            eprintln!(
+                "Skipping sparse reseal: the temporary volume lacks FILE_SUPPORTS_SPARSE_FILES"
+            );
+            return;
+        }
+        let path = dir.path().join("sparse.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"live frame").unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+
+        let block_offset = 128 * 1024 * 1024;
+        put_plaintext_test_block_at(&mut vault, block_offset);
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::create_directory(&mut vault, "added").unwrap();
+        assert!(vault.hashed_file_len < block_offset);
+        assert_vault_generation_current(&vault).unwrap();
+        let reopened = VaultV3::open_plaintext(&path).unwrap();
+        let block = reopened.manifest.chunks.values().next().unwrap();
+        assert_eq!(reopened.file_data_offset(block), block_offset);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_ne!(meta.file_attributes() & 0x200, 0);
+        let (_, covered, _) =
+            vault_generation_baseline(&mut file, &[], meta.len(), u64::MAX).unwrap();
+        assert!(covered < 1024 * 1024, "{covered} logical data bytes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_plaintext_open_uses_logical_coverage_on_compressed_or_unreported_extents() {
+        use std::io::{SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compressible.aerozip");
+        let input = dir.path().join("input");
+        let payload = vec![0; 128 * 1024];
+        std::fs::write(&input, &payload).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        let record = vault.manifest.chunks.values_mut().next().unwrap();
+        assert_eq!(record.plaintext_len, payload.len() as u64);
+        let len = record.plaintext_len;
+        record.stored_raw = true;
+        record.block_len = len;
+        record.compressed_len = len;
+        record.cipher_hash = blake3::hash(&payload).to_hex().to_string();
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        write_container_with_data(
+            &mut file,
+            vault.header.clone(),
+            &vault.mac_key,
+            &vault.master_key,
+            &vault.manifest,
+            &[],
+            &[],
+            len + 8,
+            |file| {
+                file.write_all(&len.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
+                // A hole supplies the exact stored zero bytes of this valid
+                // frame, simulating a start-to-end compressed logical extent.
+                file.seek(SeekFrom::Current(len as i64))
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+        if file.metadata().unwrap().blocks() * 512 >= len {
+            eprintln!(
+                "Skipping compressed allocation surrogate: filesystem allocated the zero range"
+            );
+            return;
+        }
+
+        for mode in ["dense-extents", "query-failure"] {
+            if mode == "dense-extents" {
+                REPORT_DENSE_EXTENTS.with(|flag| flag.set(true));
+            } else {
+                FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
+            }
+            let opened = VaultV3::open_plaintext(&path).unwrap();
+            FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(false));
+            assert_eq!(opened.hashed_file_len, opened.opened_file_len, "{mode}");
+            assert!(VaultV3::scrub(&opened).is_empty());
+            let output = dir.path().join(mode);
+            VaultV3::extract_entry(&opened, "input", &output).unwrap();
+            assert_eq!(std::fs::read(&output).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn sparse_plaintext_delete_keeps_repair_order_in_session_and_after_reopen() {
+        use std::io::{SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        for reopen in [false, true] {
+            let path = dir.path().join(format!("parity-{reopen}.aerozip"));
+            VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new_plaintext(&path),
+                super::super::RecoveryPlacement::Embedded,
+                20,
+            )
+            .unwrap();
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            let data = ["first", "second", "delete"];
+            for name in data {
+                let input = dir.path().join(name);
+                std::fs::write(&input, name.repeat(1500)).unwrap();
+                VaultV3::add_files(&mut vault, &[(input, name.into())]).unwrap();
+            }
+            assert_eq!(vault.manifest.chunks.len(), 3);
+            for record in vault.manifest.chunks.values() {
+                vault
+                    .plaintext_file_offsets
+                    .insert(record.id.clone(), (3 - record.block_index) * 1024 * 1024);
+            }
+            save_open_vault(&mut vault).unwrap();
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            VaultV3::delete_entry(&mut vault, "delete").unwrap();
+            let stored = vault.frames_in_storage_order();
+            assert!(
+                stored
+                    .windows(2)
+                    .all(|pair| pair[0].data_offset < pair[1].data_offset),
+                "compact frames must follow physical order"
+            );
+            let id = vault
+                .manifest
+                .entries
+                .iter()
+                .find(|entry| entry.path == "first")
+                .unwrap()
+                .chunks[0]
+                .clone();
+            let record = &vault.manifest.chunks[&id];
+            if reopen {
+                let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(SeekFrom::Start(
+                    DATA_OFFSET + vault.file_data_offset(record) + 8,
+                ))
+                .unwrap();
+                file.write_all(&[vault.data[record.data_offset as usize + 8] ^ 1])
+                    .unwrap();
+                drop(file);
+                vault = VaultV3::open_plaintext(&path).unwrap();
+            } else {
+                vault.data[record.data_offset as usize + 8] ^= 1;
+            }
+            assert_eq!(
+                VaultV3::repair(&mut vault, false, None).unwrap(),
+                (1, super::super::ParitySource::Embedded),
+                "reopened={reopen}"
+            );
+            for name in &data[..2] {
+                let output = dir.path().join(format!("restored-{name}-{reopen}"));
+                VaultV3::extract_entry(&vault, name, &output).unwrap();
+                assert_eq!(std::fs::read(output).unwrap(), name.repeat(1500).as_bytes());
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    #[ignore = "requires a 64-bit host with room for multiple 4 GiB allocations and file extents"]
+    fn legacy_sparse_data_section_over_four_gib_can_be_resealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerozip");
+        let input = dir.path().join("input");
+        let payload = b"referenced block beyond 4 GiB";
+        std::fs::write(&input, payload).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input.clone(), "input".into())]).unwrap();
+
+        // Write the ordinary v3 layout accepted by 0.6.8. The data section
+        // is sparse, with a live block past 4 GiB and the manifest after it.
+        let block_offset = 4 * 1024 * 1024 * 1024 + 4096;
+        let live_size = vault.data.len();
+        put_plaintext_test_block_at(&mut vault, block_offset);
         drop(vault);
 
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(DEFAULT_DATA_BUDGET)));
-        let default_result = VaultV3::open_plaintext(&path);
-        TEST_DATA_BUDGET.with(|limit| limit.set(None));
-        assert!(default_result
-            .unwrap_err()
-            .contains("in-memory open budget"));
-        assert!(data_budget() >= header.data_len);
-
-        crate::lock::take_trace();
         let mut opened = VaultV3::open_plaintext(&path).unwrap();
-        assert_eq!(opened.data.len() as u64, header.data_len);
-        assert!(!crate::lock::take_trace().contains(&"generation"));
+        assert_eq!(opened.data.len(), live_size);
+        assert_eq!(
+            opened.file_data_offset(opened.manifest.chunks.values().next().unwrap()),
+            block_offset
+        );
         let output = dir.path().join("output");
         VaultV3::extract_entry(&opened, "input", &output).unwrap();
         assert_eq!(std::fs::read(output).unwrap(), payload);
-        let error = VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap_err();
-        assert!(error.contains("write generation budget"), "{error}");
-        assert_eq!(
-            std::fs::metadata(path).unwrap().len(),
-            header.extension_payload_offset
-        );
+        VaultV3::add_files(&mut opened, &[(input, "new".into())]).unwrap();
+        assert_vault_generation_current(&opened).unwrap();
+        assert_eq!(VaultV3::list(&opened).len(), 2);
     }
 
     #[cfg(target_os = "linux")]
@@ -6783,6 +7923,56 @@ mod tests {
     }
 
     #[test]
+    fn pending_pair_refuses_open_and_create_even_with_a_valid_detached_sidecar() {
+        use super::super::{ec::RecoveryPlacement, pending_pair};
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(not(unix))]
+        let _ = &mut builder;
+        let dir = builder.tempdir().unwrap();
+
+        for plaintext in [false, true] {
+            let path = dir.path().join(if plaintext {
+                "pending.aerozip"
+            } else {
+                "pending.aerovault"
+            });
+            let options = if plaintext {
+                CreateOptionsV3::new_plaintext(&path)
+            } else {
+                CreateOptionsV3::new(&path, PW)
+            };
+            VaultV3::create_with_error_correction(&options, RecoveryPlacement::Both, 20).unwrap();
+            VaultV3::export_parity(&path, if plaintext { "" } else { PW }, None).unwrap();
+            let sidecar = super::super::ec::default_sidecar_path(&path);
+            let recovery = std::fs::read(&sidecar).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut pending = vec![0x9b; HEADER_SIZE];
+            pending[..pending_pair::MAGIC.len()].copy_from_slice(pending_pair::MAGIC);
+            pending.extend_from_slice(&original);
+            std::fs::write(&path, &pending).unwrap();
+
+            crate::lock::take_trace();
+            let error = if plaintext {
+                VaultV3::open_plaintext(&path).unwrap_err()
+            } else {
+                VaultV3::open(&path, PW).unwrap_err()
+            };
+            assert!(error.contains("publication is pending"), "{error}");
+            assert!(!crate::lock::take_trace().contains(&"lock"));
+            assert_eq!(VaultV3::peek(&path).unwrap_err(), error);
+            assert_eq!(VaultV3::has_error_correction(&path).unwrap_err(), error);
+            assert_eq!(VaultV3::create(&options).unwrap_err(), error);
+            assert_eq!(std::fs::read(&path).unwrap(), pending);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), recovery);
+        }
+    }
+
+    #[test]
     fn round9_v3_data_budget_refuses_public_add_without_mutating_handle_or_disk() {
         use rand::{RngCore, SeedableRng};
         let dir = tempfile::tempdir().unwrap();
@@ -6793,24 +7983,735 @@ mod tests {
         rng.fill_bytes(&mut random);
         std::fs::write(&input, random).unwrap();
         VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
-        let mut opened = VaultV3::open_plaintext(&path).unwrap();
+        let tight = VaultV3Limits::default().with_max_data_bytes(512);
+        let mut opened = VaultV3::open_plaintext_with_limits(&path, tight).unwrap();
         let before = std::fs::read(&path).unwrap();
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(512)));
         let failed = VaultV3::add_files(&mut opened, &[(input.clone(), "input".into())]);
-        TEST_DATA_BUDGET.with(|limit| limit.set(None));
-        assert!(failed.unwrap_err().contains("in-memory open budget"));
+        assert!(failed
+            .unwrap_err()
+            .contains("configured 512-byte data budget"));
         assert!(opened.data.is_empty());
         assert!(VaultV3::list(&opened).is_empty());
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        VaultV3::add_files(&mut opened, &[(input, "input".into())]).unwrap();
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(512)));
-        assert!(VaultV3::open_plaintext(&path)
+        let mut unlimited = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut unlimited, &[(input, "input".into())]).unwrap();
+        assert!(VaultV3::open_plaintext_with_limits(&path, tight)
             .unwrap_err()
-            .contains("in-memory open budget"));
-        TEST_DATA_BUDGET.with(|limit| limit.set(Some(2048)));
-        let reopened = VaultV3::open_plaintext(&path);
-        TEST_DATA_BUDGET.with(|limit| limit.set(None));
-        assert_eq!(VaultV3::list(&reopened.unwrap()).len(), 1);
+            .contains("configured 512-byte data budget"));
+        let reopened = VaultV3::open_plaintext_with_limits(
+            &path,
+            VaultV3Limits::default().with_max_data_bytes(2048),
+        )
+        .unwrap();
+        assert_eq!(VaultV3::list(&reopened).len(), 1);
+    }
+
+    #[test]
+    fn a_data_budget_refusal_preserves_the_vault_and_its_sidecar() {
+        use super::super::ec::RecoveryPlacement;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.aerovault");
+        let sidecar = super::super::ec::default_sidecar_path(&path);
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"stored bytes").unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&path, PW),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open(&path, PW).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        drop(vault);
+        VaultV3::export_parity(&path, PW, None).unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        let recovery = std::fs::read(&sidecar).unwrap();
+        let limits = VaultV3Limits::default().with_max_data_bytes(0);
+        for error in [
+            VaultV3::open_with_limits(&path, PW, limits).unwrap_err(),
+            VaultV3::export_parity_with_limits(&path, PW, None, limits).unwrap_err(),
+            VaultV3::strip_parity_with_limits(&path, PW, false, limits).unwrap_err(),
+        ] {
+            assert!(error.contains("configured 0-byte data budget"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(&sidecar).unwrap(), recovery);
+        }
+    }
+
+    #[test]
+    fn invalid_environment_data_budget_is_reported_and_explicit_limits_ignore_it() {
+        const SAMPLE: &str = "AEROVAULT_TEST_ENV_BUDGET_PATH";
+        const TEST: &str = "v3::vault::tests::invalid_environment_data_budget_is_reported_and_explicit_limits_ignore_it";
+        if let Some(path) = std::env::var_os(SAMPLE).map(PathBuf::from) {
+            let result = VaultV3::open_plaintext(&path);
+            match std::env::var(DATA_BUDGET_ENV).ok().as_deref() {
+                None | Some("1073741824") => {
+                    result.unwrap();
+                }
+                Some(_) => {
+                    let error = result.unwrap_err();
+                    assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+                    assert!(
+                        error.contains(&format!("{MIN_ENV_DATA_BUDGET}..={}", isize::MAX)),
+                        "{error}"
+                    );
+                }
+            }
+            VaultV3::open_plaintext_with_limits(
+                &path,
+                VaultV3Limits::default().with_max_data_bytes(0),
+            )
+            .unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        for value in [None, Some("1073741824"), Some("536870912"), Some("invalid")] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", TEST, "--nocapture"])
+                .env(SAMPLE, &path);
+            if let Some(value) = value {
+                child.env(DATA_BUDGET_ENV, value);
+            } else {
+                child.env_remove(DATA_BUDGET_ENV);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn distant_plaintext_frame_keeps_disk_offsets_and_repairs_without_loading_the_gap() {
+        use std::io::{SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.aerozip");
+        let input = dir.path().join("input");
+        let payload = b"block framing and payload are separate checks".repeat(512);
+        std::fs::write(&input, &payload).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault =
+            VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+
+        let block_offset = MAX_BLOCK_SIZE + 4096;
+        let header = put_plaintext_test_block_at(&mut vault, block_offset);
+        let intact_frame = std::mem::take(&mut vault.data);
+        drop(vault);
+        let intact_file = super::super::strip_transaction::generation(&path).unwrap();
+        VaultV3::export_parity_with_limits(&path, "", None, VaultV3Limits::default()).unwrap();
+        let rewrite = |relative, bytes: &[u8]| {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(
+                header.data_offset + block_offset + relative,
+            ))
+            .unwrap();
+            file.write_all(bytes).unwrap();
+        };
+        let open_damaged = || {
+            let vault =
+                VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
+            assert_eq!(vault.data.len(), intact_frame.len());
+            let damaged = VaultV3::scrub(&vault);
+            assert_eq!(damaged.len(), 1);
+            assert_eq!(damaged[0].on_disk_start, block_offset);
+            assert_eq!(damaged[0].record.data_offset, block_offset);
+            vault
+        };
+
+        // Exercise both a damaged prefix with intact body and a damaged body
+        // with intact prefix. Neither changes the storage needed for the frame.
+        rewrite(0, &[0; 8]);
+        drop(open_damaged());
+        rewrite(0, &intact_frame[..8]);
+        rewrite(8, &[intact_frame[8] ^ 1]);
+        drop(open_damaged());
+
+        rewrite(0, &[0; 8]);
+        let mut recoverable = open_damaged();
+        assert_eq!(VaultV3::repair(&mut recoverable, false, None).unwrap().0, 1);
+        assert!(VaultV3::scrub(&recoverable).is_empty());
+        let output = dir.path().join("restored");
+        VaultV3::extract_entry(&recoverable, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), payload);
+        assert_eq!(recoverable.data, intact_frame);
+        assert_eq!(
+            super::super::strip_transaction::generation(&path).unwrap(),
+            intact_file
+        );
+        let reopened = VaultV3::open_plaintext(&path).unwrap();
+        assert_eq!(
+            reopened.file_data_offset(reopened.manifest.chunks.values().next().unwrap()),
+            block_offset
+        );
+        assert_vault_generation_current(&recoverable).unwrap();
+        let second_output = dir.path().join("reopened");
+        VaultV3::extract_entry(&reopened, "input", &second_output).unwrap();
+        assert_eq!(std::fs::read(second_output).unwrap(), payload);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn generation_reads_allocated_extents_and_detects_sparse_tail_changes() {
+        use std::io::{SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail.aerozip");
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let file_len = 128 * 1024 * 1024;
+        let tail = file_len - 32;
+        file.set_len(file_len).unwrap();
+        file.seek(SeekFrom::Start(tail)).unwrap();
+        file.write_all(b"ordinary trailing bytes").unwrap();
+        file.sync_data().unwrap();
+        if sparse_hash_extent(&file, file_len) == file_len {
+            return;
+        }
+
+        GENERATION_BYTES_READ.with(|read| read.set(0));
+        let vault = VaultV3::open_plaintext(&path).unwrap();
+        let bytes_read = GENERATION_BYTES_READ.with(std::cell::Cell::get);
+        assert!(
+            bytes_read < file_len / 8,
+            "generation read {bytes_read} bytes"
+        );
+        assert_vault_generation_current(&vault).unwrap();
+
+        FAIL_SPARSE_TAIL_QUERY.with(|fail| fail.set(true));
+        let raw = VaultV3::open_plaintext(&path).unwrap();
+        assert_eq!(raw.hashed_file_len, file_len);
+        assert_eq!(
+            raw.opened_hash,
+            Some(
+                super::super::strip_transaction::generation(&path)
+                    .unwrap()
+                    .hash
+            )
+        );
+        assert_vault_generation_current(&raw).unwrap();
+
+        file.seek(SeekFrom::Start(tail)).unwrap();
+        file.write_all(b"O").unwrap();
+        file.sync_data().unwrap();
+        assert!(assert_vault_generation_current(&vault)
+            .unwrap_err()
+            .contains("changed"));
+        file.seek(SeekFrom::Start(tail)).unwrap();
+        file.write_all(b"o").unwrap();
+        file.sync_data().unwrap();
+        assert_vault_generation_current(&vault).unwrap();
+
+        file.seek(SeekFrom::Start(file_len / 2)).unwrap();
+        file.write_all(b"additional trailing bytes").unwrap();
+        file.sync_data().unwrap();
+        assert!(assert_vault_generation_current(&vault)
+            .unwrap_err()
+            .contains("changed"));
+        assert_eq!(file.metadata().unwrap().len(), file_len);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_fallback_can_extract_without_authorizing_writes_or_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.aerozip");
+        let input = dir.path().join("input");
+        let contents = b"stored data before a large unused tail";
+        std::fs::write(&input, contents).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        drop(vault);
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let logical_len = file.metadata().unwrap().len() + MAX_OPEN_TRAILING_SCAN + 8192;
+        file.set_len(logical_len).unwrap();
+        for (label, first_extent) in [
+            ("ordinary", None),
+            ("coarse-prefix", Some(logical_len - 4096)),
+        ] {
+            let force_extent_failure = || {
+                REPORT_FIRST_EXTENT.with(|extent| extent.set(first_extent));
+                FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
+                GENERATION_BYTES_READ.with(|read| read.set(0));
+            };
+            force_extent_failure();
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            assert!(vault.opened_hash.is_none(), "{label}");
+            let read = GENERATION_BYTES_READ.with(std::cell::Cell::get);
+            assert!(read < 1024 * 1024, "{label}: read {read} generation bytes");
+            let output = dir.path().join(format!("extracted-{label}"));
+            VaultV3::extract_entry(&vault, "input", &output).unwrap();
+            assert_eq!(std::fs::read(output).unwrap(), contents);
+            let error = VaultV3::create_directory(&mut vault, "refused").unwrap_err();
+            assert!(
+                error.contains("without a complete generation baseline"),
+                "{error}"
+            );
+
+            force_extent_failure();
+            let sidecar = dir.path().join(format!("refused-{label}.aerocorrect"));
+            let error = VaultV3::export_parity(&path, "", Some(&sidecar)).unwrap_err();
+            assert!(
+                error.contains("without a complete generation baseline"),
+                "{error}"
+            );
+            assert!(GENERATION_BYTES_READ.with(std::cell::Cell::get) < 1024 * 1024);
+            assert!(!sidecar.exists());
+        }
+        FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(false));
+        assert_eq!(file.metadata().unwrap().len(), logical_len);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn valid_plaintext_frame_at_sixty_four_gib_opens_under_memory_limit() {
+        const KEY: &str = "AEROVAULT_TEST_DISTANT_FRAME";
+        const TEST: &str =
+            "v3::vault::tests::valid_plaintext_frame_at_sixty_four_gib_opens_under_memory_limit";
+        const DATA_OFFSET: u64 = 64 * 1024 * 1024 * 1024;
+        const PAYLOAD: &[u8] = b"a small live block in an ordinary sparse archive";
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            crate::source::memory_test::limit();
+            let vault =
+                VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
+            assert!(
+                vault.data.len() < 4096,
+                "loaded {} frame bytes",
+                vault.data.len()
+            );
+            assert_eq!(
+                vault.file_data_offset(vault.manifest.chunks.values().next().unwrap()),
+                DATA_OFFSET
+            );
+            let output = path.with_file_name("restored");
+            VaultV3::extract_entry(&vault, "input", &output).unwrap();
+            assert_eq!(std::fs::read(output).unwrap(), PAYLOAD);
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("distant.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, PAYLOAD).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        put_plaintext_test_block_at(&mut vault, DATA_OFFSET);
+        drop(vault);
+
+        let file = std::fs::File::open(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        if sparse_hash_extent(&file, file_len) < file_len {
+            crate::source::memory_test::run(TEST, KEY, &path);
+        }
+    }
+
+    #[test]
+    fn macos_vm_estimate_changes_with_current_memory_pressure() {
+        let section = 2 * 1024 * 1024 * 1024;
+        let page_size = 16 * 1024;
+        let idle = macos_vm_headroom(100_000, 80_000, 80_000, 4000, page_size, 0);
+        let busy = macos_vm_headroom(1000, 80_000, 10_000, 1000, page_size, 0);
+        check_available_memory(section, Some(idle), section).unwrap();
+        assert!(check_available_memory(section, Some(busy), section).is_err());
+        assert_eq!(
+            macos_vm_headroom(50, 20, 30, 40, page_size, 0),
+            50 * page_size
+        );
+        let memsize = 14 * 1024 * 1024 * 1024;
+        let idle = macos_memory_level_headroom(memsize, 92, 0);
+        let busy = macos_memory_level_headroom(memsize, 10, 0);
+        check_available_memory(section, idle, section).unwrap();
+        assert!(check_available_memory(section, busy, section).is_err());
+        assert_eq!(macos_memory_level_headroom(memsize, 101, 0), None);
+        assert_eq!(macos_memory_level_headroom(memsize, 0, 4096), Some(4096));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn meminfo_reports_available_memory_plus_free_swap() {
+        let meminfo = "MemTotal:       16000000 kB\nMemFree:         1000000 kB\nMemAvailable:    8000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n";
+        assert_eq!(
+            parse_meminfo_available(meminfo),
+            Some((8_000_000 * 1024, 1_500_000 * 1024))
+        );
+        assert_eq!(
+            parse_meminfo_available("MemAvailable:    4 kB\n"),
+            Some((4096, 0))
+        );
+        assert_eq!(parse_meminfo_available("MemFree: 4 kB\n"), None);
+        let available = available_memory_bytes().expect("Linux reports available memory");
+        assert!(available > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_allows_a_vault_buffer_after_clean_cache_reclaim() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for (name, bytes) in [("memory.max", 1024 * MIB), ("memory.current", 896 * MIB)] {
+            std::fs::write(path.join(name), bytes.to_string()).unwrap();
+        }
+        let stats = |active_file: u64, inactive_file: u64| {
+            std::fs::write(
+                path.join("memory.stat"),
+                format!(
+                    "anon {}\nactive_file {active_file}\ninactive_file {inactive_file}\nfile_dirty {}\nfile_writeback {}\n",
+                    128 * MIB,
+                    16 * MIB,
+                    16 * MIB
+                ),
+            )
+            .unwrap();
+        };
+        let section = 768 * MIB;
+        for cache in [(0, section), (section, 0)] {
+            stats(cache.0, cache.1);
+            let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
+            assert_eq!(available, 864 * MIB);
+            check_available_memory(section, Some(available), section).unwrap();
+        }
+        stats(0, 0);
+        let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
+        assert_eq!(available, 128 * MIB);
+        assert!(check_available_memory(section, Some(available), section).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_cache_credit_accounts_for_protected_missing_and_unknown_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("scope");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("memory.min"), "600").unwrap();
+        std::fs::write(child.join("memory.low"), "200").unwrap();
+        std::fs::write(child.join("memory.current"), "400").unwrap();
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), Some(600));
+
+        std::fs::write(child.join("memory.min"), "unavailable").unwrap();
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), None);
+        std::fs::remove_file(child.join("memory.min")).unwrap();
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), None);
+
+        std::fs::remove_dir_all(&child).unwrap();
+        assert_eq!(cgroup_v2_child_protection(&child), Some(0));
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), Some(1000));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_and_swap_respect_a_constrained_ancestor() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("slice");
+        let relative = Path::new("slice/leaf");
+        let leaf = dir.path().join(relative);
+        std::fs::create_dir_all(&leaf).unwrap();
+        for (path, value) in [
+            (leaf.join("memory.max"), "max".into()),
+            (leaf.join("memory.swap.max"), "max".into()),
+            (parent.join("memory.max"), (512 * MIB).to_string()),
+            (parent.join("memory.current"), (128 * MIB).to_string()),
+            (parent.join("memory.swap.max"), (256 * MIB).to_string()),
+            (parent.join("memory.swap.current"), (224 * MIB).to_string()),
+        ] {
+            std::fs::write(path, value).unwrap();
+        }
+        let available = cgroup_v2_headroom(dir.path(), relative, 16 * 1024 * MIB, 2 * 1024 * MIB);
+        assert_eq!(available, 416 * MIB);
+        let section = 512 * MIB;
+        let error = check_available_memory(section, Some(available), section).unwrap_err();
+        assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+        assert_eq!(
+            cgroup_v2_headroom(dir.path(), relative, 16 * 1024 * MIB, 8 * MIB),
+            392 * MIB
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_open_obeys_the_ancestor_and_can_reclaim_its_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("open.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"ordinary file under an unlimited leaf").unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        let bytes = vault.header.data_len;
+        assert!(bytes > 1);
+        drop(vault);
+
+        let root = dir.path().join("cgroups");
+        let group = PathBuf::from("parent/leaf");
+        let parent = root.join("parent");
+        std::fs::create_dir_all(root.join(&group)).unwrap();
+        std::fs::write(root.join(&group).join("memory.max"), "max").unwrap();
+        std::fs::write(root.join(&group).join("memory.min"), "0").unwrap();
+        std::fs::write(root.join(&group).join("memory.low"), "0").unwrap();
+        std::fs::write(parent.join("memory.max"), (bytes + 1).to_string()).unwrap();
+        std::fs::write(parent.join("memory.current"), bytes.to_string()).unwrap();
+        std::fs::write(parent.join("memory.swap.max"), "0").unwrap();
+        TEST_CGROUP_V2.with(|paths| paths.replace(Some((root, group))));
+
+        let error =
+            VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap_err();
+        assert!(error.contains("1 bytes available"), "{error}");
+        assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+        let explicit = VaultV3Limits::default().with_max_data_bytes(bytes);
+        VaultV3::open_plaintext_with_limits(&path, explicit).unwrap();
+
+        std::fs::write(parent.join("memory.stat"), format!("active_file {bytes}\n")).unwrap();
+        let opened = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
+        assert_eq!(VaultV3::list(&opened).len(), 1);
+        drop(opened);
+
+        let sibling = parent.join("protected");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(sibling.join("memory.current"), bytes.to_string()).unwrap();
+        for (minimum, low, admits) in [("max", "0", false), ("0", "max", false), ("0", "0", true)] {
+            std::fs::write(sibling.join("memory.min"), minimum).unwrap();
+            std::fs::write(sibling.join("memory.low"), low).unwrap();
+            let result = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default());
+            assert_eq!(
+                result.is_ok(),
+                admits,
+                "sibling minimum {minimum}, low {low}"
+            );
+            if let Err(error) = result {
+                assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+            }
+        }
+        std::fs::remove_file(sibling.join("memory.low")).unwrap();
+        assert!(VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).is_err());
+        TEST_CGROUP_V2.with(|paths| paths.replace(None));
+    }
+
+    /// Frames whose stored bytes are all holes, over `frames` maximum-size
+    /// blocks, in a plaintext vault whose extents cannot vouch for them.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn write_unbacked_plaintext_frames(path: &Path, frames: u64) -> u64 {
+        use super::super::manifest::serialize_manifest_plaintext;
+        use std::io::Write;
+
+        VaultV3::create(&CreateOptionsV3::new_plaintext(path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(path).unwrap();
+        let stride = MAX_BLOCK_SIZE + 8;
+        for index in 0..frames {
+            let id = format!("unbacked-{index}");
+            vault.manifest.chunks.insert(
+                id.clone(),
+                ChunkRecordV3 {
+                    id,
+                    block_index: index,
+                    data_offset: index * stride,
+                    block_len: MAX_BLOCK_SIZE,
+                    plaintext_len: MAX_BLOCK_SIZE,
+                    compressed_len: MAX_BLOCK_SIZE,
+                    cipher_hash: String::new(),
+                    stored_raw: true,
+                },
+            );
+        }
+        let manifest = serialize_manifest_plaintext(&vault.manifest).unwrap();
+        let mut header = vault.header.clone();
+        header.data_len = frames * stride;
+        header.manifest_offset = header.data_offset + header.data_len;
+        header.manifest_len = manifest.len() as u64;
+        header.extension_dir_offset = header.manifest_offset + header.manifest_len;
+        header.extension_dir_len = 2;
+        header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
+        header.extension_payload_len = 0;
+        header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&header.to_bytes()).unwrap();
+        file.seek(std::io::SeekFrom::Start(header.manifest_offset))
+            .unwrap();
+        file.write_all(&manifest).unwrap();
+        file.write_all(b"[]").unwrap();
+        header.data_len
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn coarse_extents_cannot_allocate_past_available_memory() {
+        const KEY: &str = "AEROVAULT_TEST_COARSE_EXTENT_MEMORY";
+        const TEST: &str = "v3::vault::tests::coarse_extents_cannot_allocate_past_available_memory";
+        // 32 maximum-size frames: 2 GiB of holes, above the child's 1.5 GiB
+        // address-space limit, and cheap to hash densely.
+        const FRAMES: u64 = 32;
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            crate::source::memory_test::limit();
+            let section = (MAX_BLOCK_SIZE + 8) * FRAMES;
+            for mode in ["dense-extents", "query-failure"] {
+                if mode == "dense-extents" {
+                    REPORT_DENSE_EXTENTS.with(|flag| flag.set(true));
+                } else {
+                    FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
+                }
+                let error = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default())
+                    .expect_err("frames past available memory must be refused");
+                REPORT_DENSE_EXTENTS.with(|flag| flag.set(false));
+                FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(false));
+                assert!(
+                    error.contains("bytes in memory but the system reports"),
+                    "{mode}: {error}"
+                );
+                assert!(
+                    error.contains(&format!("{DATA_BUDGET_ENV}={section} (bytes)")),
+                    "{mode}: {error}"
+                );
+            }
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unbacked.aerozip");
+        write_unbacked_plaintext_frames(&path, FRAMES);
+        let file = std::fs::File::open(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        if sparse_hash_extent(&file, file_len) < file_len {
+            crate::source::memory_test::run(TEST, KEY, &path);
+        } else {
+            eprintln!("Skipping coarse-extent memory bound: the filesystem allocated the holes");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn encrypted_data_section_cannot_allocate_past_available_memory() {
+        const KEY: &str = "AEROVAULT_TEST_ENCRYPTED_SECTION_MEMORY";
+        const TEST: &str =
+            "v3::vault::tests::encrypted_data_section_cannot_allocate_past_available_memory";
+        const PASSWORD: &str = "memory-bound-password";
+        const SECTION: u64 = 2 * 1024 * 1024 * 1024;
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            crate::source::memory_test::limit();
+            let error = VaultV3::open_with_limits(&path, PASSWORD, VaultV3Limits::default())
+                .expect_err("a data section past available memory must be refused");
+            assert!(
+                error.contains("bytes in memory but the system reports"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("{DATA_BUDGET_ENV}={SECTION} (bytes)")),
+                "{error}"
+            );
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PASSWORD)).unwrap();
+        let vault = VaultV3::open(&path, PASSWORD).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let range = |offset: u64, len: u64| &bytes[offset as usize..(offset + len) as usize];
+        let old = vault.header.clone();
+        let mut header = old.clone();
+        header.data_len = SECTION;
+        header.manifest_offset = header.data_offset + header.data_len;
+        header.extension_dir_offset = header.manifest_offset + header.manifest_len;
+        header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
+        header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&header.to_bytes()).unwrap();
+        file.write_all(range(old.data_offset, old.data_len))
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(header.manifest_offset))
+            .unwrap();
+        file.write_all(range(old.manifest_offset, old.manifest_len))
+            .unwrap();
+        file.write_all(range(old.extension_dir_offset, old.extension_dir_len))
+            .unwrap();
+        file.write_all(range(
+            old.extension_payload_offset,
+            old.extension_payload_len,
+        ))
+        .unwrap();
+        drop(file);
+        crate::source::memory_test::run(TEST, KEY, &path);
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn plaintext_frame_sum_requires_file_backing_before_allocation() {
+        const KEY: &str = "AEROVAULT_TEST_FRAME_STORAGE_BOUND";
+        const TEST: &str =
+            "v3::vault::tests::plaintext_frame_sum_requires_file_backing_before_allocation";
+        const LOGICAL_LEN: u64 = 64 * 1024 * 1024 * 1024;
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            crate::source::memory_test::limit();
+            // The file contains raw test bytes, never a serialized vault.
+            // Test the reader directly with synthetic frame ranges in memory.
+            let mut file = std::fs::File::open(&path).unwrap();
+            let file_len = file.metadata().unwrap().len();
+            let template = path.with_file_name("template.aerozip");
+            VaultV3::create(&CreateOptionsV3::new_plaintext(&template)).unwrap();
+            let mut header = VaultHeaderV3::from_bytes(&std::fs::read(template).unwrap()).unwrap();
+            header.data_len = LOGICAL_LEN;
+            let mut manifest = empty_manifest_plaintext(DEFAULT_ZSTD_LEVEL);
+            let stride = MAX_BLOCK_SIZE + 8;
+            for index in 0..LOGICAL_LEN / stride {
+                let id = format!("fixture-{index}");
+                manifest.chunks.insert(
+                    id.clone(),
+                    ChunkRecordV3 {
+                        id,
+                        block_index: index,
+                        data_offset: index * stride,
+                        block_len: MAX_BLOCK_SIZE,
+                        plaintext_len: MAX_BLOCK_SIZE,
+                        compressed_len: MAX_BLOCK_SIZE,
+                        cipher_hash: String::new(),
+                        stored_raw: true,
+                    },
+                );
+            }
+            let (_, covered, prefix) =
+                vault_generation_baseline(&mut file, &[], file_len, u64::MAX).unwrap();
+            assert!(prefix < file_len && covered < MAX_BLOCK_SIZE);
+            let error = read_plaintext_data(&mut file, &header, &mut manifest, Some(covered), None)
+                .err()
+                .expect("unbacked ranges must be rejected before allocation");
+            assert!(
+                error.contains("bytes covered by logical data ranges"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("{DATA_BUDGET_ENV}={LOGICAL_LEN} (bytes)")),
+                "{error}"
+            );
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw-data");
+        let file = std::fs::File::create(&path).unwrap();
+        let file_len = DATA_OFFSET + LOGICAL_LEN;
+        file.set_len(file_len).unwrap();
+        if sparse_hash_extent(&file, file_len) < file_len {
+            crate::source::memory_test::run(TEST, KEY, &path);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -6819,10 +8720,13 @@ mod tests {
         const KEY: &str = "AEROVAULT_ROUND8_MEMORY";
         if let Some(path) = std::env::var_os(KEY) {
             crate::source::memory_test::limit();
-            TEST_DATA_BUDGET.with(|budget| budget.set(Some(DEFAULT_DATA_BUDGET)));
+            let limits = VaultV3Limits::default().with_max_data_bytes(1024 * 1024 * 1024);
             crate::lock::take_trace();
-            let err = VaultV3::open_plaintext(PathBuf::from(path)).unwrap_err();
-            assert!(err.contains("in-memory open budget"), "{err}");
+            let err = VaultV3::open_plaintext_with_limits(PathBuf::from(path), limits).unwrap_err();
+            assert!(
+                err.contains("configured 1073741824-byte data budget"),
+                "{err}"
+            );
             assert!(!crate::lock::take_trace().contains(&"generation"));
             crate::source::memory_test::complete();
             return;

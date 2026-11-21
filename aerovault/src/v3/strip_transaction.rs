@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Generation {
-    len: u64,
-    hash: [u8; 32],
+    pub(super) len: u64,
+    pub(super) hash: [u8; 32],
 }
 
 pub(super) fn generation(path: &Path) -> Result<Generation, String> {
@@ -28,7 +28,7 @@ pub(super) fn generation(path: &Path) -> Result<Generation, String> {
     hash_generation(file, expected)
 }
 
-fn hash_generation(mut file: fs::File, expected: u64) -> Result<Generation, String> {
+pub(super) fn hash_generation(mut file: fs::File, expected: u64) -> Result<Generation, String> {
     let mut reader = Read::by_ref(&mut file).take(expected);
     let mut hash = blake3::Hasher::new();
     let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
@@ -60,7 +60,7 @@ fn generation_if_present(path: &Path) -> Result<Option<Generation>, String> {
     }
 }
 
-fn recorded_generation(
+pub(super) fn recorded_generation(
     path: &Path,
     candidates: &[Option<Generation>],
 ) -> Result<Option<Generation>, String> {
@@ -329,7 +329,7 @@ pub(crate) fn private_dir(parent: &Path, prefix: &str) -> Result<PrivateDir, Str
     Ok(dir)
 }
 
-fn private_options() -> fs::OpenOptions {
+pub(super) fn private_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -340,7 +340,7 @@ fn private_options() -> fs::OpenOptions {
     options
 }
 
-fn sync_dir(path: &Path) -> Result<(), String> {
+pub(super) fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     fs::File::open(path)
         .and_then(|f| f.sync_all())
@@ -361,25 +361,79 @@ pub(super) fn copy_file_capped(
     target: &Path,
     limit: u64,
 ) -> Result<Generation, String> {
-    let mut copied = 0u64;
     let mut input = crate::source::open_regular_no_follow(source).map_err(|e| e.to_string())?;
-    let mut output = private_options().open(target).map_err(|e| e.to_string())?;
-    let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
-    loop {
-        let n = input.read(&mut *buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        copied = copied
-            .checked_add(n as u64)
-            .ok_or("Recovery copy length overflow")?;
-        if copied > limit {
-            return Err("Recovery input grew beyond its validated copy bound".into());
-        }
-        output.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    let expected = input.metadata().map_err(|e| e.to_string())?.len();
+    if expected > limit {
+        return Err("Recovery input grew beyond its validated copy bound".into());
     }
+    let mut output = private_options().open(target).map_err(|e| e.to_string())?;
+    copy_recovery_data(&mut input, &mut output, expected, 0).map_err(|e| e.to_string())?;
     output.sync_all().map_err(|e| e.to_string())?;
     generation(target)
+}
+
+pub(super) fn copy_recovery_data(
+    input: &mut fs::File,
+    output: &mut fs::File,
+    expected: u64,
+    output_offset: u64,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Seek, SeekFrom};
+
+    let output_len = output_offset
+        .checked_add(expected)
+        .ok_or(ErrorKind::InvalidInput)?;
+    let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
+    let mut copy_range = |input: &mut fs::File,
+                          output: &mut fs::File,
+                          range: std::ops::Range<u64>|
+     -> std::io::Result<()> {
+        input.seek(SeekFrom::Start(range.start))?;
+        output.seek(SeekFrom::Start(output_offset + range.start))?;
+        let mut remaining = range.end - range.start;
+        while remaining > 0 {
+            let n = remaining.min(buf.len() as u64) as usize;
+            input.read_exact(&mut buf[..n])?;
+            output.write_all(&buf[..n])?;
+            remaining -= n as u64;
+        }
+        Ok(())
+    };
+    let mut cursor = 0;
+    #[cfg(windows)]
+    let mut marked_sparse = false;
+    while cursor < expected {
+        match super::sparse::data_range(input, cursor, expected) {
+            Ok(Some(range)) => {
+                #[cfg(windows)]
+                if range.start > cursor && !marked_sparse {
+                    marked_sparse = super::sparse::mark_sparse_if_supported(output)?;
+                }
+                cursor = range.end;
+                copy_range(input, output, range)?;
+            }
+            Ok(None) => {
+                #[cfg(windows)]
+                if !marked_sparse {
+                    super::sparse::mark_sparse_if_supported(output)?;
+                }
+                break;
+            }
+            Err(_) => {
+                // A volume without extent queries still gets a full byte copy.
+                copy_range(input, output, 0..expected)?;
+                break;
+            }
+        }
+    }
+    if input.metadata()?.len() != expected {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Recovery input changed length while being copied",
+        ));
+    }
+    output.set_len(output_len)?;
+    Ok(())
 }
 
 fn replace_from(
@@ -395,17 +449,8 @@ fn replace_from(
         .prefix("replacement-")
         .tempfile_in(private.path())
         .map_err(|e| e.to_string())?;
-    let mut buf = zeroize::Zeroizing::new([0u8; 64 * 1024]);
-    let mut remaining = expected.len;
-    while remaining > 0 {
-        let n = remaining.min(buf.len() as u64) as usize;
-        input.read_exact(&mut buf[..n]).map_err(|e| e.to_string())?;
-        temp.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-        remaining -= n as u64;
-    }
-    if input.read(&mut buf[..1]).map_err(|e| e.to_string())? != 0 {
-        return Err("strip rollback copy grew while being read".into());
-    }
+    copy_recovery_data(&mut input, temp.as_file_mut(), expected.len, 0)
+        .map_err(|e| e.to_string())?;
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
     #[cfg(all(test, target_os = "macos"))]
     if let Some(inspect) = INSPECT_ROLLBACK_STAGE.with(|h| h.borrow_mut().take()) {
@@ -530,7 +575,7 @@ fn conflict(path: &Path, reason: &str) -> String {
     format!("pending strip transaction conflicts ({reason}); files left untouched; preserve the vault, sidecar and rollback directory {}, then follow the pending-strip conflict procedure in AEROVAULT-V3-SPEC.md before reopening", path.display())
 }
 
-struct TrustedJournal<'a> {
+pub(super) struct TrustedJournal<'a> {
     path: &'a Path,
     directory: same_file::Handle,
     #[cfg(windows)]
@@ -540,7 +585,7 @@ struct TrustedJournal<'a> {
 }
 
 impl<'a> TrustedJournal<'a> {
-    fn open(path: &'a Path) -> Result<Self, String> {
+    pub(super) fn open(path: &'a Path) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if !metadata.is_dir() {
             return Err("strip transaction path is not a regular directory".into());
@@ -575,7 +620,7 @@ impl<'a> TrustedJournal<'a> {
         Ok(journal)
     }
 
-    fn recheck(&self) -> Result<(), String> {
+    pub(super) fn recheck(&self) -> Result<(), String> {
         let current = super::extraction_stage::directory_identity(self.path)
             .map_err(|e| format!("strip journal directory unavailable: {e}"))?;
         if current != self.directory {
@@ -584,7 +629,7 @@ impl<'a> TrustedJournal<'a> {
         Ok(())
     }
 
-    fn open_input(&self, name: &str) -> Result<fs::File, String> {
+    pub(super) fn open_input(&self, name: &str) -> Result<fs::File, String> {
         #[cfg(unix)]
         let file = {
             use std::os::fd::{AsRawFd, FromRawFd};
@@ -645,7 +690,7 @@ impl<'a> TrustedJournal<'a> {
         Ok(Some(file))
     }
 
-    fn retire(self) -> Result<(), String> {
+    pub(super) fn retire(self) -> Result<(), String> {
         self.recheck()?;
         let path = self.path;
         #[cfg(windows)]
@@ -684,27 +729,89 @@ fn validate_private_journal_directory(path: &Path, opened: &fs::File) -> Result<
 }
 
 #[cfg(unix)]
-fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
+pub(super) enum AncestryError {
+    Writable(String),
+    Other(String),
+}
+
+#[cfg(unix)]
+impl AncestryError {
+    pub(super) fn into_message(self) -> String {
+        match self {
+            Self::Writable(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn validate_journal_ancestry(parent: &Path) -> Result<(), String> {
+    check_journal_ancestry(parent).map_err(AncestryError::into_message)
+}
+
+#[cfg(unix)]
+pub(super) fn check_journal_ancestry(parent: &Path) -> Result<(), AncestryError> {
     use std::os::unix::fs::MetadataExt;
     let user = unsafe { libc::geteuid() };
     // An untrusted parent must not be able to replace the checked journal entry.
     for ancestor in parent.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
-        if !metadata.is_dir()
-            || (metadata.uid() != user && metadata.uid() != 0)
-            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
-        {
-            return Err("strip journal ancestry permits replacement by another principal".into());
+        let metadata = fs::symlink_metadata(ancestor).map_err(|e| {
+            AncestryError::Other(format!(
+                "Cannot inspect ancestor {} ({e})",
+                ancestor.display()
+            ))
+        })?;
+        if !metadata.is_dir() || (metadata.uid() != user && metadata.uid() != 0) {
+            return Err(AncestryError::Other(format!(
+                "Ancestor {} must be a directory owned by this user or root",
+                ancestor.display()
+            )));
+        }
+        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+            return Err(AncestryError::Writable(writable_ancestor(
+                ancestor,
+                metadata.mode(),
+            )));
         }
         #[cfg(target_os = "macos")]
-        if super::unix_security::capture(ancestor)?
+        if super::unix_security::capture(ancestor)
+            .map_err(AncestryError::Other)?
             .split(|&b| b == b'\n')
             .any(mac_acl_may_mutate)
         {
-            return Err("strip journal ancestry grants additional access through an ACL".into());
+            return Err(AncestryError::Other(format!(
+                "Ancestor {} grants additional write access through an ACL",
+                ancestor.display()
+            )));
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn writable_ancestor(path: &Path, mode: u32) -> String {
+    let who = match mode & 0o022 {
+        0o020 => "g",
+        0o002 => "o",
+        _ => "go",
+    };
+    let quoted = path.display().to_string().replace('\'', "'\\''");
+    format!(
+        "Ancestor {} permits other users to write. Run chmod {who}-w '{quoted}'",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn validate_publication_parent(source: &Path) -> Result<PathBuf, String> {
+    let directory = output_parent_dir(source);
+    let parent = fs::canonicalize(directory).map_err(|e| {
+        format!(
+            "Vault directory {} cannot be resolved ({e})",
+            directory.display()
+        )
+    })?;
+    validate_journal_ancestry(&parent).map_err(|e| format!("Vault directory rejected. {e}"))?;
+    Ok(parent)
 }
 
 #[cfg(target_os = "macos")]
@@ -1066,7 +1173,28 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
     };
     let path = journal_path(&source);
     match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(target_os = "linux")]
+            if !matches!(
+                super::pending_pair::state::pending_location(&source),
+                Ok(None)
+            ) {
+                // A held lock means a live writer: either the publisher of
+                // this journal, or a writer that ran recovery when it took
+                // the lock. The draft is not abandoned, and every step of a
+                // publication replaces the vault by an atomic rename, so the
+                // reader opens the visible vault, old or new, without
+                // recovery and without waiting. An abandoned draft is
+                // recovered by the next open that finds the lock free.
+                let lock = match crate::lock::try_acquire_without_recovery(&source) {
+                    Ok(lock) => lock,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(e) => return Err(e.to_string()),
+                };
+                return recover_under_guard(&lock);
+            }
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
         Ok(_) => {}
     }
@@ -1097,10 +1225,24 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
 pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
     let source = lock.source_path();
     let path = journal_path(source);
+    #[cfg(target_os = "linux")]
+    let private = super::pending_pair::state::pending_location(source)?;
     match fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(target_os = "linux")]
+            if let Some(private) = private {
+                return super::pending_pair::recover_private(lock, &private);
+            }
+            return Ok(());
+        }
         Err(e) => return Err(e.to_string()),
         Ok(_) => {}
+    }
+    #[cfg(target_os = "linux")]
+    if private.is_some() {
+        return Err(
+            "Both an adjacent and a private pair journal exist; preserve both for recovery".into(),
+        );
     }
     if !lock.covers_namespace(source) {
         return Err("pending strip recovery requires a real source lock".to_string());
@@ -1110,14 +1252,53 @@ pub(crate) fn recover_under_guard(lock: &WriteLock) -> Result<(), String> {
     recover_locked(source, &path, lock).map(|_| ())
 }
 
+pub(super) enum PreparedUpdate {
+    Adjacent(PrivateDir),
+    #[cfg(target_os = "linux")]
+    Private(super::pending_pair::update::Preparation),
+}
+
+impl PreparedUpdate {
+    pub(super) fn path(&self) -> &Path {
+        match self {
+            Self::Adjacent(dir) => dir.path(),
+            #[cfg(target_os = "linux")]
+            Self::Private(dir) => dir.path(),
+        }
+    }
+}
+
+pub(super) fn prepare_update(source: &Path, prefix: &str) -> Result<PreparedUpdate, String> {
+    #[cfg(target_os = "linux")]
+    if validate_publication_parent(source).is_err() {
+        return super::pending_pair::update::prepare(source, prefix).map(PreparedUpdate::Private);
+    }
+    private_dir(output_parent_dir(source), prefix).map(PreparedUpdate::Adjacent)
+}
+
+pub(super) fn publish_update(
+    source: &Path,
+    prepared: PreparedUpdate,
+    lock: &WriteLock,
+    _sidecar_lock: Option<&WriteLock>,
+) -> Result<(), String> {
+    match prepared {
+        PreparedUpdate::Adjacent(dir) => publish(source, dir, lock),
+        #[cfg(target_os = "linux")]
+        PreparedUpdate::Private(dir) => super::pending_pair::update::publish(
+            source,
+            dir,
+            lock,
+            _sidecar_lock.ok_or("Private pair needs a sidecar lock")?,
+        ),
+    }
+}
+
 /// The caller has prepared old/new vault and sidecar files in a private temp
 /// directory under the source parent, while holding both namespace guards.
 pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> Result<(), String> {
     #[cfg(unix)]
-    let trusted_parent = fs::canonicalize(output_parent_dir(source)).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    validate_journal_ancestry(&trusted_parent)
-        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
+    let trusted_parent = validate_publication_parent(source)?;
     let sidecar = super::ec::default_sidecar_path(source);
     let journal = Journal {
         version: 4,
@@ -1176,7 +1357,7 @@ pub(super) fn publish(source: &Path, prepared: PrivateDir, lock: &WriteLock) -> 
     }
     #[cfg(unix)]
     validate_journal_ancestry(&trusted_parent)
-        .map_err(|e| format!("Cannot publish a recoverable vault/sidecar pair: {e}"))?;
+        .map_err(|e| format!("Vault directory rejected. {e}"))?;
     fs::rename(prepared.path(), &path).map_err(|e| format!("publish strip journal: {e}"))?;
     sync_dir(output_parent_dir(source))?;
     #[cfg(test)]
@@ -1263,6 +1444,19 @@ thread_local! {
     pub(super) static AFTER_STRIP_SIDECAR: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+// These fixtures exercise the adjacent journal and its specific fault hooks,
+// even when the test runner has a group-writable default umask.
+#[cfg(test)]
+pub(super) fn adjacent_test_dir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder.prefix("aerovault-adjacent-").tempdir().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1341,7 +1535,7 @@ mod tests {
         for (edit_before_vault, matches_stage) in
             [(true, false), (false, false), (true, true), (false, true)]
         {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = adjacent_test_dir();
             let source = dir.path().join("source.aerozip");
             let sidecar = super::super::ec::default_sidecar_path(&source);
             fs::write(&source, b"vault old").unwrap();
@@ -1399,16 +1593,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn group_writable_ancestry_refuses_pair_before_publication_and_reopens_original() {
+    fn other_writable_ancestry_refuses_pair_before_publication_and_reopens_original() {
         use super::super::{
             ec::RecoveryPlacement,
             vault::{CreateOptionsV3, VaultV3},
         };
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = adjacent_test_dir();
         let shared = dir.path().join("shared");
         fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
         let source = shared.join("source.aerovault");
         let sidecar = super::super::ec::default_sidecar_path(&source);
         let password = "existing-password-123";
@@ -1420,20 +1615,81 @@ mod tests {
         .unwrap();
         let old_vault = fs::read(&source).unwrap();
         let old_sidecar = fs::read(&sidecar).unwrap();
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
 
         let mut opened = VaultV3::open(&source, password).unwrap();
         let error = VaultV3::change_password(&mut opened, "different-password-123").unwrap_err();
-        assert!(
-            error.contains("Cannot publish a recoverable vault/sidecar pair"),
-            "{error}"
-        );
+        assert!(error.contains("Vault directory rejected"), "{error}");
         drop(opened);
         assert!(!journal_path(&source).exists());
         assert_eq!(fs::read(&source).unwrap(), old_vault);
         assert_eq!(fs::read(&sidecar).unwrap(), old_sidecar);
         assert!(VaultV3::open(&source, password).is_ok());
         assert!(VaultV3::open(&source, "different-password-123").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_creation_makes_missing_parents_private() {
+        use super::super::{
+            ec::RecoveryPlacement,
+            vault::{CreateOptionsV3, VaultV3},
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let parent = dir.path().join("new");
+        let nested = parent.join("nested");
+        let source = nested.join("source.aerovault");
+        let password = "new-directories-test-password";
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new(&source, password),
+            RecoveryPlacement::Detached,
+            20,
+        )
+        .unwrap();
+        for created in [parent, nested] {
+            assert_eq!(created.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        assert!(super::super::ec::default_sidecar_path(&source).is_file());
+        assert!(VaultV3::open(&source, password).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_pair_creation_leaves_no_locks_or_recovery_files() {
+        use super::super::{
+            ec::RecoveryPlacement,
+            vault::{CreateOptionsV3, VaultV3},
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        #[cfg(target_os = "linux")]
+        let modes = [0o777];
+        #[cfg(not(target_os = "linux"))]
+        let modes = [0o775, 0o777];
+        for mode in modes {
+            let dir = tempfile::tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+            let source = dir.path().join("shared.aerovault");
+            let error = VaultV3::create_with_error_correction(
+                &CreateOptionsV3::new(&source, "shared-group-test-password"),
+                RecoveryPlacement::Detached,
+                20,
+            )
+            .unwrap_err();
+            assert!(error.contains("Vault directory rejected"), "{error}");
+            let rejected = dir.path().canonicalize().unwrap();
+            assert!(
+                error.contains(&format!("Ancestor {}", rejected.display())),
+                "{error}"
+            );
+            assert!(error.contains("Run chmod "), "{error}");
+            assert!(dir.path().read_dir().unwrap().next().is_none());
+        }
     }
 
     #[cfg(unix)]

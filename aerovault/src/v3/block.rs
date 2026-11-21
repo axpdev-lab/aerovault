@@ -41,7 +41,11 @@ pub fn read_section<R: Read + Seek>(
     reader
         .seek(SeekFrom::Start(offset))
         .map_err(|e| format!("Seek {label}: {e}"))?;
-    let mut buf = vec![0u8; len as usize];
+    let len = usize::try_from(len).map_err(|_| format!("{label} exceeds address space"))?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|error| format!("Cannot allocate {label}: {error}"))?;
+    buf.resize(len, 0);
     reader
         .read_exact(&mut buf)
         .map_err(|e| format!("Read {label}: {e}"))?;
@@ -94,13 +98,42 @@ pub fn build_file_bytes(
 #[allow(clippy::too_many_arguments)]
 pub fn write_container<W: Write>(
     writer: &mut W,
-    mut header: VaultHeaderV3,
+    header: VaultHeaderV3,
     mac_key: &[u8; KEY_SIZE],
     master_key: &[u8; KEY_SIZE],
     manifest: &VaultManifestV3,
     extensions: &[ExtensionEntryV3],
     extension_payloads: &[u8],
     data: &[u8],
+) -> Result<(), String> {
+    write_container_with_data(
+        writer,
+        header,
+        mac_key,
+        master_key,
+        manifest,
+        extensions,
+        extension_payloads,
+        data.len() as u64,
+        |writer| {
+            writer
+                .write_all(data)
+                .map_err(|error| format!("Write vault data: {error}"))
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_container_with_data<W: Write>(
+    writer: &mut W,
+    mut header: VaultHeaderV3,
+    mac_key: &[u8; KEY_SIZE],
+    master_key: &[u8; KEY_SIZE],
+    manifest: &VaultManifestV3,
+    extensions: &[ExtensionEntryV3],
+    extension_payloads: &[u8],
+    data_len: u64,
+    write_data: impl FnOnce(&mut W) -> Result<(), String>,
 ) -> Result<(), String> {
     // The manifest blob is encrypted on the standard lane and stored as plaintext
     // JSON on the `.aerovz` lane (#7). Either way it is the blob the header
@@ -128,14 +161,13 @@ pub fn write_container<W: Write>(
         .filter(|e| e.extension_id != ERROR_CORRECTION_META_EXTENSION_ID)
         .cloned()
         .collect();
-    let mut extension_payloads = extension_payloads.to_vec();
-    if extensions
+    let meta_payload = if extensions
         .iter()
         .any(|e| e.extension_id == ERROR_CORRECTION_EXTENSION_ID)
     {
         let (k, p) = manifest_error_correction_grid(manifest.error_correction_pct);
         let (meta_payload, _shards, _prot, _ov) =
-            compute_error_correction_shards_grid(&[&encrypted_manifest], k, p);
+            compute_error_correction_shards_grid(&[&encrypted_manifest], k, p)?;
         extensions.push(ExtensionEntryV3 {
             extension_id: ERROR_CORRECTION_META_EXTENSION_ID.to_string(),
             algorithm_id: ERROR_CORRECTION_ALGORITHM_ID.to_string(),
@@ -144,20 +176,27 @@ pub fn write_container<W: Write>(
             offset: extension_payloads.len() as u64,
             length: meta_payload.len() as u64,
         });
-        extension_payloads.extend_from_slice(&meta_payload);
-    }
+        meta_payload
+    } else {
+        Vec::new()
+    };
 
     let extension_dir =
         serde_json::to_vec(&extensions).map_err(|e| format!("Extension serialize: {e}"))?;
 
     header.data_offset = DATA_OFFSET;
-    header.data_len = data.len() as u64;
-    header.manifest_offset = DATA_OFFSET + header.data_len;
+    header.data_len = data_len;
+    let add = |offset: u64, len| {
+        offset
+            .checked_add(len)
+            .ok_or("Vault section offset overflows")
+    };
+    header.manifest_offset = add(DATA_OFFSET, header.data_len)?;
     header.manifest_len = encrypted_manifest.len() as u64;
-    header.extension_dir_offset = header.manifest_offset + header.manifest_len;
+    header.extension_dir_offset = add(header.manifest_offset, header.manifest_len)?;
     header.extension_dir_len = extension_dir.len() as u64;
-    header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
-    header.extension_payload_len = extension_payloads.len() as u64;
+    header.extension_payload_offset = add(header.extension_dir_offset, header.extension_dir_len)?;
+    header.extension_payload_len = add(extension_payloads.len() as u64, meta_payload.len() as u64)?;
     header.header_mac = [0u8; MAC_SIZE];
     header.header_mac = header.compute_mac(mac_key)?;
 
@@ -166,10 +205,11 @@ pub fn write_container<W: Write>(
             .map_err(|e| format!("Write vault container: {e}"))
     };
     write(writer, &header.to_bytes())?;
-    write(writer, data)?;
+    write_data(writer)?;
     write(writer, &encrypted_manifest)?;
     write(writer, &extension_dir)?;
-    write(writer, &extension_payloads)?;
+    write(writer, extension_payloads)?;
+    write(writer, &meta_payload)?;
     Ok(())
 }
 

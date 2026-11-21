@@ -350,6 +350,11 @@ pub(crate) fn acquire_without_recovery(vault: &Path) -> io::Result<WriteLock> {
     acquire_with_policy(vault, false, false, wait())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn try_acquire_without_recovery(vault: &Path) -> io::Result<WriteLock> {
+    acquire_with_policy(vault, false, false, Duration::ZERO)
+}
+
 /// Refuse a contended namespace without retrying after the holder exits.
 pub(crate) fn try_acquire(vault: &Path) -> io::Result<WriteLock> {
     recover_acquired(acquire_with_policy(vault, false, false, Duration::ZERO)?)

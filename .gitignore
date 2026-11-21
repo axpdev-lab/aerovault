@@ -1,4 +1,5 @@
 /target
+/tests/large-vault-compat/target
 Cargo.lock
 *.aerovault
 /CLAUDE.md

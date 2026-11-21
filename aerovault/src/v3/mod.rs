@@ -26,6 +26,8 @@ mod extraction_stage;
 pub mod format;
 pub mod manifest;
 pub mod packing;
+mod pending_pair;
+mod sparse;
 pub(crate) mod strip_transaction;
 pub mod telemetry;
 #[cfg(unix)]
@@ -46,4 +48,5 @@ pub use manifest::{
 pub use telemetry::VaultTelemetrySink;
 pub use vault::{
     CreateOptionsV3, EntryInfo, OpenVaultV3, PeekInfo, VaultLane, VaultSummaryV3, VaultV3,
+    VaultV3Limits,
 };

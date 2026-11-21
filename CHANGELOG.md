@@ -2,6 +2,38 @@
 
 All notable changes to the `aerovault` crate are documented here.
 
+## [0.7.0] - Unreleased
+
+### Fixed
+
+- Restored open, extraction and writes for large v3 vaults and plaintext archives created by 0.6.8. Version 0.6.9 imposed a default 1 GiB data-section ceiling and a separate 4 GiB generation ceiling. Normal v3 operations now stream the generation hash over the actual file extent and retain the locked generation check before publication. Opening checks the file generation before loading vault data into memory. On Linux and macOS filesystems that report sparse extents, generation checks cover allocated ranges and their positions without reading the holes. Plaintext archives validate and load the stored frames in order, leaving unclaimed gaps and trailing padding out of memory. The on-disk format is unchanged.
+
+- When the destination ancestry cannot support a recoverable vault and detached parity pair, creation reports the refusal before acquiring either persistent lock. On Unix, creation that writes a detached sidecar makes missing destination directories private.
+
+- On Linux, new vaults with detached parity can be created in group-writable directories when both destination names are free and the filesystem supports unnamed temporary files. A journal in the user's private state allows a restarted process to finish an interrupted creation. Existing files are preserved if either name is already occupied.
+
+- On Linux, stripping embedded recovery or changing the password with a detached sidecar can also use private recovery state in group-writable directories. On supported filesystems, atomic exchanges retain the displaced files while the vault and sidecar are published. An interrupted update temporarily blocks normal reads until recovery can verify both generations. Existing adjacent recovery journals remain supported.
+
+- On Linux, recovery cleans up interrupted pair preparation before a retry. If a different XDG state directory was used before a later save, AeroVault can continue to normal vault authentication once the earlier journal proves its exchange or rollback finished. In that case it retains the earlier journal and recovery copies in private state, with one retained slot per vault and state directory.
+
+- Plaintext archives load and repair frames without allocating intervening gaps. The default limit uses logical data ranges, including on compressed filesystems. Filesystems without extent queries use the file's logical length. Sparse saves preserve frame offsets and Error Correction order, including after a delete. Rollback copies preserve holes on supported filesystems.
+
+- On Linux, a reader can open the visible vault during a private publication while the file is in ordinary vault format. A file marked as pending requires pair recovery. An abandoned journal still recovers when the reader can acquire the lock.
+
+- Default opens check reported memory headroom before allocation. On Linux this includes reclaimable file cache and swap permitted by the cgroup hierarchy. Error Correction uses the same default memory policy and reports an error when its reconstruction buffers cannot fit.
+
+- Saving a vault with embedded Error Correction can now report insufficient memory before regenerating parity. An explicit data budget bypasses the headroom estimate, and allocation failures still return errors.
+
+- When sparse extent information is unavailable, a vault with more than 4 GiB of unused trailing bytes can still open for extraction. Writes and parity exports require a complete generation check.
+
+- If a stale detached sidecar leaves damaged blocks unrepaired, `vault repair` now exits with an explicit error. Version 0.6.8 could exit successfully with the damaged blocks still present.
+
+- On Linux, paired publication can use `~/.aerovault-state/journals` when a writable ancestor rules out the normal XDG state directory. AeroVault creates `~/.aerovault-state` with mode 0700 only when that fallback is needed. Opening checks the current XDG directory, the default state directory, and the fallback. If an interrupted update used a different custom XDG directory, restore the prior `XDG_STATE_HOME` before reopening. Recovery reports a conflict when more than one journal is found for the same vault.
+
+### Added
+
+- Embedders can set a stored-data budget with `VaultV3Limits` and the `*_with_limits` APIs. An open handle keeps its budget for later writes. The original entry points honor `AEROVAULT_V3_DATA_BUDGET_BYTES` and report an error when a configured value falls outside the supported range.
+
 ## [0.6.9] - 2026-11-19
 
 ### Security
