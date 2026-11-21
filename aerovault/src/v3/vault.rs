@@ -49,6 +49,7 @@ use crate::aerocrypt::{
 
 const DATA_BUDGET_ENV: &str = "AEROVAULT_V3_DATA_BUDGET_BYTES";
 const MIN_ENV_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
+const MAX_RAW_OPEN_TAIL: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Optional resource policy for opening and editing a v3 container.
 ///
@@ -200,7 +201,7 @@ pub struct OpenVaultV3 {
     /// End of the dense prefix. A sparse fingerprint also covers the
     /// positions and contents of every extent beyond this point.
     hashed_file_len: u64,
-    opened_hash: [u8; 32],
+    opened_hash: Option<[u8; 32]>,
     limits: VaultV3Limits,
     pub(super) master_key: [u8; KEY_SIZE],
     pub(super) mac_key: [u8; KEY_SIZE],
@@ -253,6 +254,12 @@ impl OpenVaultV3 {
     /// The container's filesystem path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(super) fn complete_generation(&self) -> Result<[u8; 32], String> {
+        self.opened_hash.ok_or_else(|| {
+            "Vault opened without a complete generation baseline. Use a filesystem with sparse extent support or remove the unused tail from a verified copy before writing".into()
+        })
     }
 
     pub(super) fn file_data_offset(&self, record: &ChunkRecordV3) -> u64 {
@@ -724,6 +731,7 @@ impl VaultV3 {
         if new_password.len() < MIN_PASSWORD_LEN {
             return Err("Password must be at least 8 characters".to_string());
         }
+        vault.complete_generation()?;
         let lock = write_lock(&vault.path)?;
         vault.path = lock.source_path().to_path_buf();
         let sidecar = super::ec::default_sidecar_path(lock.source_path());
@@ -1396,6 +1404,7 @@ fn write_op<T>(
     vault: &mut OpenVaultV3,
     op: impl FnOnce(&mut OpenVaultV3, &WriteLock, Option<&WriteLock>) -> Result<T, String>,
 ) -> Result<T, String> {
+    vault.complete_generation()?;
     let lock = write_lock(&vault.path)?;
     #[cfg(test)]
     if let Some(hook) = BEFORE_MUTATION_SIDECAR_LOCK.with(|h| h.borrow_mut().take()) {
@@ -2756,7 +2765,7 @@ fn open_vault_with_guard(
     };
 
     // Reject impossible ranges before reading any payload for the baseline.
-    validate_ranges(&header, file_len)?;
+    let extent = validate_ranges(&header, file_len)?;
     limits.check_data_len(header.data_len)?;
 
     // The generation is taken once the header is checked, so a wrong password
@@ -2771,8 +2780,12 @@ fn open_vault_with_guard(
     if let Some(hook) = BEFORE_OPEN_GENERATION.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let (opened_hash, scanned_bytes, hashed_file_len) =
-        vault_generation_baseline(&mut file, &header_bytes, file_len)?;
+    let (opened_hash, scanned_bytes, hashed_file_len) = vault_generation_baseline(
+        &mut file,
+        &header_bytes,
+        file_len,
+        extent.saturating_add(MAX_RAW_OPEN_TAIL),
+    )?;
     let encrypted_manifest = read_capped(
         &mut file,
         header.manifest_offset,
@@ -2952,7 +2965,7 @@ fn check_available_memory(
 
 /// Memory this process can still obtain, as reported by the operating
 /// system, or `None` where it is not reported.
-fn available_memory_bytes() -> Option<u64> {
+pub(super) fn available_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     return linux_available_memory();
     #[cfg(target_os = "macos")]
@@ -2963,11 +2976,13 @@ fn available_memory_bytes() -> Option<u64> {
     None
 }
 
-/// `MemAvailable` plus free swap, capped by the address-space limit and by
-/// the memory limit of the process's own cgroup v2.
+/// Host memory and swap headroom, capped by the process's address-space
+/// limit and by the applicable cgroup v2 limits.
 #[cfg(target_os = "linux")]
 fn linux_available_memory() -> Option<u64> {
-    let mut available = parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+    let (memory, swap) = parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+    let mut available =
+        cgroup_v2_available_memory(memory, swap).unwrap_or_else(|| memory.saturating_add(swap));
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -2976,83 +2991,189 @@ fn linux_available_memory() -> Option<u64> {
     if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } == 0
         && limit.rlim_cur != libc::RLIM_INFINITY
     {
-        available = available.min(limit.rlim_cur);
-    }
-    if let Some(cgroup) = cgroup_v2_available_memory() {
-        available = available.min(cgroup);
+        #[allow(clippy::useless_conversion, reason = "rlim_t can be 32-bit on Linux")]
+        let address_limit = u64::from(limit.rlim_cur);
+        let mapped = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| parse_linux_kib(&status, "VmSize"))
+            .unwrap_or(0);
+        available = available.min(address_limit.saturating_sub(mapped));
     }
     Some(available)
 }
 
 #[cfg(target_os = "linux")]
-fn parse_meminfo_available(meminfo: &str) -> Option<u64> {
-    let kib = |name: &str| {
-        meminfo.lines().find_map(|line| {
-            line.strip_prefix(name)?
-                .strip_prefix(':')?
-                .trim()
-                .strip_suffix("kB")?
-                .trim()
-                .parse::<u64>()
-                .ok()
-        })
-    };
-    Some(
-        kib("MemAvailable")?
-            .saturating_add(kib("SwapFree").unwrap_or(0))
-            .saturating_mul(1024),
-    )
+fn parse_meminfo_available(meminfo: &str) -> Option<(u64, u64)> {
+    Some((
+        parse_linux_kib(meminfo, "MemAvailable")?,
+        parse_linux_kib(meminfo, "SwapFree").unwrap_or(0),
+    ))
 }
 
 #[cfg(target_os = "linux")]
-fn cgroup_v2_available_memory() -> Option<u64> {
-    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = membership
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))?;
-    let dir = Path::new("/sys/fs/cgroup").join(relative.trim().trim_start_matches('/'));
-    let read = |name: &str| {
-        std::fs::read_to_string(dir.join(name))
-            .ok()?
+pub(super) fn parse_linux_kib(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let kib = line
+            .strip_prefix(name)?
+            .strip_prefix(':')?
+            .trim()
+            .strip_suffix("kB")?
             .trim()
             .parse::<u64>()
-            .ok()
-    };
-    // `memory.max` reads "max" when the group has no limit.
-    let max = read("memory.max")?;
-    Some(max.saturating_sub(read("memory.current").unwrap_or(0)))
+            .ok()?;
+        Some(kib.saturating_mul(1024))
+    })
 }
 
-/// Physical memory plus the free space of the current swap files.
+#[cfg(target_os = "linux")]
+fn cgroup_v2_available_memory(memory: u64, swap: u64) -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let group = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let group = Path::new(group.strip_prefix('/')?);
+    if group
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(cgroup_v2_headroom(
+        Path::new("/sys/fs/cgroup"),
+        group,
+        memory,
+        swap,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_headroom(root: &Path, group: &Path, mut memory: u64, mut swap: u64) -> u64 {
+    for relative in group.ancestors() {
+        let dir = root.join(relative);
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        };
+        // A value of "max" leaves this level unrestricted. Limits still
+        // apply at ancestors when the process's own group is unrestricted.
+        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current")) {
+            let stats = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
+            let bytes = |key: &str| {
+                stats
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(' ')?;
+                        (name == key).then_some(value)?.trim().parse::<u64>().ok()
+                    })
+                    .unwrap_or(0)
+            };
+            // Treat only inactive file pages as candidates for reclaim.
+            // Dirty or writeback pages can require I/O before they are free.
+            let clean_cache = bytes("inactive_file")
+                .saturating_sub(bytes("file_dirty"))
+                .saturating_sub(bytes("file_writeback"));
+            let working_set = current.saturating_sub(clean_cache);
+            memory = memory.min(max.saturating_sub(working_set));
+        }
+        if swap > 0 {
+            if let Some(max) = read("memory.swap.max") {
+                let remaining =
+                    read("memory.swap.current").map_or(0, |used| max.saturating_sub(used));
+                swap = swap.min(remaining);
+            }
+        }
+    }
+    memory.saturating_add(swap)
+}
+
+/// Estimate headroom from live VM counters and current swap space.
 #[cfg(target_os = "macos")]
 fn macos_available_memory() -> Option<u64> {
-    fn sysctl<T>(name: &std::ffi::CStr, value: &mut T) -> bool {
-        let mut len = std::mem::size_of::<T>();
-        // SAFETY: `value` is writable for `len` bytes, and the kernel writes
-        // at most `len` bytes for a fixed-size value.
-        let status = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (value as *mut T).cast(),
-                &mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        status == 0 && len == std::mem::size_of::<T>()
+    unsafe extern "C" {
+        fn host_page_size(
+            host: libc::mach_port_t,
+            size: *mut libc::vm_size_t,
+        ) -> libc::kern_return_t;
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
     }
-    let mut memsize = 0u64;
-    if !sysctl(c"hw.memsize", &mut memsize) {
+
+    let mut page_size = 0;
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: VM statistics consists of integer counters, valid when zeroed.
+    let mut stat: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    // SAFETY: each output lives for its call, and the count is the buffer
+    // size in Mach integer units. Release the acquired host send right.
+    #[allow(
+        deprecated,
+        reason = "These libc bindings still expose the Darwin Mach ABI"
+    )]
+    let (size_status, vm_status) = unsafe {
+        let host = libc::mach_host_self();
+        let size_status = host_page_size(host, &mut page_size);
+        let vm_status = libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            (&mut stat as *mut libc::vm_statistics64).cast(),
+            &mut count,
+        );
+        mach_port_deallocate(libc::mach_task_self(), host);
+        (size_status, vm_status)
+    };
+    if size_status != libc::KERN_SUCCESS
+        || vm_status != libc::KERN_SUCCESS
+        || count != libc::HOST_VM_INFO64_COUNT
+    {
         return None;
     }
     // SAFETY: xsw_usage is plain integers, valid when zeroed.
     let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
-    let swap_free = if sysctl(c"vm.swapusage", &mut swap) {
+    let mut len = std::mem::size_of_val(&swap);
+    // SAFETY: the buffer and its byte size are valid for this fixed-size sysctl.
+    let swap_status = unsafe {
+        libc::sysctlbyname(
+            c"vm.swapusage".as_ptr(),
+            (&mut swap as *mut libc::xsw_usage).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let free_swap = if swap_status == 0 && len == std::mem::size_of_val(&swap) {
         swap.xsu_avail
     } else {
         0
     };
-    Some(memsize.saturating_add(swap_free))
+    Some(macos_vm_headroom(
+        stat.free_count,
+        stat.inactive_count,
+        stat.external_page_count,
+        stat.speculative_count,
+        page_size as u64,
+        free_swap,
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_vm_headroom(
+    free: u32,
+    inactive: u32,
+    file_backed: u32,
+    speculative: u32,
+    page_size: u64,
+    swap_free: u64,
+) -> u64 {
+    // Darwin already includes speculative pages in free_count. Limit the
+    // estimate of additional reclaimable pages to inactive capacity.
+    let additional = inactive.min(file_backed.saturating_sub(speculative));
+    (u64::from(free) + u64::from(additional))
+        .saturating_mul(page_size)
+        .saturating_add(swap_free)
 }
 
 /// The commit charge still available, capped by the free address space.
@@ -3224,10 +3345,9 @@ pub(super) fn assert_vault_generation_current(vault: &OpenVaultV3) -> Result<(),
 }
 
 pub(super) fn assert_vault_generation_at(vault: &OpenVaultV3, path: &Path) -> Result<(), String> {
+    let expected = vault.complete_generation()?;
     let mut file = crate::source::open_regular(path).map_err(|e| format!("Open vault: {e}"))?;
-    if file_generation(&mut file, vault.hashed_file_len, vault.opened_file_len)?
-        != vault.opened_hash
-    {
+    if file_generation(&mut file, vault.hashed_file_len, vault.opened_file_len)? != expected {
         return Err("Vault changed while this write was in progress; retry operation".to_string());
     }
     Ok(())
@@ -3365,24 +3485,44 @@ fn file_generation(
         .ok_or_else(|| "Cannot recheck sparse vault generation; open it again".into())
 }
 
-/// Start a generation using logical extent lengths when available. If a
-/// query fails, retry with a raw hash and use the full logical length.
+/// Start a generation using logical extent lengths when available. On a
+/// raw fallback, keep a complete baseline only within the caller's scan limit.
 fn vault_generation_baseline(
     file: &mut std::fs::File,
     header: &[u8],
     file_len: u64,
-) -> Result<([u8; 32], u64, u64), String> {
+    max_raw_len: u64,
+) -> Result<(Option<[u8; 32]>, u64, u64), String> {
     let prefix = sparse_hash_extent(file, file_len);
     if prefix < file_len {
         if let Some((hash, covered)) =
             file_generation_starting_with(file, header, prefix, file_len)?
         {
-            return Ok((hash, covered, prefix));
+            return Ok((Some(hash), covered, prefix));
         }
+    }
+    if file_len > max_raw_len {
+        verify_generation_prefix(file, header)?;
+        return Ok((None, file_len, 0));
     }
     let (hash, logical_len) = file_generation_starting_with(file, header, file_len, file_len)?
         .expect("raw generation does not query extents");
-    Ok((hash, logical_len, file_len))
+    Ok((Some(hash), logical_len, file_len))
+}
+
+fn verify_generation_prefix(file: &mut std::fs::File, prefix: &[u8]) -> Result<(), String> {
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("Read vault: {e}"))?;
+    let mut head = [0; HEADER_SIZE];
+    let bytes = &mut head[..prefix.len()];
+    file.read_exact(bytes)
+        .map_err(|e| format!("Read vault: {e}"))?;
+    if bytes != prefix {
+        return Err("vault changed while it was being read; open it again".into());
+    }
+    #[cfg(test)]
+    GENERATION_BYTES_READ.with(|n| n.set(n.get() + bytes.len() as u64));
+    Ok(())
 }
 
 /// Hash the file bytes, including a sparse description of the tail if the
@@ -3401,18 +3541,9 @@ fn file_generation_starting_with(
     let expected = hashed_len
         .checked_sub(prefix.len() as u64)
         .ok_or_else(changed)?;
-    file.seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| format!("Read vault: {e}"))?;
-    let mut head = vec![0u8; prefix.len()];
-    file.read_exact(&mut head)
-        .map_err(|e| format!("Read vault: {e}"))?;
-    if head != prefix {
-        return Err(changed());
-    }
+    verify_generation_prefix(file, prefix)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&head);
-    #[cfg(test)]
-    GENERATION_BYTES_READ.with(|n| n.set(n.get() + head.len() as u64));
+    hasher.update(prefix);
     hash_generation_bytes(file, &mut hasher, expected)?;
     let scanned_bytes = if hashed_len < len {
         let Some(tail) = hash_sparse_tail(file, &mut hasher, hashed_len, len)? else {
@@ -3586,8 +3717,13 @@ pub(super) fn save_locked_to(
             Some((length, hash)) => (length, length, hash),
             None => {
                 let length = file.metadata().map_err(|error| error.to_string())?.len();
-                let (hash, _, prefix) = vault_generation_baseline(file, &header_bytes, length)?;
-                (length, prefix, hash)
+                let (hash, _, prefix) =
+                    vault_generation_baseline(file, &header_bytes, length, u64::MAX)?;
+                (
+                    length,
+                    prefix,
+                    hash.expect("sealing requires a complete generation"),
+                )
             }
         };
         #[cfg(test)]
@@ -3608,7 +3744,7 @@ pub(super) fn save_locked_to(
     // not trip the generation guard against the bytes we just wrote.
     vault.opened_file_len = file_len;
     vault.hashed_file_len = hashed_file_len;
-    vault.opened_hash = file_hash;
+    vault.opened_hash = Some(file_hash);
     vault.header = header;
     if let Some(layout) = disk_layout {
         vault.plaintext_file_offsets = layout
@@ -4695,7 +4831,7 @@ mod tests {
         // The baseline the save kept is the file now on disk.
         let mut file = std::fs::File::open(&vp).unwrap();
         assert_eq!(
-            file_generation(&mut file, v.hashed_file_len, v.opened_file_len).unwrap(),
+            Some(file_generation(&mut file, v.hashed_file_len, v.opened_file_len).unwrap()),
             v.opened_hash
         );
         drop(file);
@@ -6046,7 +6182,7 @@ mod tests {
             },
             opened_file_len: 0,
             hashed_file_len: 0,
-            opened_hash: [0u8; 32],
+            opened_hash: Some([0u8; 32]),
             plaintext_file_offsets: BTreeMap::new(),
             limits: VaultV3Limits::default(),
             master_key: [0u8; KEY_SIZE],
@@ -7428,7 +7564,8 @@ mod tests {
         let mut file = std::fs::File::open(&path).unwrap();
         let meta = file.metadata().unwrap();
         assert_ne!(meta.file_attributes() & 0x200, 0);
-        let (_, covered, _) = vault_generation_baseline(&mut file, &[], meta.len()).unwrap();
+        let (_, covered, _) =
+            vault_generation_baseline(&mut file, &[], meta.len(), u64::MAX).unwrap();
         assert!(covered < 1024 * 1024, "{covered} logical data bytes");
     }
 
@@ -7915,9 +8052,11 @@ mod tests {
         assert_eq!(raw.hashed_file_len, file_len);
         assert_eq!(
             raw.opened_hash,
-            super::super::strip_transaction::generation(&path)
-                .unwrap()
-                .hash
+            Some(
+                super::super::strip_transaction::generation(&path)
+                    .unwrap()
+                    .hash
+            )
         );
         assert_vault_generation_current(&raw).unwrap();
 
@@ -7939,6 +8078,51 @@ mod tests {
             .unwrap_err()
             .contains("changed"));
         assert_eq!(file.metadata().unwrap().len(), file_len);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_fallback_can_extract_without_authorizing_writes_or_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.aerozip");
+        let input = dir.path().join("input");
+        let contents = b"stored data before a large unused tail";
+        std::fs::write(&input, contents).unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        drop(vault);
+
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let logical_len = file.metadata().unwrap().len() + MAX_RAW_OPEN_TAIL + 8192;
+        file.set_len(logical_len).unwrap();
+        let open = || {
+            FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
+            GENERATION_BYTES_READ.with(|read| read.set(0));
+        };
+        open();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        assert!(vault.opened_hash.is_none());
+        assert!(GENERATION_BYTES_READ.with(std::cell::Cell::get) < 1024 * 1024);
+        let output = dir.path().join("extracted");
+        VaultV3::extract_entry(&vault, "input", &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), contents);
+        let error = VaultV3::create_directory(&mut vault, "refused").unwrap_err();
+        assert!(
+            error.contains("without a complete generation baseline"),
+            "{error}"
+        );
+
+        open();
+        let sidecar = dir.path().join("refused.aerocorrect");
+        let error = VaultV3::export_parity(&path, "", Some(&sidecar)).unwrap_err();
+        assert!(
+            error.contains("without a complete generation baseline"),
+            "{error}"
+        );
+        assert!(GENERATION_BYTES_READ.with(std::cell::Cell::get) < 1024 * 1024);
+        assert!(!sidecar.exists());
+        assert_eq!(file.metadata().unwrap().len(), logical_len);
     }
 
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
@@ -7986,21 +8170,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn macos_vm_estimate_changes_with_current_memory_pressure() {
+        let section = 2 * 1024 * 1024 * 1024;
+        let page_size = 16 * 1024;
+        let idle = macos_vm_headroom(100_000, 80_000, 80_000, 4000, page_size, 0);
+        let busy = macos_vm_headroom(1000, 80_000, 10_000, 1000, page_size, 0);
+        check_available_memory(section, Some(idle), section).unwrap();
+        assert!(check_available_memory(section, Some(busy), section).is_err());
+        assert_eq!(
+            macos_vm_headroom(50, 20, 30, 40, page_size, 0),
+            50 * page_size
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn meminfo_reports_available_memory_plus_free_swap() {
         let meminfo = "MemTotal:       16000000 kB\nMemFree:         1000000 kB\nMemAvailable:    8000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n";
         assert_eq!(
             parse_meminfo_available(meminfo),
-            Some((8_000_000 + 1_500_000) * 1024)
+            Some((8_000_000 * 1024, 1_500_000 * 1024))
         );
         assert_eq!(
             parse_meminfo_available("MemAvailable:    4 kB\n"),
-            Some(4096)
+            Some((4096, 0))
         );
         assert_eq!(parse_meminfo_available("MemFree: 4 kB\n"), None);
         let available = available_memory_bytes().expect("Linux reports available memory");
         assert!(available > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_allows_a_vault_buffer_after_clean_cache_reclaim() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        for (name, bytes) in [("memory.max", 1024 * MIB), ("memory.current", 896 * MIB)] {
+            std::fs::write(path.join(name), bytes.to_string()).unwrap();
+        }
+        let stats = |inactive_file: u64| {
+            std::fs::write(
+                path.join("memory.stat"),
+                format!(
+                    "anon {}\ninactive_file {inactive_file}\nfile_dirty {}\nfile_writeback {}\n",
+                    128 * MIB,
+                    16 * MIB,
+                    16 * MIB
+                ),
+            )
+            .unwrap();
+        };
+        let section = 768 * MIB;
+        stats(section);
+        let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
+        assert_eq!(available, 864 * MIB);
+        check_available_memory(section, Some(available), section).unwrap();
+        stats(0);
+        let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
+        assert_eq!(available, 128 * MIB);
+        assert!(check_available_memory(section, Some(available), section).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_and_swap_respect_a_constrained_ancestor() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("slice");
+        let relative = Path::new("slice/leaf");
+        let leaf = dir.path().join(relative);
+        std::fs::create_dir_all(&leaf).unwrap();
+        for (path, value) in [
+            (leaf.join("memory.max"), "max".into()),
+            (leaf.join("memory.swap.max"), "max".into()),
+            (parent.join("memory.max"), (512 * MIB).to_string()),
+            (parent.join("memory.current"), (128 * MIB).to_string()),
+            (parent.join("memory.swap.max"), (256 * MIB).to_string()),
+            (parent.join("memory.swap.current"), (224 * MIB).to_string()),
+        ] {
+            std::fs::write(path, value).unwrap();
+        }
+        let available = cgroup_v2_headroom(dir.path(), relative, 16 * 1024 * MIB, 2 * 1024 * MIB);
+        assert_eq!(available, 416 * MIB);
+        let section = 512 * MIB;
+        let error = check_available_memory(section, Some(available), section).unwrap_err();
+        assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+        assert_eq!(
+            cgroup_v2_headroom(dir.path(), relative, 16 * 1024 * MIB, 8 * MIB),
+            392 * MIB
+        );
     }
 
     /// Frames whose stored bytes are all holes, over `frames` maximum-size
@@ -8186,7 +8446,8 @@ mod tests {
                     },
                 );
             }
-            let (_, covered, prefix) = vault_generation_baseline(&mut file, &[], file_len).unwrap();
+            let (_, covered, prefix) =
+                vault_generation_baseline(&mut file, &[], file_len, u64::MAX).unwrap();
             assert!(prefix < file_len && covered < MAX_BLOCK_SIZE);
             let error = read_plaintext_data(&mut file, &header, &mut manifest, Some(covered), None)
                 .err()

@@ -18,7 +18,11 @@ All notable changes to the `aerovault` crate are documented here.
 
 - Plaintext archives load and repair frames without allocating intervening gaps. The default limit uses logical data ranges, including on compressed filesystems. Filesystems without extent queries use the file's logical length. Sparse saves preserve frame offsets and Error Correction order, including after a delete. Rollback copies preserve holes on supported filesystems.
 
-- On Linux, opening a vault with a private recovery journal reports an active publisher immediately. An abandoned journal still recovers when the reader can acquire the lock.
+- On Linux, a reader can open the visible vault during a private publication while the file is in ordinary vault format. A file marked as pending requires pair recovery. An abandoned journal still recovers when the reader can acquire the lock.
+
+- Default opens check reported memory headroom before allocation. On Linux this includes reclaimable inactive file cache and swap permitted by the cgroup hierarchy. Error Correction reports an error when its reconstruction buffers cannot fit.
+
+- When sparse extent information is unavailable, a vault with more than 4 GiB of unused trailing bytes can still open for extraction. Writes and parity exports require a complete generation check.
 
 - If a stale detached sidecar leaves damaged blocks unrepaired, `vault repair` now exits with an explicit error. Version 0.6.8 could exit successfully with the damaged blocks still present.
 

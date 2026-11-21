@@ -38,7 +38,7 @@ use super::vault::{
 };
 use crate::error_correction::{
     compute_error_correction_shards_grid, compute_metadata_parity, manifest_error_correction_grid,
-    reconstruct_from_error_correction,
+    reconstruct_from_error_correction, ErrorCorrectionPayloadHeader,
 };
 use crate::error_correction::{AeroCorrectSegment, AeroCorrectSidecar};
 
@@ -590,6 +590,7 @@ pub(super) fn export_parity_from_sealed(
     vault_path: &Path,
     out: &Path,
 ) -> Result<ExportParityResult, String> {
+    vault.complete_generation()?;
     if vault.manifest_repaired_on_open {
         return Err(
             "Vault manifest was recovered on open: run repair before exporting parity".to_string(),
@@ -678,6 +679,7 @@ pub(super) fn strip_parity(
     let lock = super::vault::write_lock(vault_path)?;
     let vault_path = lock.source_path();
     let mut vault = super::vault::open_vault_under_guard(vault_path, password, &lock, limits)?;
+    vault.complete_generation()?;
     let had_embedded = vault
         .extensions
         .iter()
@@ -876,6 +878,9 @@ pub(super) fn repair_vault(
     dry_run: bool,
     parity: Option<&Path>,
 ) -> Result<(usize, ParitySource), String> {
+    if !dry_run {
+        vault.complete_generation()?;
+    }
     super::vault::validate_chunk_identities(&vault.manifest)?;
     let damaged = scrub_vault(vault);
     if damaged.is_empty() {
@@ -918,32 +923,49 @@ pub(super) fn repair_vault(
                 .then(|| acc.checked_add(8 + r.block_len))
                 .flatten()
         });
-        if !matches!(total, Some(t) if t <= vault.data.len() as u64) {
-            return Err(
-                "AeroVault v3 chunk records exceed the block limit or the data section".to_string(),
-            );
-        }
+        let total = total
+            .filter(|&bytes| bytes <= vault.data.len() as u64)
+            .ok_or("AeroVault v3 chunk records exceed the block limit or the data section")?;
 
-        let mut blocks = zeroize::Zeroizing::new(
-            ordered
-                .iter()
-                .map(|rec| {
-                    let start = rec.data_offset as usize;
-                    let full = 8 + rec.block_len as usize;
-                    // Always a fixed-length (8 + block_len) buffer so the
-                    // concatenated stream length matches what the parity was computed
-                    // over, even when the block is truncated on disk: the missing tail
-                    // is zero-padded here, flagged as damaged by its shard checksum,
-                    // then reconstructed.
-                    let mut buf = vec![0u8; full];
-                    if start < vault.data.len() {
-                        let avail = (vault.data.len() - start).min(full);
-                        buf[..avail].copy_from_slice(&vault.data[start..start + avail]);
-                    }
-                    buf
-                })
-                .collect::<Vec<Vec<u8>>>(),
-        );
+        // Reconstruction holds the individual blocks and the concatenated
+        // stream together. Parsing also copies the serialized parity payload.
+        let group_bytes = ErrorCorrectionPayloadHeader::from_bytes(&error_correction_b)
+            .ok()
+            .map_or(0, |header| {
+                (u64::from(header.data_shards) + u64::from(header.parity_shards))
+                    * u64::from(header.shard_size)
+            });
+        let working_bytes = total
+            .saturating_mul(2)
+            .saturating_add(error_correction_b.len() as u64)
+            .saturating_add(group_bytes);
+        if let Some(available) =
+            super::vault::available_memory_bytes().filter(|&bytes| working_bytes > bytes)
+        {
+            return Err(format!(
+                "Error Correction reconstruction needs at least {working_bytes} more bytes in memory, but the system reports {available} bytes available"
+            ));
+        }
+        let allocation_error =
+            |error| format!("Cannot allocate Error Correction reconstruction buffers: {error}");
+        let mut blocks = zeroize::Zeroizing::new(Vec::new());
+        blocks
+            .try_reserve_exact(ordered.len())
+            .map_err(allocation_error)?;
+        for rec in &ordered {
+            let start = rec.data_offset as usize;
+            let full = 8 + rec.block_len as usize;
+            // Missing bytes stay zero so each reconstructed block keeps
+            // the exact length used to compute its parity.
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(full).map_err(allocation_error)?;
+            buf.resize(full, 0);
+            if start < vault.data.len() {
+                let avail = (vault.data.len() - start).min(full);
+                buf[..avail].copy_from_slice(&vault.data[start..start + avail]);
+            }
+            blocks.push(buf);
+        }
 
         let bad_indices: Vec<usize> = damaged
             .iter()
@@ -1364,6 +1386,68 @@ mod tests {
         }
         std::fs::write(vault_path, &bytes).unwrap();
         span
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn repair_returns_a_memory_error_with_the_data_already_resident() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        const KEY: &str = "AEROVAULT_REPAIR_MEMORY_PATH";
+        const TEST: &str =
+            "v3::ec::tests::repair_returns_a_memory_error_with_the_data_already_resident";
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            assert_eq!(VaultV3::scrub(&vault).len(), 1);
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let mapped = super::super::vault::parse_linux_kib(&status, "VmSize").unwrap();
+            let limit = mapped + 6 * 1024 * 1024;
+            let bounds = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            // SAFETY: the test adjusts the address-space limit of this child.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_AS, &bounds) }, 0);
+            for dry_run in [true, false] {
+                let error = VaultV3::repair(&mut vault, dry_run, None).unwrap_err();
+                assert!(
+                    error.contains("Error Correction reconstruction needs"),
+                    "{error}"
+                );
+            }
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repair.aerozip");
+        let input = dir.path().join("input");
+        let mut payload = vec![0; 8 * 1024 * 1024];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut payload);
+        std::fs::write(&input, payload).unwrap();
+        VaultV3::create_with_error_correction(
+            &CreateOptionsV3::new_plaintext(&path),
+            RecoveryPlacement::Embedded,
+            20,
+        )
+        .unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        let record = vault.manifest.chunks.values().next().unwrap();
+        let offset = vault.header.data_offset + vault.file_data_offset(record) + 8;
+        let changed = vault.data[record.data_offset as usize + 8] ^ 1;
+        drop(vault);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[changed]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let damaged = super::super::strip_transaction::generation(&path).unwrap();
+        crate::source::memory_test::run(TEST, KEY, &path);
+        assert_eq!(
+            super::super::strip_transaction::generation(&path).unwrap(),
+            damaged
+        );
     }
 
     #[test]

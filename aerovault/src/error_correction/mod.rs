@@ -240,24 +240,27 @@ impl ErrorCorrectionPayload {
                 expected
             ));
         }
-        // Past this point `data.len() == expected`, so `num_data_shards` and `num_parity`
-        // are each bounded by `data.len() / ERROR_CORRECTION_SHARD_CKSUM_LEN`: the
-        // `Vec::with_capacity` calls below can no longer be driven huge by the header.
-
+        // The exact input length bounds every table before reserving it.
+        let allocation_error = |error| format!("Cannot allocate Error Correction payload: {error}");
         let mut off = 32;
         let read_cksums = |count: usize, off: &mut usize| {
-            let mut v = Vec::with_capacity(count);
+            let mut v = Vec::new();
+            v.try_reserve_exact(count).map_err(allocation_error)?;
             for _ in 0..count {
                 let mut c = [0u8; ERROR_CORRECTION_SHARD_CKSUM_LEN];
                 c.copy_from_slice(&data[*off..*off + ERROR_CORRECTION_SHARD_CKSUM_LEN]);
                 v.push(c);
                 *off += ERROR_CORRECTION_SHARD_CKSUM_LEN;
             }
-            v
+            Ok::<_, String>(v)
         };
-        let data_checksums = read_cksums(num_data_shards, &mut off);
-        let parity_checksums = read_cksums(num_parity, &mut off);
-        let parity_data = data[off..].to_vec();
+        let data_checksums = read_cksums(num_data_shards, &mut off)?;
+        let parity_checksums = read_cksums(num_parity, &mut off)?;
+        let mut parity_data = Vec::new();
+        parity_data
+            .try_reserve_exact(parity_len)
+            .map_err(allocation_error)?;
+        parity_data.extend_from_slice(&data[off..]);
 
         Ok(ErrorCorrectionPayload {
             header,
@@ -522,7 +525,10 @@ pub(crate) fn reconstruct_from_error_correction(
         ));
     }
 
-    let mut stream = ReconstructionBuffer::new(Vec::with_capacity(l), true);
+    let allocation_error =
+        |error| format!("Cannot allocate Error Correction reconstruction buffers: {error}");
+    let mut stream = ReconstructionBuffer::new(Vec::new(), true);
+    stream.0.try_reserve_exact(l).map_err(allocation_error)?;
     for b in blocks.iter() {
         stream.0.extend_from_slice(b);
     }
@@ -537,9 +543,14 @@ pub(crate) fn reconstruct_from_error_correction(
     let mut changed = false;
 
     for g in 0..num_groups {
-        let mut opt: Vec<_> = (0..k + p)
-            .map(|_| (ReconstructionBuffer::new(vec![0u8; s], false), false))
-            .collect();
+        let mut opt = Vec::new();
+        opt.try_reserve_exact(k + p).map_err(allocation_error)?;
+        for _ in 0..k + p {
+            let mut shard = ReconstructionBuffer::new(Vec::new(), false);
+            shard.0.try_reserve_exact(s).map_err(allocation_error)?;
+            shard.0.resize(s, 0);
+            opt.push((shard, false));
+        }
         let mut erased_data = 0usize;
 
         for (local, (shard, present)) in opt.iter_mut().take(k).enumerate() {

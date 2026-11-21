@@ -180,7 +180,7 @@ vault.copy_entry("archive/secret.pdf", "backup/secret.pdf")?;
 
 ### Large v3 vaults and resource limits
 
-V3 keeps stored data in memory. Plaintext archives load their declared frames without the unused gaps between them. Opening, extracting and writing existing vaults has no fixed container-size ceiling. Opening validates file ranges and metadata and reserves the data buffer with a fallible allocation. Writes still hash and compare the source generation under the writer lock before publishing.
+V3 keeps stored data in memory. Plaintext archives load their declared frames without the unused gaps between them. Opening validates file ranges and metadata and checks reported memory headroom before allocating a buffer under the default policy. Writes hash and compare the source generation under the writer lock before publishing. If the filesystem cannot identify sparse extents and the archive has an unused tail larger than 4 GiB, the vault can open for extraction. Writes and parity exports then require a complete generation check.
 
 Embedders can cap the stored data section by passing `VaultV3Limits::default().with_max_data_bytes(bytes)` to `VaultV3::open_with_limits` or `VaultV3::open_plaintext_with_limits`. The handle applies the same limit to later writes. Detached export and strip also provide `*_with_limits` variants. This limit covers stored data bytes. Compression, encryption and recovery may need additional memory. A pending recovery journal may be finished before the open checks the budget.
 
