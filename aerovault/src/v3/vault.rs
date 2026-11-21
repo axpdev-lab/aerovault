@@ -49,7 +49,7 @@ use crate::aerocrypt::{
 
 const DATA_BUDGET_ENV: &str = "AEROVAULT_V3_DATA_BUDGET_BYTES";
 const MIN_ENV_DATA_BUDGET: u64 = 1024 * 1024 * 1024;
-const MAX_RAW_OPEN_TAIL: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_OPEN_TRAILING_SCAN: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Optional resource policy for opening and editing a v3 container.
 ///
@@ -2791,12 +2791,8 @@ fn open_vault_with_guard(
     if let Some(hook) = BEFORE_OPEN_GENERATION.with(|h| h.borrow_mut().take()) {
         hook();
     }
-    let (opened_hash, scanned_bytes, hashed_file_len) = vault_generation_baseline(
-        &mut file,
-        &header_bytes,
-        file_len,
-        extent.saturating_add(MAX_RAW_OPEN_TAIL),
-    )?;
+    let (opened_hash, scanned_bytes, hashed_file_len) =
+        vault_generation_baseline(&mut file, &header_bytes, file_len, extent)?;
     let encrypted_manifest = read_capped(
         &mut file,
         header.manifest_offset,
@@ -3034,6 +3030,15 @@ pub(super) fn parse_linux_kib(text: &str, name: &str) -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn cgroup_v2_available_memory(memory: u64, swap: u64) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(headroom) = TEST_CGROUP_V2.with(|paths| {
+        paths
+            .borrow()
+            .as_ref()
+            .map(|(root, group)| cgroup_v2_headroom(root, group, memory, swap))
+    }) {
+        return Some(headroom);
+    }
     let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let group = membership
         .lines()
@@ -3051,6 +3056,12 @@ fn cgroup_v2_available_memory(memory: u64, swap: u64) -> Option<u64> {
         memory,
         swap,
     ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static TEST_CGROUP_V2: std::cell::RefCell<Option<(PathBuf, PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(target_os = "linux")]
@@ -3429,10 +3440,16 @@ thread_local! {
     static FAIL_SPARSE_TAIL_QUERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_os = "linux")]
     static REPORT_DENSE_EXTENTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static REPORT_FIRST_EXTENT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Start a sparse fingerprint at the first hole after the verified header.
 fn sparse_hash_extent(file: &std::fs::File, file_len: u64) -> u64 {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(end) = REPORT_FIRST_EXTENT.with(|extent| extent.take()) {
+        return end;
+    }
     #[cfg(all(test, target_os = "linux"))]
     if REPORT_DENSE_EXTENTS.with(|dense| dense.replace(false)) {
         return file_len;
@@ -3444,11 +3461,28 @@ fn sparse_hash_extent(file: &std::fs::File, file_len: u64) -> u64 {
     }
 }
 
+struct GenerationScan {
+    declared_end: u64,
+    remaining_tail: u64,
+}
+
+impl GenerationScan {
+    fn allow(&mut self, start: u64, end: u64) -> bool {
+        let unused = end.saturating_sub(start.max(self.declared_end));
+        let Some(remaining) = self.remaining_tail.checked_sub(unused) else {
+            return false;
+        };
+        self.remaining_tail = remaining;
+        true
+    }
+}
+
 fn hash_sparse_tail(
     file: &mut std::fs::File,
     hasher: &mut blake3::Hasher,
     prefix_len: u64,
     file_len: u64,
+    scan: &mut GenerationScan,
 ) -> Result<Option<u64>, String> {
     // The offsets, lengths and logical file length commit to every hole.
     // An allocated extent in a previously empty region changes this hash.
@@ -3469,6 +3503,9 @@ fn hash_sparse_tail(
             break;
         };
         let len = range.end - range.start;
+        if !scan.allow(range.start, range.end) {
+            return Ok(None);
+        }
         hasher.update(&range.start.to_le_bytes());
         hasher.update(&len.to_le_bytes());
         file.seek(std::io::SeekFrom::Start(range.start))
@@ -3508,33 +3545,40 @@ fn file_generation(
     if len != expected_len {
         return Err("Vault changed while this write was in progress; retry operation".into());
     }
-    file_generation_starting_with(file, &[], hashed_len, len)?
+    let mut scan = GenerationScan {
+        declared_end: len,
+        remaining_tail: 0,
+    };
+    file_generation_starting_with(file, &[], hashed_len, len, &mut scan)?
         .map(|(hash, _)| hash)
         .ok_or_else(|| "Cannot recheck sparse vault generation; open it again".into())
 }
 
-/// Start a generation using logical extent lengths when available. On a
-/// raw fallback, keep a complete baseline only within the caller's scan limit.
+/// Bound bytes read after the declared data, including across a raw retry.
 fn vault_generation_baseline(
     file: &mut std::fs::File,
     header: &[u8],
     file_len: u64,
-    max_raw_len: u64,
+    declared_end: u64,
 ) -> Result<(Option<[u8; 32]>, u64, u64), String> {
+    let mut scan = GenerationScan {
+        declared_end,
+        remaining_tail: MAX_OPEN_TRAILING_SCAN,
+    };
     let prefix = sparse_hash_extent(file, file_len);
     if prefix < file_len {
         if let Some((hash, covered)) =
-            file_generation_starting_with(file, header, prefix, file_len)?
+            file_generation_starting_with(file, header, prefix, file_len, &mut scan)?
         {
             return Ok((Some(hash), covered, prefix));
         }
     }
-    if file_len > max_raw_len {
+    let Some((hash, logical_len)) =
+        file_generation_starting_with(file, header, file_len, file_len, &mut scan)?
+    else {
         verify_generation_prefix(file, header)?;
         return Ok((None, file_len, 0));
-    }
-    let (hash, logical_len) = file_generation_starting_with(file, header, file_len, file_len)?
-        .expect("raw generation does not query extents");
+    };
     Ok((Some(hash), logical_len, file_len))
 }
 
@@ -3560,7 +3604,11 @@ fn file_generation_starting_with(
     prefix: &[u8],
     hashed_len: u64,
     len: u64,
+    scan: &mut GenerationScan,
 ) -> Result<Option<([u8; 32], u64)>, String> {
+    if !scan.allow(0, hashed_len) {
+        return Ok(None);
+    }
     #[cfg(test)]
     GENERATION_READS.with(|n| n.set(n.get() + 1));
     #[cfg(test)]
@@ -3574,7 +3622,7 @@ fn file_generation_starting_with(
     hasher.update(prefix);
     hash_generation_bytes(file, &mut hasher, expected)?;
     let scanned_bytes = if hashed_len < len {
-        let Some(tail) = hash_sparse_tail(file, &mut hasher, hashed_len, len)? else {
+        let Some(tail) = hash_sparse_tail(file, &mut hasher, hashed_len, len, scan)? else {
             return Ok(None);
         };
         if file
@@ -8122,34 +8170,42 @@ mod tests {
         drop(vault);
 
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let logical_len = file.metadata().unwrap().len() + MAX_RAW_OPEN_TAIL + 8192;
+        let logical_len = file.metadata().unwrap().len() + MAX_OPEN_TRAILING_SCAN + 8192;
         file.set_len(logical_len).unwrap();
-        let open = || {
-            FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
-            GENERATION_BYTES_READ.with(|read| read.set(0));
-        };
-        open();
-        let mut vault = VaultV3::open_plaintext(&path).unwrap();
-        assert!(vault.opened_hash.is_none());
-        assert!(GENERATION_BYTES_READ.with(std::cell::Cell::get) < 1024 * 1024);
-        let output = dir.path().join("extracted");
-        VaultV3::extract_entry(&vault, "input", &output).unwrap();
-        assert_eq!(std::fs::read(output).unwrap(), contents);
-        let error = VaultV3::create_directory(&mut vault, "refused").unwrap_err();
-        assert!(
-            error.contains("without a complete generation baseline"),
-            "{error}"
-        );
+        for (label, first_extent) in [
+            ("ordinary", None),
+            ("coarse-prefix", Some(logical_len - 4096)),
+        ] {
+            let force_extent_failure = || {
+                REPORT_FIRST_EXTENT.with(|extent| extent.set(first_extent));
+                FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
+                GENERATION_BYTES_READ.with(|read| read.set(0));
+            };
+            force_extent_failure();
+            let mut vault = VaultV3::open_plaintext(&path).unwrap();
+            assert!(vault.opened_hash.is_none(), "{label}");
+            let read = GENERATION_BYTES_READ.with(std::cell::Cell::get);
+            assert!(read < 1024 * 1024, "{label}: read {read} generation bytes");
+            let output = dir.path().join(format!("extracted-{label}"));
+            VaultV3::extract_entry(&vault, "input", &output).unwrap();
+            assert_eq!(std::fs::read(output).unwrap(), contents);
+            let error = VaultV3::create_directory(&mut vault, "refused").unwrap_err();
+            assert!(
+                error.contains("without a complete generation baseline"),
+                "{error}"
+            );
 
-        open();
-        let sidecar = dir.path().join("refused.aerocorrect");
-        let error = VaultV3::export_parity(&path, "", Some(&sidecar)).unwrap_err();
-        assert!(
-            error.contains("without a complete generation baseline"),
-            "{error}"
-        );
-        assert!(GENERATION_BYTES_READ.with(std::cell::Cell::get) < 1024 * 1024);
-        assert!(!sidecar.exists());
+            force_extent_failure();
+            let sidecar = dir.path().join(format!("refused-{label}.aerocorrect"));
+            let error = VaultV3::export_parity(&path, "", Some(&sidecar)).unwrap_err();
+            assert!(
+                error.contains("without a complete generation baseline"),
+                "{error}"
+            );
+            assert!(GENERATION_BYTES_READ.with(std::cell::Cell::get) < 1024 * 1024);
+            assert!(!sidecar.exists());
+        }
+        FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(false));
         assert_eq!(file.metadata().unwrap().len(), logical_len);
     }
 
@@ -8298,6 +8354,43 @@ mod tests {
             cgroup_v2_headroom(dir.path(), relative, 16 * 1024 * MIB, 8 * MIB),
             392 * MIB
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_open_obeys_the_ancestor_and_can_reclaim_its_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("open.aerozip");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"ordinary file under an unlimited leaf").unwrap();
+        VaultV3::create(&CreateOptionsV3::new_plaintext(&path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(&path).unwrap();
+        VaultV3::add_files(&mut vault, &[(input, "input".into())]).unwrap();
+        let bytes = vault.header.data_len;
+        assert!(bytes > 1);
+        drop(vault);
+
+        let root = dir.path().join("cgroups");
+        let group = PathBuf::from("parent/leaf");
+        let parent = root.join("parent");
+        std::fs::create_dir_all(root.join(&group)).unwrap();
+        std::fs::write(root.join(&group).join("memory.max"), "max").unwrap();
+        std::fs::write(parent.join("memory.max"), (bytes + 1).to_string()).unwrap();
+        std::fs::write(parent.join("memory.current"), bytes.to_string()).unwrap();
+        std::fs::write(parent.join("memory.swap.max"), "0").unwrap();
+        TEST_CGROUP_V2.with(|paths| paths.replace(Some((root, group))));
+
+        let error =
+            VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap_err();
+        assert!(error.contains("1 bytes available"), "{error}");
+        assert!(error.contains(DATA_BUDGET_ENV), "{error}");
+        let explicit = VaultV3Limits::default().with_max_data_bytes(bytes);
+        VaultV3::open_plaintext_with_limits(&path, explicit).unwrap();
+
+        std::fs::write(parent.join("memory.stat"), format!("active_file {bytes}\n")).unwrap();
+        let opened = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default()).unwrap();
+        assert_eq!(VaultV3::list(&opened).len(), 1);
+        TEST_CGROUP_V2.with(|paths| paths.replace(None));
     }
 
     /// Frames whose stored bytes are all holes, over `frames` maximum-size
