@@ -174,6 +174,12 @@ impl AeroCorrectSidecar {
         Ok(d)
     }
 
+    /// Serialize the sidecar to its on-disk representation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the output size exceeds the address space or memory cannot
+    /// be reserved for the sidecar.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.try_to_bytes(None)
             .expect("Cannot serialize Error Correction sidecar")

@@ -1119,6 +1119,19 @@ mod tests {
         let (with_parity, _) = portable_header(dir.path(), transaction, original).unwrap();
         assert!(with_parity.payload_offset > HEADER_SIZE as u64);
 
+        let mut unrecoverable = valid.clone();
+        let old_bytes = fs::read(&old_vault).unwrap();
+        let mut single_shard_parity =
+            crate::error_correction::compute_metadata_parity(&old_bytes[..HEADER_SIZE], 20, 1)
+                .unwrap();
+        *single_shard_parity.last_mut().unwrap() ^= 1;
+        unrecoverable.segments[0].avec_bytes = single_shard_parity;
+        for sidecar in [&old_sidecar, &new_sidecar] {
+            fs::write(sidecar, unrecoverable.to_bytes()).unwrap();
+        }
+        let (with_rotted_parity, _) = portable_header(dir.path(), transaction, original).unwrap();
+        assert_eq!(with_rotted_parity.payload_offset, HEADER_SIZE as u64);
+
         let mut empty = valid.clone();
         empty.segments[0].avec_bytes.clear();
         for sidecar in [&old_sidecar, &new_sidecar] {

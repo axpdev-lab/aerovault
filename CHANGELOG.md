@@ -22,6 +22,8 @@ All notable changes to the `aerovault` crate are documented here.
 
 - Default opens check reported memory headroom before allocation. On Linux this includes reclaimable file cache and swap permitted by the cgroup hierarchy. Error Correction uses the same default memory policy and reports an error when its reconstruction buffers cannot fit.
 
+- Saving a vault with embedded Error Correction can now report insufficient memory before regenerating parity. An explicit data budget bypasses the headroom estimate, and allocation failures still return errors.
+
 - When sparse extent information is unavailable, a vault with more than 4 GiB of unused trailing bytes can still open for extraction. Writes and parity exports require a complete generation check.
 
 - If a stale detached sidecar leaves damaged blocks unrepaired, `vault repair` now exits with an explicit error. Version 0.6.8 could exit successfully with the damaged blocks still present.

@@ -113,7 +113,11 @@ pub fn estimate_aerorec_sidecar_len(file_size: u64, pct: u32) -> u64 {
 
 /// Build a windowed sidecar from an in-memory buffer: one segment per window, each
 /// carrying that window's own RS parity. Returns the sidecar plus aggregate telemetry.
-fn build_windowed_sidecar(data: &[u8], pct: u32, window: u64) -> (AeroCorrectSidecar, u64, u64) {
+fn build_windowed_sidecar(
+    data: &[u8],
+    pct: u32,
+    window: u64,
+) -> Result<(AeroCorrectSidecar, u64, u64), String> {
     let file_size = data.len() as u64;
     let (k, p) = error_correction_grid(pct);
     let mut segments = Vec::new();
@@ -122,8 +126,7 @@ fn build_windowed_sidecar(data: &[u8], pct: u32, window: u64) -> (AeroCorrectSid
     for (off, len) in aerocorrect_windows(file_size, window) {
         let w = &data[off as usize..(off + len) as usize];
         let (avec_bytes, shards, _protected, _overhead) =
-            compute_error_correction_shards_grid(&[w], k, p)
-                .expect("Cannot generate in-memory Error Correction sidecar");
+            compute_error_correction_shards_grid(&[w], k, p)?;
         total_shards += shards;
         total_avec += avec_bytes.len() as u64;
         segments.push(AeroCorrectSegment {
@@ -133,7 +136,7 @@ fn build_windowed_sidecar(data: &[u8], pct: u32, window: u64) -> (AeroCorrectSid
         });
     }
     let sidecar = AeroCorrectSidecar::new(sha256_bytes(data), file_size, segments);
-    (sidecar, total_shards, total_avec)
+    Ok((sidecar, total_shards, total_avec))
 }
 
 fn generated_from(
@@ -142,14 +145,14 @@ fn generated_from(
     file_sha256: [u8; 32],
     shards: u64,
     avec_payload_len: u64,
-) -> SyncEcGeneratedSidecar {
-    let sidecar_bytes = sidecar.to_bytes();
+) -> Result<SyncEcGeneratedSidecar, String> {
+    let sidecar_bytes = sidecar.try_to_bytes(None)?;
     let overhead_pct = if file_size > 0 {
         (avec_payload_len as f64 / file_size as f64) * 100.0
     } else {
         0.0
     };
-    SyncEcGeneratedSidecar {
+    Ok(SyncEcGeneratedSidecar {
         sidecar_len: sidecar_bytes.len() as u64,
         sidecar_bytes,
         file_size,
@@ -158,9 +161,14 @@ fn generated_from(
         bytes_protected: file_size,
         overhead_pct,
         avec_payload_len,
-    }
+    })
 }
 
+/// Generate a windowed recovery sidecar for an in-memory file.
+///
+/// # Panics
+///
+/// Panics if the parity or sidecar buffers cannot be allocated.
 pub fn generate_sync_sidecar_for_bytes(
     _rel_path: &str,
     data: &[u8],
@@ -178,10 +186,19 @@ fn generate_sync_sidecar_for_bytes_windowed(
     window: u64,
 ) -> SyncEcGeneratedSidecar {
     let file_sha256 = sha256_bytes(data);
-    let (sidecar, shards, avec) = build_windowed_sidecar(data, pct, window);
-    generated_from(sidecar, data.len() as u64, file_sha256, shards, avec)
+    build_windowed_sidecar(data, pct, window)
+        .and_then(|(sidecar, shards, avec)| {
+            generated_from(sidecar, data.len() as u64, file_sha256, shards, avec)
+        })
+        .expect("Cannot generate in-memory Error Correction sidecar")
 }
 
+/// Generate a recovery sidecar if the in-memory file fits the requested size cap.
+///
+/// # Panics
+///
+/// Panics if a file within the cap needs parity or sidecar buffers that cannot
+/// be allocated.
 pub fn generate_sync_sidecar_for_bytes_capped(
     rel_path: &str,
     data: &[u8],
@@ -314,7 +331,7 @@ fn generate_sync_sidecar_for_file_capped_windowed(
         file_sha256,
         total_shards,
         total_avec,
-    )))
+    )?))
 }
 
 /// Shared sidecar validation for the verify/repair paths: parse, content-bind against

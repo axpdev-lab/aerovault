@@ -3069,6 +3069,32 @@ thread_local! {
 }
 
 #[cfg(target_os = "linux")]
+fn cgroup_v2_child_protection(child: &Path) -> Option<u64> {
+    let read = |name: &str| -> std::io::Result<u64> {
+        let value = std::fs::read_to_string(child.join(name))?;
+        match value.trim() {
+            "max" => Ok(u64::MAX),
+            value => value
+                .parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        }
+    };
+    let protection = read("memory.min").and_then(|min| Ok(min.max(read("memory.low")?)));
+    match protection {
+        Ok(protection) => Some(protection),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A scope that was removed after read_dir cannot protect cache.
+            // A surviving group with a missing setting is still unknown.
+            match std::fs::symlink_metadata(child) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn cgroup_v2_reclaimable_cache(dir: &Path, clean_cache: u64) -> Option<u64> {
     if clean_cache == 0 {
         return Some(0);
@@ -3080,14 +3106,7 @@ fn cgroup_v2_reclaimable_cache(dir: &Path, clean_cache: u64) -> Option<u64> {
             continue;
         }
         let child = entry.path();
-        let read_protection = |name: &str| {
-            let value = std::fs::read_to_string(child.join(name)).ok()?;
-            match value.trim() {
-                "max" => Some(u64::MAX),
-                value => value.parse::<u64>().ok(),
-            }
-        };
-        let protection = read_protection("memory.min")?.max(read_protection("memory.low")?);
+        let protection = cgroup_v2_child_protection(&child)?;
         if protection == 0 {
             continue;
         }
@@ -8372,6 +8391,27 @@ mod tests {
         let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
         assert_eq!(available, 128 * MIB);
         assert!(check_available_memory(section, Some(available), section).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_cache_credit_accounts_for_protected_missing_and_unknown_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("scope");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("memory.min"), "600").unwrap();
+        std::fs::write(child.join("memory.low"), "200").unwrap();
+        std::fs::write(child.join("memory.current"), "400").unwrap();
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), Some(600));
+
+        std::fs::write(child.join("memory.min"), "unavailable").unwrap();
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), None);
+        std::fs::remove_file(child.join("memory.min")).unwrap();
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), None);
+
+        std::fs::remove_dir_all(&child).unwrap();
+        assert_eq!(cgroup_v2_child_protection(&child), Some(0));
+        assert_eq!(cgroup_v2_reclaimable_cache(dir.path(), 1000), Some(1000));
     }
 
     #[cfg(target_os = "linux")]
