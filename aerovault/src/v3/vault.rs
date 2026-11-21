@@ -98,6 +98,13 @@ impl VaultV3Limits {
         }
         Ok(())
     }
+
+    fn default_memory_headroom(self) -> Option<u64> {
+        self.max_data_bytes
+            .is_none()
+            .then(available_memory_bytes)
+            .flatten()
+    }
 }
 
 /// Error returned by [`VaultV3::open`] for a plaintext container. Kept stable:
@@ -260,6 +267,10 @@ impl OpenVaultV3 {
         self.opened_hash.ok_or_else(|| {
             "Vault opened without a complete generation baseline. Use a filesystem with sparse extent support or remove the unused tail from a verified copy before writing".into()
         })
+    }
+
+    pub(super) fn default_memory_headroom(&self) -> Option<u64> {
+        self.limits.default_memory_headroom()
     }
 
     pub(super) fn file_data_offset(&self, record: &ChunkRecordV3) -> u64 {
@@ -2886,11 +2897,7 @@ fn open_vault_with_guard(
     // Without an explicit budget, the memory the system can still provide
     // bounds the allocation. Extent reporting alone is not enough: it can be
     // unavailable or report a sparse file as fully backed.
-    let memory_bound = limits
-        .max_data_bytes
-        .is_none()
-        .then(available_memory_bytes)
-        .flatten();
+    let memory_bound = limits.default_memory_headroom();
     let LoadedData {
         mut bytes,
         file_offsets,
@@ -2965,7 +2972,7 @@ fn check_available_memory(
 
 /// Memory this process can still obtain, as reported by the operating
 /// system, or `None` where it is not reported.
-pub(super) fn available_memory_bytes() -> Option<u64> {
+fn available_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     return linux_available_memory();
     #[cfg(target_os = "macos")]
@@ -3070,9 +3077,10 @@ fn cgroup_v2_headroom(root: &Path, group: &Path, mut memory: u64, mut swap: u64)
                     })
                     .unwrap_or(0)
             };
-            // Treat only inactive file pages as candidates for reclaim.
-            // Dirty or writeback pages can require I/O before they are free.
-            let clean_cache = bytes("inactive_file")
+            // Both file LRUs can be reclaimed. The host limit still caps
+            // the estimate. Do not credit dirty or writeback file pages.
+            let clean_cache = bytes("active_file")
+                .saturating_add(bytes("inactive_file"))
                 .saturating_sub(bytes("file_dirty"))
                 .saturating_sub(bytes("file_writeback"));
             let working_set = current.saturating_sub(clean_cache);
@@ -3092,6 +3100,36 @@ fn cgroup_v2_headroom(root: &Path, group: &Path, mut memory: u64, mut swap: u64)
 /// Estimate headroom from live VM counters and current swap space.
 #[cfg(target_os = "macos")]
 fn macos_available_memory() -> Option<u64> {
+    fn sysctl<T>(name: &std::ffi::CStr, value: &mut T) -> bool {
+        let mut len = std::mem::size_of::<T>();
+        // SAFETY: the buffer and its byte size are valid for this fixed-size sysctl.
+        let status = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (value as *mut T).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        status == 0 && len == std::mem::size_of::<T>()
+    }
+
+    // SAFETY: xsw_usage is plain integers, valid when zeroed.
+    let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
+    let free_swap = if sysctl(c"vm.swapusage", &mut swap) {
+        swap.xsu_avail
+    } else {
+        0
+    };
+    let mut memsize = 0u64;
+    let mut level = 0u32;
+    if sysctl(c"hw.memsize", &mut memsize) && sysctl(c"kern.memorystatus_level", &mut level) {
+        if let Some(available) = macos_memory_level_headroom(memsize, level, free_swap) {
+            return Some(available);
+        }
+    }
+
     unsafe extern "C" {
         fn host_page_size(
             host: libc::mach_port_t,
@@ -3131,24 +3169,6 @@ fn macos_available_memory() -> Option<u64> {
     {
         return None;
     }
-    // SAFETY: xsw_usage is plain integers, valid when zeroed.
-    let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of_val(&swap);
-    // SAFETY: the buffer and its byte size are valid for this fixed-size sysctl.
-    let swap_status = unsafe {
-        libc::sysctlbyname(
-            c"vm.swapusage".as_ptr(),
-            (&mut swap as *mut libc::xsw_usage).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    let free_swap = if swap_status == 0 && len == std::mem::size_of_val(&swap) {
-        swap.xsu_avail
-    } else {
-        0
-    };
     Some(macos_vm_headroom(
         stat.free_count,
         stat.inactive_count,
@@ -3157,6 +3177,14 @@ fn macos_available_memory() -> Option<u64> {
         page_size as u64,
         free_swap,
     ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_memory_level_headroom(memsize: u64, level: u32, swap_free: u64) -> Option<u64> {
+    (memsize > 0 && level <= 100).then(|| {
+        let available = (u128::from(memsize) * u128::from(level) / 100) as u64;
+        available.saturating_add(swap_free)
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -8182,6 +8210,13 @@ mod tests {
             macos_vm_headroom(50, 20, 30, 40, page_size, 0),
             50 * page_size
         );
+        let memsize = 14 * 1024 * 1024 * 1024;
+        let idle = macos_memory_level_headroom(memsize, 92, 0);
+        let busy = macos_memory_level_headroom(memsize, 10, 0);
+        check_available_memory(section, idle, section).unwrap();
+        assert!(check_available_memory(section, busy, section).is_err());
+        assert_eq!(macos_memory_level_headroom(memsize, 101, 0), None);
+        assert_eq!(macos_memory_level_headroom(memsize, 0, 4096), Some(4096));
     }
 
     #[cfg(target_os = "linux")]
@@ -8210,11 +8245,11 @@ mod tests {
         for (name, bytes) in [("memory.max", 1024 * MIB), ("memory.current", 896 * MIB)] {
             std::fs::write(path.join(name), bytes.to_string()).unwrap();
         }
-        let stats = |inactive_file: u64| {
+        let stats = |active_file: u64, inactive_file: u64| {
             std::fs::write(
                 path.join("memory.stat"),
                 format!(
-                    "anon {}\ninactive_file {inactive_file}\nfile_dirty {}\nfile_writeback {}\n",
+                    "anon {}\nactive_file {active_file}\ninactive_file {inactive_file}\nfile_dirty {}\nfile_writeback {}\n",
                     128 * MIB,
                     16 * MIB,
                     16 * MIB
@@ -8223,11 +8258,13 @@ mod tests {
             .unwrap();
         };
         let section = 768 * MIB;
-        stats(section);
-        let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
-        assert_eq!(available, 864 * MIB);
-        check_available_memory(section, Some(available), section).unwrap();
-        stats(0);
+        for cache in [(0, section), (section, 0)] {
+            stats(cache.0, cache.1);
+            let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
+            assert_eq!(available, 864 * MIB);
+            check_available_memory(section, Some(available), section).unwrap();
+        }
+        stats(0, 0);
         let available = cgroup_v2_headroom(path, Path::new(""), 4 * 1024 * MIB, 0);
         assert_eq!(available, 128 * MIB);
         assert!(check_available_memory(section, Some(available), section).is_err());

@@ -939,8 +939,9 @@ pub(super) fn repair_vault(
             .saturating_mul(2)
             .saturating_add(error_correction_b.len() as u64)
             .saturating_add(group_bytes);
-        if let Some(available) =
-            super::vault::available_memory_bytes().filter(|&bytes| working_bytes > bytes)
+        if let Some(available) = vault
+            .default_memory_headroom()
+            .filter(|&bytes| working_bytes > bytes)
         {
             return Err(format!(
                 "Error Correction reconstruction needs at least {working_bytes} more bytes in memory, but the system reports {available} bytes available"
@@ -1399,6 +1400,8 @@ mod tests {
         if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
             let mut vault = VaultV3::open_plaintext(&path).unwrap();
             assert_eq!(VaultV3::scrub(&vault).len(), 1);
+            let limits = VaultV3Limits::default().with_max_data_bytes(64 * 1024 * 1024);
+            let mut explicit = VaultV3::open_plaintext_with_limits(&path, limits).unwrap();
             let status = std::fs::read_to_string("/proc/self/status").unwrap();
             let mapped = super::super::vault::parse_linux_kib(&status, "VmSize").unwrap();
             let limit = mapped + 6 * 1024 * 1024;
@@ -1414,6 +1417,13 @@ mod tests {
                     error.contains("Error Correction reconstruction needs"),
                     "{error}"
                 );
+            }
+            match VaultV3::repair(&mut explicit, true, None) {
+                Ok((1, ParitySource::Embedded)) => {}
+                Err(error)
+                    if error
+                        .contains("Cannot allocate Error Correction reconstruction buffers") => {}
+                result => panic!("Expected repair or a fallible allocation error, got {result:?}"),
             }
             crate::source::memory_test::complete();
             return;

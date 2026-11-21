@@ -20,7 +20,7 @@ All notable changes to the `aerovault` crate are documented here.
 
 - On Linux, a reader can open the visible vault during a private publication while the file is in ordinary vault format. A file marked as pending requires pair recovery. An abandoned journal still recovers when the reader can acquire the lock.
 
-- Default opens check reported memory headroom before allocation. On Linux this includes reclaimable inactive file cache and swap permitted by the cgroup hierarchy. Error Correction reports an error when its reconstruction buffers cannot fit.
+- Default opens check reported memory headroom before allocation. On Linux this includes reclaimable file cache and swap permitted by the cgroup hierarchy. Error Correction uses the same default memory policy and reports an error when its reconstruction buffers cannot fit.
 
 - When sparse extent information is unavailable, a vault with more than 4 GiB of unused trailing bytes can still open for extraction. Writes and parity exports require a complete generation check.
 
