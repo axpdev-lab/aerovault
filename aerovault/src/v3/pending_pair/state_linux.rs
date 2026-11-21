@@ -82,9 +82,13 @@ pub(in crate::v3) fn validate_active_root(root: &Path) -> Result<(), String> {
 }
 
 fn present(path: &Path, known: bool) -> Result<bool, String> {
+    Ok(inspect_path(path, known)?.is_some())
+}
+
+fn inspect_path(path: &Path, known: bool) -> Result<Option<fs::Metadata>, String> {
     match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         // An unused search root can be unavailable. A located journal still
         // has to pass all trust checks before recovery.
         Err(error)
@@ -94,7 +98,7 @@ fn present(path: &Path, known: bool) -> Result<bool, String> {
                     ErrorKind::PermissionDenied | ErrorKind::NotADirectory
                 ) || error.raw_os_error() == Some(libc::ELOOP)) =>
         {
-            Ok(false)
+            Ok(None)
         }
         Err(error) => Err(format!(
             "Inspect private recovery path {} ({error})",
@@ -120,35 +124,49 @@ pub(super) fn lookup_location(
     roots.dedup();
 
     let key = source_key(source).to_hex();
-    let mut pending: Option<PathBuf> = None;
+    let mut pending: Option<(PathBuf, fs::Metadata)> = None;
     for root in roots {
         let candidate = root.join(key.as_str());
-        if present(&candidate, false)? {
-            if require_recovery
-                && !present(
-                    &candidate.join(crate::v3::pending_pair::fresh::RECORD),
-                    true,
-                )?
-                && !present(
-                    &candidate.join(crate::v3::pending_pair::update::RECORD),
-                    true,
-                )?
-                && !present(
-                    &candidate.join(crate::v3::pending_pair::update::PREPARATION),
-                    true,
-                )?
+        let Some(metadata) = inspect_path(&candidate, false)? else {
+            continue;
+        };
+        if require_recovery
+            && !present(
+                &candidate.join(crate::v3::pending_pair::fresh::RECORD),
+                true,
+            )?
+            && !present(
+                &candidate.join(crate::v3::pending_pair::update::RECORD),
+                true,
+            )?
+            && !present(
+                &candidate.join(crate::v3::pending_pair::update::PREPARATION),
+                true,
+            )?
+        {
+            continue;
+        }
+        if let Some((prior, previous)) = &pending {
+            if !metadata.is_dir()
+                || !previous.is_dir()
+                || (metadata.dev(), metadata.ino()) != (previous.dev(), previous.ino())
             {
-                continue;
-            }
-            if let Some(prior) = pending {
                 return Err(format!(
                     "Conflicting private pair journals at {} and {}. Preserve both for recovery",
                     prior.display(),
                     candidate.display()
                 ));
             }
-            pending = Some(candidate);
+            // An alias is only evidence that a directory was counted twice.
+            // Recovery must still use a spelling that passes the trust checks.
+            if validate_active_root(&root)
+                .and_then(|()| TrustedJournal::open(&candidate))
+                .is_err()
+            {
+                continue;
+            }
         }
+        pending = Some((candidate, metadata));
     }
-    Ok(pending)
+    Ok(pending.map(|(path, _)| path))
 }

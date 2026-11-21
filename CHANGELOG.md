@@ -6,7 +6,7 @@ All notable changes to the `aerovault` crate are documented here.
 
 ### Fixed
 
-- Restored open, extraction and writes for large v3 vaults and plaintext archives created by 0.6.8. Version 0.6.9 imposed a default 1 GiB data-section ceiling and a separate 4 GiB generation ceiling. Normal v3 operations now stream the generation hash over the actual file extent and retain the locked generation check before publication. Opening checks the file generation before loading vault data into memory. Where the filesystem can prove that bytes beyond the container are a sparse suffix, generation checks verify the suffix without reading it. Plaintext archives validate chunk ranges before loading data and omit unclaimed trailing data padding from memory. The on-disk format is unchanged.
+- Restored open, extraction and writes for large v3 vaults and plaintext archives created by 0.6.8. Version 0.6.9 imposed a default 1 GiB data-section ceiling and a separate 4 GiB generation ceiling. Normal v3 operations now stream the generation hash over the actual file extent and retain the locked generation check before publication. Opening checks the file generation before loading vault data into memory. On Linux and macOS filesystems that report sparse extents, generation checks cover allocated ranges and their positions without reading the holes. Plaintext archives validate and load the stored frames in order, leaving unclaimed gaps and trailing padding out of memory. The on-disk format is unchanged.
 
 - When the destination ancestry cannot support a recoverable vault and detached parity pair, creation reports the refusal before acquiring either persistent lock. On Unix, creation that writes a detached sidecar makes missing destination directories private.
 
@@ -14,9 +14,9 @@ All notable changes to the `aerovault` crate are documented here.
 
 - On Linux, stripping embedded recovery or changing the password with a detached sidecar can also use private recovery state in group-writable directories. On supported filesystems, atomic exchanges retain the displaced files while the vault and sidecar are published. An interrupted update temporarily blocks normal reads until recovery can verify both generations. Existing adjacent recovery journals remain supported.
 
-- On Linux, recovery cleans up interrupted pair preparation before a retry. It also completes cleanup of an earlier rotation after a later rotation in a different XDG state directory, once the latest vault and its sidecar are verified as a pair.
+- On Linux, recovery cleans up interrupted pair preparation before a retry. If a different XDG state directory was used before a later save, AeroVault can continue to normal vault authentication once the earlier journal proves its exchange or rollback finished. In that case it retains the earlier journal and recovery copies in private state, with one retained slot per vault and state directory.
 
-- Plaintext opening checks block framing before allocating a large data section. If damage prevents the archive from confirming a large extent, AeroVault reports the explicit byte budget needed to attempt repair. Intact large archives retain the default open and repair behavior.
+- Plaintext archives can repair damaged frames without loading intervening gaps. By default, the claimed frames must fit within the bytes backed by storage. Scrub reports the on-disk offsets and repairs keep existing frames at those offsets.
 
 - If a stale detached sidecar leaves damaged blocks unrepaired, `vault repair` now exits with an explicit error. Version 0.6.8 could exit successfully with the damaged blocks still present.
 
