@@ -1176,23 +1176,29 @@ mod tests {
                     assert!(error.contains("header MAC mismatch"), "{error}");
                 }
                 "open-during-private-publication" => {
+                    // The publisher holds the lock for the whole open. A
+                    // reader that waited would time out on the short wait,
+                    // and one that recovered could not take the lock: the
+                    // open succeeds only by reading the visible vault.
+                    // Every contended attempt re-arms the hook, so a retry
+                    // loop would count more than one.
+                    fn count_contention(count: std::rc::Rc<std::cell::Cell<u32>>) {
+                        crate::lock::ON_LOCK_CONTENTION.with(|hook| {
+                            *hook.borrow_mut() = Some(Box::new(move || {
+                                count.set(count.get() + 1);
+                                count_contention(count);
+                            }));
+                        });
+                    }
                     let publisher = crate::lock::acquire_without_recovery(&path).unwrap();
                     crate::lock::set_short_wait_for_this_thread();
-                    // Release exactly at contention. A waiting reader would
-                    // retry, acquire the lock and recover this draft.
-                    crate::lock::ON_LOCK_CONTENTION.with(|hook| {
-                        *hook.borrow_mut() = Some(Box::new(move || drop(publisher)));
-                    });
-                    let started = std::time::Instant::now();
-                    let error = VaultV3::open(&path, OLD).unwrap_err();
-                    assert!(started.elapsed() < std::time::Duration::from_secs(1));
-                    assert!(
-                        error.contains("Vault publication is in progress"),
-                        "{error}"
-                    );
-                    assert!(error.contains("retry after the writer finishes"), "{error}");
-                    let lock_path = crate::lock::lock_path(&path);
-                    assert!(error.contains(lock_path.to_str().unwrap()), "{error}");
+                    let contended = std::rc::Rc::new(std::cell::Cell::new(0));
+                    count_contention(contended.clone());
+                    let opened = VaultV3::open(&path, OLD).unwrap();
+                    crate::lock::ON_LOCK_CONTENTION.with(|hook| hook.borrow_mut().take());
+                    assert_eq!(contended.get(), 1, "the reader must try the lock once");
+                    drop(opened);
+                    drop(publisher);
                 }
                 "create-sparse" => {
                     VaultV3::create_with_error_correction(

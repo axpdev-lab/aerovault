@@ -61,8 +61,9 @@ pub struct VaultV3Limits {
 
 impl VaultV3Limits {
     /// Limit the data section at open and on subsequent saves of the handle.
-    /// By default, there is no fixed size limit beyond the address space and
-    /// available memory.
+    /// By default, there is no fixed size limit: an open is refused only when
+    /// the data section exceeds the memory the operating system reports as
+    /// available. An explicit limit replaces that check.
     pub const fn with_max_data_bytes(mut self, max: u64) -> Self {
         self.max_data_bytes = Some(max);
         self
@@ -2869,13 +2870,28 @@ fn open_vault_with_guard(
     #[cfg(test)]
     crate::lock::trace("decode");
 
+    // Without an explicit budget, the memory the system can still provide
+    // bounds the allocation. Extent reporting alone is not enough: it can be
+    // unavailable or report a sparse file as fully backed.
+    let memory_bound = limits
+        .max_data_bytes
+        .is_none()
+        .then(available_memory_bytes)
+        .flatten();
     let LoadedData {
         mut bytes,
         file_offsets,
     } = if plaintext_header {
         let storage_bound = limits.max_data_bytes.is_none().then_some(scanned_bytes);
-        read_plaintext_data(&mut file, &header, &mut manifest, storage_bound)?
+        read_plaintext_data(
+            &mut file,
+            &header,
+            &mut manifest,
+            storage_bound,
+            memory_bound,
+        )?
     } else {
+        check_available_memory(header.data_len, memory_bound, header.data_len)?;
         let mut data = vault_data_buffer(header.data_len)?;
         file.seek(std::io::SeekFrom::Start(header.data_offset))
             .map_err(|e| format!("Seek data section: {e}"))?;
@@ -2920,6 +2936,160 @@ fn open_vault_with_guard(
     })
 }
 
+fn check_available_memory(
+    size: u64,
+    available: Option<u64>,
+    section_bytes: u64,
+) -> Result<(), String> {
+    if let Some(available) = available.filter(|&available| size > available) {
+        let env_bytes = section_bytes.max(MIN_ENV_DATA_BUDGET);
+        return Err(format!(
+            "Vault data section needs {size} bytes in memory but the system reports {available} bytes available. For a trusted archive on a host with enough memory, set {DATA_BUDGET_ENV}={env_bytes} (bytes) or use VaultV3Limits::with_max_data_bytes({section_bytes})"
+        ));
+    }
+    Ok(())
+}
+
+/// Memory this process can still obtain, as reported by the operating
+/// system, or `None` where it is not reported.
+fn available_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    return linux_available_memory();
+    #[cfg(target_os = "macos")]
+    return macos_available_memory();
+    #[cfg(windows)]
+    return windows_available_memory();
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    None
+}
+
+/// `MemAvailable` plus free swap, capped by the address-space limit and by
+/// the memory limit of the process's own cgroup v2.
+#[cfg(target_os = "linux")]
+fn linux_available_memory() -> Option<u64> {
+    let mut available = parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable rlimit for the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } == 0
+        && limit.rlim_cur != libc::RLIM_INFINITY
+    {
+        available = available.min(limit.rlim_cur);
+    }
+    if let Some(cgroup) = cgroup_v2_available_memory() {
+        available = available.min(cgroup);
+    }
+    Some(available)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_meminfo_available(meminfo: &str) -> Option<u64> {
+    let kib = |name: &str| {
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .strip_prefix(':')?
+                .trim()
+                .strip_suffix("kB")?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    Some(
+        kib("MemAvailable")?
+            .saturating_add(kib("SwapFree").unwrap_or(0))
+            .saturating_mul(1024),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_available_memory() -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let dir = Path::new("/sys/fs/cgroup").join(relative.trim().trim_start_matches('/'));
+    let read = |name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    // `memory.max` reads "max" when the group has no limit.
+    let max = read("memory.max")?;
+    Some(max.saturating_sub(read("memory.current").unwrap_or(0)))
+}
+
+/// Physical memory plus the free space of the current swap files.
+#[cfg(target_os = "macos")]
+fn macos_available_memory() -> Option<u64> {
+    fn sysctl<T>(name: &std::ffi::CStr, value: &mut T) -> bool {
+        let mut len = std::mem::size_of::<T>();
+        // SAFETY: `value` is writable for `len` bytes, and the kernel writes
+        // at most `len` bytes for a fixed-size value.
+        let status = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (value as *mut T).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        status == 0 && len == std::mem::size_of::<T>()
+    }
+    let mut memsize = 0u64;
+    if !sysctl(c"hw.memsize", &mut memsize) {
+        return None;
+    }
+    // SAFETY: xsw_usage is plain integers, valid when zeroed.
+    let mut swap: libc::xsw_usage = unsafe { std::mem::zeroed() };
+    let swap_free = if sysctl(c"vm.swapusage", &mut swap) {
+        swap.xsu_avail
+    } else {
+        0
+    };
+    Some(memsize.saturating_add(swap_free))
+}
+
+/// The commit charge still available, capped by the free address space.
+#[cfg(windows)]
+fn windows_available_memory() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `status` is a writable MEMORYSTATUSEX with its length set.
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
+        .then(|| status.avail_page_file.min(status.avail_virtual))
+}
+
 fn vault_data_buffer(size: u64) -> Result<Zeroizing<Vec<u8>>, String> {
     let size = usize::try_from(size).map_err(|_| "Data section exceeds address space")?;
     if size > isize::MAX as usize {
@@ -2943,6 +3113,7 @@ fn read_plaintext_data(
     header: &VaultHeaderV3,
     manifest: &mut VaultManifestV3,
     storage_bound: Option<u64>,
+    memory_bound: Option<u64>,
 ) -> Result<LoadedData, String> {
     // Read the declared frames into a compact buffer in their on-disk order
     // so extraction and Error Correction see the same bytes. A frame offset
@@ -2978,6 +3149,7 @@ fn read_plaintext_data(
             "Plaintext frames claim {data_size} bytes but the file has {allocated} bytes covered by logical data ranges. For a trusted archive requiring repair, set {DATA_BUDGET_ENV}={env_bytes} (bytes) or use VaultV3Limits::with_max_data_bytes({section_bytes})"
         ));
     }
+    check_available_memory(data_size, memory_bound, header.data_len)?;
     let mut data = vault_data_buffer(data_size)?;
     let mut file_offsets = BTreeMap::new();
     let mut position = None;
@@ -7814,6 +7986,171 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn meminfo_reports_available_memory_plus_free_swap() {
+        let meminfo = "MemTotal:       16000000 kB\nMemFree:         1000000 kB\nMemAvailable:    8000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        1500000 kB\n";
+        assert_eq!(
+            parse_meminfo_available(meminfo),
+            Some((8_000_000 + 1_500_000) * 1024)
+        );
+        assert_eq!(
+            parse_meminfo_available("MemAvailable:    4 kB\n"),
+            Some(4096)
+        );
+        assert_eq!(parse_meminfo_available("MemFree: 4 kB\n"), None);
+        let available = available_memory_bytes().expect("Linux reports available memory");
+        assert!(available > 0);
+    }
+
+    /// Frames whose stored bytes are all holes, over `frames` maximum-size
+    /// blocks, in a plaintext vault whose extents cannot vouch for them.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    fn write_unbacked_plaintext_frames(path: &Path, frames: u64) -> u64 {
+        use super::super::manifest::serialize_manifest_plaintext;
+        use std::io::Write;
+
+        VaultV3::create(&CreateOptionsV3::new_plaintext(path)).unwrap();
+        let mut vault = VaultV3::open_plaintext(path).unwrap();
+        let stride = MAX_BLOCK_SIZE + 8;
+        for index in 0..frames {
+            let id = format!("unbacked-{index}");
+            vault.manifest.chunks.insert(
+                id.clone(),
+                ChunkRecordV3 {
+                    id,
+                    block_index: index,
+                    data_offset: index * stride,
+                    block_len: MAX_BLOCK_SIZE,
+                    plaintext_len: MAX_BLOCK_SIZE,
+                    compressed_len: MAX_BLOCK_SIZE,
+                    cipher_hash: String::new(),
+                    stored_raw: true,
+                },
+            );
+        }
+        let manifest = serialize_manifest_plaintext(&vault.manifest).unwrap();
+        let mut header = vault.header.clone();
+        header.data_len = frames * stride;
+        header.manifest_offset = header.data_offset + header.data_len;
+        header.manifest_len = manifest.len() as u64;
+        header.extension_dir_offset = header.manifest_offset + header.manifest_len;
+        header.extension_dir_len = 2;
+        header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
+        header.extension_payload_len = 0;
+        header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(&header.to_bytes()).unwrap();
+        file.seek(std::io::SeekFrom::Start(header.manifest_offset))
+            .unwrap();
+        file.write_all(&manifest).unwrap();
+        file.write_all(b"[]").unwrap();
+        header.data_len
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn coarse_extents_cannot_allocate_past_available_memory() {
+        const KEY: &str = "AEROVAULT_TEST_COARSE_EXTENT_MEMORY";
+        const TEST: &str = "v3::vault::tests::coarse_extents_cannot_allocate_past_available_memory";
+        // 32 maximum-size frames: 2 GiB of holes, above the child's 1.5 GiB
+        // address-space limit, and cheap to hash densely.
+        const FRAMES: u64 = 32;
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            crate::source::memory_test::limit();
+            let section = (MAX_BLOCK_SIZE + 8) * FRAMES;
+            for mode in ["dense-extents", "query-failure"] {
+                if mode == "dense-extents" {
+                    REPORT_DENSE_EXTENTS.with(|flag| flag.set(true));
+                } else {
+                    FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(true));
+                }
+                let error = VaultV3::open_plaintext_with_limits(&path, VaultV3Limits::default())
+                    .expect_err("frames past available memory must be refused");
+                REPORT_DENSE_EXTENTS.with(|flag| flag.set(false));
+                FAIL_SPARSE_TAIL_QUERY.with(|flag| flag.set(false));
+                assert!(
+                    error.contains("bytes in memory but the system reports"),
+                    "{mode}: {error}"
+                );
+                assert!(
+                    error.contains(&format!("{DATA_BUDGET_ENV}={section} (bytes)")),
+                    "{mode}: {error}"
+                );
+            }
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unbacked.aerozip");
+        write_unbacked_plaintext_frames(&path, FRAMES);
+        let file = std::fs::File::open(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        if sparse_hash_extent(&file, file_len) < file_len {
+            crate::source::memory_test::run(TEST, KEY, &path);
+        } else {
+            eprintln!("Skipping coarse-extent memory bound: the filesystem allocated the holes");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[test]
+    fn encrypted_data_section_cannot_allocate_past_available_memory() {
+        const KEY: &str = "AEROVAULT_TEST_ENCRYPTED_SECTION_MEMORY";
+        const TEST: &str =
+            "v3::vault::tests::encrypted_data_section_cannot_allocate_past_available_memory";
+        const PASSWORD: &str = "memory-bound-password";
+        const SECTION: u64 = 2 * 1024 * 1024 * 1024;
+        if let Some(path) = std::env::var_os(KEY).map(PathBuf::from) {
+            crate::source::memory_test::limit();
+            let error = VaultV3::open_with_limits(&path, PASSWORD, VaultV3Limits::default())
+                .expect_err("a data section past available memory must be refused");
+            assert!(
+                error.contains("bytes in memory but the system reports"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("{DATA_BUDGET_ENV}={SECTION} (bytes)")),
+                "{error}"
+            );
+            crate::source::memory_test::complete();
+            return;
+        }
+
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.aerovault");
+        VaultV3::create(&CreateOptionsV3::new(&path, PASSWORD)).unwrap();
+        let vault = VaultV3::open(&path, PASSWORD).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let range = |offset: u64, len: u64| &bytes[offset as usize..(offset + len) as usize];
+        let old = vault.header.clone();
+        let mut header = old.clone();
+        header.data_len = SECTION;
+        header.manifest_offset = header.data_offset + header.data_len;
+        header.extension_dir_offset = header.manifest_offset + header.manifest_len;
+        header.extension_payload_offset = header.extension_dir_offset + header.extension_dir_len;
+        header.header_mac = header.compute_mac(&vault.mac_key).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&header.to_bytes()).unwrap();
+        file.write_all(range(old.data_offset, old.data_len))
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(header.manifest_offset))
+            .unwrap();
+        file.write_all(range(old.manifest_offset, old.manifest_len))
+            .unwrap();
+        file.write_all(range(old.extension_dir_offset, old.extension_dir_len))
+            .unwrap();
+        file.write_all(range(
+            old.extension_payload_offset,
+            old.extension_payload_len,
+        ))
+        .unwrap();
+        drop(file);
+        crate::source::memory_test::run(TEST, KEY, &path);
+    }
+
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     #[test]
     fn plaintext_frame_sum_requires_file_backing_before_allocation() {
@@ -7851,7 +8188,7 @@ mod tests {
             }
             let (_, covered, prefix) = vault_generation_baseline(&mut file, &[], file_len).unwrap();
             assert!(prefix < file_len && covered < MAX_BLOCK_SIZE);
-            let error = read_plaintext_data(&mut file, &header, &mut manifest, Some(covered))
+            let error = read_plaintext_data(&mut file, &header, &mut manifest, Some(covered), None)
                 .err()
                 .expect("unbacked ranges must be rejected before allocation");
             assert!(

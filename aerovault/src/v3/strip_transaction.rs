@@ -1179,16 +1179,18 @@ pub(crate) fn recover_if_pending(source: &Path) -> Result<(), String> {
                 super::pending_pair::state::pending_location(&source),
                 Ok(None)
             ) {
-                let lock = crate::lock::try_acquire_without_recovery(&source).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        format!(
-                            "Vault publication is in progress (lock {}); retry after the writer finishes",
-                            crate::lock::lock_path(&source).display()
-                        )
-                    } else {
-                        e.to_string()
-                    }
-                })?;
+                // A held lock means a live writer: either the publisher of
+                // this journal, or a writer that ran recovery when it took
+                // the lock. The draft is not abandoned, and every step of a
+                // publication replaces the vault by an atomic rename, so the
+                // reader opens the visible vault, old or new, without
+                // recovery and without waiting. An abandoned draft is
+                // recovered by the next open that finds the lock free.
+                let lock = match crate::lock::try_acquire_without_recovery(&source) {
+                    Ok(lock) => lock,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(e) => return Err(e.to_string()),
+                };
                 return recover_under_guard(&lock);
             }
             return Ok(());
