@@ -88,6 +88,43 @@ unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
     fn CreateDirectoryW(path: *const u16, attributes: *const SecurityAttributes) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
+    fn GetFileInformationByHandleEx(
+        file: *mut c_void,
+        class: u32,
+        information: *mut c_void,
+        size: u32,
+    ) -> i32;
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct FileCompressionInfo {
+    compressed_file_size: i64,
+    compression_format: u16,
+    compression_unit_shift: u8,
+    chunk_shift: u8,
+    cluster_shift: u8,
+    reserved: [u8; 3],
+}
+
+pub(super) fn allocated_file_bytes(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+
+    const FILE_COMPRESSION_INFO_CLASS: u32 = 8;
+    let mut info = FileCompressionInfo::default();
+    // SAFETY: the live handle and initialized output buffer have the Win32 ABI layout.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_COMPRESSION_INFO_CLASS,
+            (&mut info as *mut FileCompressionInfo).cast(),
+            std::mem::size_of::<FileCompressionInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    u64::try_from(info.compressed_file_size).map_err(|_| std::io::ErrorKind::InvalidData.into())
 }
 
 #[repr(C)]
@@ -548,6 +585,55 @@ pub(crate) fn guest_effective_rights(path: &Path) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{capture, decode_sddl_buffer, protected_aces};
+
+    #[test]
+    fn allocated_file_bytes_reports_only_the_backed_part_of_a_sparse_file() {
+        use std::ffi::c_void;
+        use std::io::Write;
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr::null_mut;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn DeviceIoControl(
+                file: *mut c_void,
+                code: u32,
+                input: *mut c_void,
+                input_len: u32,
+                output: *mut c_void,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: *mut c_void,
+            ) -> i32;
+        }
+
+        const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+        let mut file = tempfile::tempfile().unwrap();
+        let mut returned = 0;
+        // SAFETY: the file is live and writable. This synchronous request
+        // marks the test file sparse and takes no input or output buffer.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_SET_SPARSE,
+                null_mut(),
+                0,
+                null_mut(),
+                0,
+                &mut returned,
+                null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        file.set_len(128 * 1024 * 1024).unwrap();
+        file.write_all(b"backed byte range").unwrap();
+        file.sync_all().unwrap();
+        let backed = super::allocated_file_bytes(&file).unwrap();
+        assert!(
+            backed > 0 && backed < 1024 * 1024,
+            "{backed} allocated bytes"
+        );
+    }
 
     #[test]
     fn captured_sddl_ends_at_first_nul_within_api_capacity() {
