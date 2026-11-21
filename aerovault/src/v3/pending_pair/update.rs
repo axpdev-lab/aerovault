@@ -474,11 +474,10 @@ pub(in crate::v3) fn publish(
     let vault_leaf = destination.leaf(source)?;
     let sidecar_leaf = destination.leaf(&sidecar)?;
     check_locks(source, &sidecar, lock, sidecar_lock)?;
-    let root = output_parent_dir(prepared.path());
-    TrustedJournal::open(root)?;
-    let input = TrustedJournal::open(prepared.path())?;
-    let key = state::source_key(source);
     let active = prepared.directory.as_path();
+    TrustedJournal::open(output_parent_dir(active))?;
+    let input = TrustedJournal::open(active)?;
+    let key = state::source_key(source);
     if prepared.draft.source_key != *key.as_bytes()
         || prepared.draft.parent != (destination.device, destination.inode)
     {
@@ -833,6 +832,19 @@ fn verify_current_pair(destination: &Destination, leaves: [&CStr; 2]) -> Result<
     let sidecar = AeroCorrectSidecarReader::open_automatic_destination(open(leaves[1])?)?;
     if sidecar.total_len != length {
         return Err("Current sidecar does not cover the current vault length".into());
+    }
+    let expected_windows = [
+        (0, HEADER_SIZE as u64),
+        (header.manifest_offset, header.manifest_len),
+        (header.data_offset, header.data_len),
+    ];
+    if !sidecar
+        .segments()
+        .iter()
+        .map(|segment| (segment.window_offset, segment.window_len))
+        .eq(expected_windows)
+    {
+        return Err("Current sidecar does not cover the current vault regions".into());
     }
     sidecar.verify_binding(&hash)?;
     destination.recheck()

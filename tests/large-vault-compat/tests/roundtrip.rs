@@ -10,12 +10,14 @@
 
 #![cfg(target_pointer_width = "64")]
 
-use aerovault::v3::{block, constants, manifest, OpenVaultV3, VaultHeaderV3, VaultV3};
+use aerovault::v3::{
+    block, constants, manifest, OpenVaultV3, VaultHeaderV3, VaultV3, VaultV3Limits,
+};
 use aerovault_068::v3::{CreateOptionsV3 as LegacyOptions, VaultV3 as LegacyVault};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -213,6 +215,25 @@ fn plaintext_legacy_reads_live_block_beyond_four_gib() {
     eprintln!("0.6.8 last live block starts at byte {last_start}");
     drop(stored);
 
-    let vault = VaultV3::open_plaintext(&path).unwrap();
+    let limits = VaultV3Limits::default();
+    VaultV3::export_parity_with_limits(&path, "", None, limits).unwrap();
+    // Keep the legacy length prefix intact and damage only its stored body.
+    let mut data = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let body = last_start + 8;
+    data.seek(SeekFrom::Start(body)).unwrap();
+    let mut byte = [0];
+    data.read_exact(&mut byte).unwrap();
+    data.seek(SeekFrom::Start(body)).unwrap();
+    data.write_all(&[byte[0] ^ 1]).unwrap();
+    drop(data);
+
+    let mut vault = VaultV3::open_plaintext_with_limits(&path, limits).unwrap();
+    assert_eq!(VaultV3::scrub(&vault).len(), 1);
+    assert_eq!(VaultV3::repair(&mut vault, false, None).unwrap().0, 1);
+    assert!(VaultV3::scrub(&vault).is_empty());
     verify_files(&vault, &root.join("extracted"), &[("base.bin", expected)]);
 }
