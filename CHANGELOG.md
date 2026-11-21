@@ -4,9 +4,50 @@ All notable changes to the `aerovault` crate are documented here.
 
 ## [0.7.0] - 2026-11-21
 
+### What changes from 0.6.8 to 0.7.0
+
+The file format, the encryption and the key derivation are unchanged: existing vaults and recovery files open as they are, with nothing to convert. Each item says whether it arrived in 0.6.9 or in 0.7.0; the detailed technical entries follow. Item by item: [AeroVault tracker](https://github.com/axpdev-lab/aerovault/discussions/5).
+
+Thank you to everyone who uses AeroVault, reports problems and tests new versions.
+
+**Security**
+
+- **A password unlock opens only an encrypted vault.** A file swapped in place of your vault (in a shared or synced folder, or on removable media) can no longer be an unencrypted archive that accepts any password and then stores what you add in the clear. Unencrypted `.aerozip` archives open only when you ask for it: `aerovault vault extract archive.aerozip --plaintext`, or `open_plaintext` in the library. *Since 0.6.9.*
+- **After a password change, the old password stops working**, also through the default recovery file: the vault and its recovery file are replaced together. A recovery file copied elsewhere before the change still carries the old header: export it again or delete it. *Since 0.6.9.*
+- **Recovery files are private.** New `.aerocorrect` files are readable only by you on Unix, since their parity can rebuild small files. Missing folders that AeroVault creates for a detached recovery file, and its private state folder, are readable only by you as well. On Windows, updates keep the vault's owner and access rights, and refuse to publish if they cannot keep them. *Since 0.6.9, extended in 0.7.0.*
+- **Plaintext does not stay in memory after a failure.** Keys and buffered file content are wiped when an operation fails, not only when it succeeds. *Since 0.6.9.*
+- **Damaged or crafted files cannot make AeroVault allocate unbounded memory.** Repair and recovery check the sizes a file declares before sizing their buffers. *Since 0.6.9.*
+
+**Robustness**
+
+- **Two programs writing to one vault no longer lose changes.** Every write takes an exclusive lock on `<vault>.aerolock`, next to the vault. A second writer waits up to 30 seconds, then fails with `vault is locked by another writer`, and a write only goes ahead if the vault is still exactly the file it read. *Since 0.6.9.*
+- **A failed write leaves the vault as it was**, on disk and in the open handle. On Windows, a save no longer fails while another program has the vault open, and a legacy (v2) vault is no longer deleted before its replacement is in place. *Since 0.6.9.*
+- **Interrupted updates finish or roll back.** Creating a vault with a detached recovery file, changing its password, or removing its embedded recovery replaces two files; if that is interrupted (crash, power loss, killed process), the next run completes it or restores the previous pair. On Linux these updates keep their journal in your private state folder (`~/.local/state/aerovault/journals`, or `~/.aerovault-state`), so they also work in a folder other accounts can write to, such as a shared project folder. Readers on Linux do not wait while another process publishes such an update. If you set a custom `XDG_STATE_HOME`, keep the same value until an interrupted update has been recovered. *Since 0.6.9, extended in 0.7.0.*
+- **Large vaults and archives open, extract and save without a fixed size ceiling: the limit is the memory your system can give.** Before it loads a vault, repairs it, or regenerates its Error Correction, AeroVault checks the memory the system reports as available (on Linux including reclaimable cache and the limits of the container or service it runs in, on macOS the system memory level and free swap, on Windows the available commit charge) and stops with a "not enough memory" error before it starts, instead of failing partway through. If the estimate is too cautious for your system, set `AEROVAULT_V3_DATA_BUDGET_BYTES`, or `VaultV3Limits` in an application that embeds AeroVault: an explicit budget replaces the estimate. *New in 0.7.0.*
+
+**Verification and checks**
+
+- **`vault repair` never reports damage as fixed when it is not.** When damaged blocks cannot be repaired (no parity, too much damage, or a stale recovery file), `vault repair` ends with an error. Scripts that run it should handle that failure. *Since 0.6.9, extended in 0.7.0.*
+- **Recovery exports match the vault.** `export-parity` checks that the vault was not saved since it was read before it publishes the recovery file, and writes keep the vault's usable parity while a block is damaged (they ask you to run `repair` first). *Since 0.6.9.*
+- **A vault is verified before its data is loaded.** Opening checks that the file is the one last written. In the rare case where that check cannot cover the whole file (a file system that cannot report a file's unused regions, and more than 4 GiB of unused space at its end), the vault opens for extraction only: writes and recovery exports are refused. *Since 0.6.9, extended in 0.7.0.*
+- **Writes refuse what readers would refuse.** A block above the 64 MiB limit, which no reader could extract, is refused when it is written. *Since 0.6.9.*
+- **More damage is recoverable.** A vault whose header was rebuilt from its recovery file can be saved and exported, and a damaged plaintext flag in the header no longer blocks header recovery. *Since 0.6.9.*
+
+**Performance**
+
+- **Each open and each save hash the vault file once more** (BLAKE3) for the check that nobody changed it in between. A save hashes the bytes as it writes them, without reading the new file back. *Since 0.6.9.*
+- **Large and sparse files cost less.** On Linux and macOS, that check skips the unused regions of a sparse file; plaintext archives no longer allocate memory for the gaps between their stored frames; changing the password of a legacy vault copies its content without loading the whole file into memory. *Since 0.6.9, extended in 0.7.0.*
+
+**What you may need to change**
+
+- **Writes through a symbolic link are refused**, with the error `is a symbolic link`: use the target path. Reading through a link still works. *Since 0.6.9.*
+- **`.aerolock` files appear next to vaults and stay there on purpose.** Do not delete them while a write may be running, and do not sync them: a sync tool should skip `*.aerolock`. Names ending in `.aerolock` are reserved for these files. *Since 0.6.9.*
+- **The lock protects only versions that take it.** Do not let 0.6.8 and 0.7.0 write to the same vault at the same time, and do not share one vault between machines for concurrent writing over SMB or NFS. *Since 0.6.9.*
+- **Embedders:** Rust 1.89 or newer is required, the minimum `rand` is 0.8.7 and `tempfile` 3.20, and a plaintext container must be opened with `open_plaintext` (`open(path, "")` refuses it). *Since 0.6.9, extended in 0.7.0.*
+
 ### Fixed
 
-- Restored open, extraction and writes for large v3 vaults and plaintext archives created by 0.6.8. Version 0.6.9 imposed a default 1 GiB data-section ceiling and a separate 4 GiB generation ceiling. Normal v3 operations now stream the generation hash over the actual file extent and retain the locked generation check before publication. Opening checks the file generation before loading vault data into memory. On Linux and macOS filesystems that report sparse extents, generation checks cover allocated ranges and their positions without reading the holes. Plaintext archives validate and load the stored frames in order, leaving unclaimed gaps and trailing padding out of memory. The on-disk format is unchanged.
+- Large v3 vaults and plaintext archives open, extract and save without a fixed data-section or generation ceiling. Normal v3 operations now stream the generation hash over the actual file extent and retain the locked generation check before publication. Opening checks the file generation before loading vault data into memory. On Linux and macOS filesystems that report sparse extents, generation checks cover allocated ranges and their positions without reading the holes. Plaintext archives validate and load the stored frames in order, leaving unclaimed gaps and trailing padding out of memory. The on-disk format is unchanged.
 
 - When the destination ancestry cannot support a recoverable vault and detached parity pair, creation reports the refusal before acquiring either persistent lock. On Unix, creation that writes a detached sidecar makes missing destination directories private.
 
